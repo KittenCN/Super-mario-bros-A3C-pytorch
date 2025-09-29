@@ -72,6 +72,10 @@ Training checkpoints land in `trained_models/`, while TensorBoard runs live in `
 - `test.py`: evaluation runner with deterministic policy execution and video capture.
 - `scripts/`: automation utilities (Optuna search, etc.).
 
+## Debugging & known issues
+
+If you run into environment construction issues with `AsyncVectorEnv` (especially on Python 3.12 + NumPy 2.x), see `docs/ENV_DEBUGGING_REPORT.md` for detailed diagnostics, experiments and recommended workarounds (including forcing synchronous envs for long runs).
+
 ## Requirements & Compatibility
 
 - Python 3.10/3.11, PyTorch ≥ 2.1, CUDA 12 image supplied via Dockerfile.
