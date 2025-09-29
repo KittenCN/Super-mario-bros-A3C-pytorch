@@ -1,66 +1,83 @@
-# [PYTORCH] Asynchronous Advantage Actor-Critic (A3C) for playing Super Mario Bros
+# Super Mario Bros A3C (2025 Edition)
 
-## Introduction
+Modernised PyTorch implementation of Asynchronous Advantage Actor-Critic (A3C) for `gym_super_mario_bros`, refreshed with Gymnasium vector environments, IMPALA-style networks, V-trace targets, mixed precision, and advanced tooling for monitoring and hyperparameter search.
 
-Here is my python source code for training an agent to play super mario bros. By using Asynchronous Advantage Actor-Critic (A3C) algorithm introduced in the paper **Asynchronous Methods for Deep Reinforcement Learning** [paper](https://arxiv.org/abs/1602.01783).
-<p align="center">
-  <img src="demo/video_1_1.gif" width="200">
-  <img src="demo/video_1_2.gif" width="200">
-  <img src="demo/video_1_4.gif" width="200">
-  <img src="demo/video_2_1.gif" width="200"><br/>
-  <img src="demo/video_2_2.gif" width="200">
-  <img src="demo/video_2_3.gif" width="200">
-  <img src="demo/video_2_4.gif" width="200">
-  <img src="demo/video_3_1.gif" width="200"><br/>
-  <img src="demo/video_3_2.gif" width="200">
-  <img src="demo/video_3_3.gif" width="200">
-  <img src="demo/video_3_4.gif" width="200">
-  <img src="demo/video_4_1.gif" width="200"><br/>
-  <img src="demo/video_5_1.gif" width="200">
-  <img src="demo/video_6_1.gif" width="200">
-  <img src="demo/video_6_3.gif" width="200">
-  <img src="demo/video_7_1.gif" width="200"><br/>
-  <img src="demo/video_7_3.gif" width="200">
-  <img src="demo/video_8_2.gif" width="200">
-  <img src="demo/video_8_3.gif" width="200"><br/>
-  <i>Sample results</i>
-</p>
+## Key Features
 
-## Motivation
+- **Vectorised Gymnasium environments** with randomized stage schedules and automatic frame stacking/pre-processing.
+- **IMPALA residual backbone + recurrent core** (GRU/LSTM/Transformer) with optional NoisyLinear exploration.
+- **V-trace / GAE returns** blended with prioritized replay for hybrid on/off-policy training.
+- **PyTorch 2.1 pipeline** featuring `torch.compile`, AMP, cosine warm-up scheduling, gradient accumulation, and AdamW optimisation.
+- **Integrated observability** via TensorBoard + optional Weights & Biases, reward tracking, and periodic checkpointing.
+- **Tooling** for evaluation, Optuna-based hyperparameter search, Docker/conda environments, and video capture through Gymnasium wrappers.
 
-Before I implemented this project, there are several repositories reproducing the paper's result quite well, in different common deep learning frameworks such as Tensorflow, Keras and Pytorch. In my opinion, most of them are great. However, they seem to be overly complicated in many parts including image's pre-processing, environtment setup and weight initialization, which distracts user's attention from more important matters. Therefore, I decide to write a cleaner code, which simplifies unimportant parts, while still follows the paper strictly. As you could see, with minimal setup and simple network's initialization, as long as you implement the algorithm correctly, an agent will teach itself how to interact with environment and gradually find out the way to reach the final goal.
+## Quick Start
 
-## Explanation in layman's term
-If you are already familiar to reinforcement learning in general and A3C in particular, you could skip this part. I write this part for explaining what is A3C algorithm, how and why it works, to people who are interested in or curious about A3C or my implementation, but do not understand the mechanism behind. Therefore, you do not need any prerequiste knowledge for reading this part :relaxed:
+```bash
+# Install dependencies
+python -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
 
-If you search on the internet, there are numerous article introducing or explaining A3C, some even provide sample code. However, I would like to take another approach: Break down the name **Asynchronous Actor-Critic Agents** into smaller parts and explain in an aggregated manner.
+# Train
+python train.py --world 1 --stage 1 --num-envs 8 --total-updates 50000
 
-### Actor-Critic
-Your agent has 2 parts called **actor** and **critic**, and its goal is to make both parts perfom better over time by exploring and exploiting the environment. Let imagine a small mischievous child (**actor**) is discovering the amazing world around him, while his dad (**critic**) oversees him, to make sure that he does not do anything dangerous. Whenever the kid does anything good, his dad will praise and encourage him to repeat that action in the future. And of course, when the kid does anything harmful, he will get warning from his dad. The more the kid interacts to the world, and takes different actions, the more feedback, both positive and negative, he gets from his dad. The goal of the kid is, to collect as many positive feedback as possible from his dad, while the goal of the dad is to evaluate his son's action better. In other word, we have a win-win relationship between the kid and his dad, or equivalently between **actor** and **critic**.
+# Evaluate
+python test.py --world 1 --stage 1 --checkpoint trained_models/latest_model.pt --episodes 5
 
-### Advantage Actor-Critic
-To make the kid learn faster, and more stable, the dad, instead of telling his son how good his action is, will tell him how better or worse his action in compared to other actions (or **a "virtual" average action**). An example is worth a thousand words. Let's compare 2 pairs of dad and son. The first dad gives his son 10 candies for grade 10 and 1 candy for grade 1 in school. The second dad, on the other hand, gives his son 5 candies for grade 10, and "punishes" his son by not allowing him to watch his favorite TV series for a day when he gets grade 1. How do you think? The second dad seems to be a little bit smarter, right? Indeed, you could rarely prevent bad actions, if you still "encourage" them with small reward.
+# Run TensorBoard (logs written per run timestamp)
+tensorboard --logdir tensorboard/a3c_super_mario_bros
 
-### Asynchronous Advantage Actor-Critic
-If an agent discovers environment alone, the learning process would be slow. More seriously, the agent could be possibly bias to a particular suboptimal solution, which is undesirable. What happen if you have a bunch of agents which simultaneously discover different part of the environment and update their new obtained knowledge to one another periodically? It is exactly the idea of **Asynchronous Advantage Actor-Critic**. Now the kid and his mates in kindergarten have a trip to a beautiful beach (with their teacher, of course). Their task is to build a great sand castle. Different child will build different parts of the castle, supervised by the teacher. Each of them will have different task, with the same final goal is a strong and eye-catching castle. Certainly, the role of the teacher now is the same as the dad in previous example. The only difference is that the former is busier :sweat_smile:
+# Hyperparameter search (example: 5 trials, in-process short runs)
+python scripts/optuna_search.py --trials 5
+```
 
-## How to use my code
+> **Tip:** The project targets `torch>=2.1`. If you use `gymnasium-super-mario-bros` instead of `gym-super-mario-bros`, adjust `requirements.txt` accordingly.
 
-With my code, you can:
-* **Train your model** by running **python train.py**
-* **Test your trained model** by running **python test.py**
+## Configuration Overview
 
-## Trained models
+`train.py` exposes a comprehensive CLI; notable flags include:
 
-You could find some trained models I have trained in [Super Mario Bros A3C trained models](https://drive.google.com/open?id=1itDw9sXPiY7xC4u72RIfO5EdoVs0msLL)
- 
-## Requirements
+- `--num-envs`, `--rollout-steps`: control environment throughput and rollout length.
+- `--recurrent-type {gru,lstm,transformer,none}` and related hidden dimensions.
+- `--lr`, `--entropy-beta`, `--value-coef`, `--clip-grad`: optimise loss shaping.
+- `--random-stage`, `--stage-span`: build multi-stage training schedules.
+- `--no-amp`, `--no-compile`: toggle mixed precision and Torch compile.
+- `--per`: enable prioritized replay augmentation.
+- `--wandb-project`: stream metrics to Weights & Biases.
 
-* **python 3.6**
-* **gym**
-* **cv2**
-* **pytorch** 
-* **numpy**
+Training checkpoints land in `trained_models/`, while TensorBoard runs live in `tensorboard/a3c_super_mario_bros/<timestamp>`.
 
-## Acknowledgements
-At the beginning, I could only train my agent to complete 9 stages. Then @davincibj pointed out that 19 stages could be completed and sent me the trained weights. Thank you a lot for the finding!
+## Evaluation & Monitoring
+
+- `test.py` loads checkpoints, renders optional videos, and prints episodic rewards.
+- Gymnasium's `RecordVideo` wrapper writes MP4s to `output/eval/` by default.
+- TensorBoard dashboards track losses, entropy, learning rate, and rolling average returns.
+- Optional W&B integration mirrors the same metrics for remote monitoring.
+
+## Advanced Usage
+
+- **Optuna search** (`scripts/optuna_search.py`): runs short ablation-style sweeps, returning best `avg_return`.
+- **Docker**: `docker build -t mario-a3c .` then `docker run --gpus all mario-a3c` launches training in a CUDA 12 base image.
+- **Conda**: `conda env create -f environment.yml && conda activate mario-a3c` mirrors the Python tooling stack.
+- **Config export**: `--config-out configs/run.json` persists the effective `TrainingConfig` for reproducibility.
+
+## Project Structure
+
+- `src/envs/`: Gymnasium environment factories, reward shaping, frame processing.
+- `src/models/`: IMPALA residual blocks, recurrent policy heads, positional encodings.
+- `src/algorithms/vtrace.py`: V-trace targets for off-policy corrections.
+- `src/utils/`: rollout buffers, prioritized replay, learning-rate schedules, logging helpers.
+- `train.py`: end-to-end training orchestrator with AMP, compile, PER, and checkpointing.
+- `test.py`: evaluation runner with deterministic policy execution and video capture.
+- `scripts/`: automation utilities (Optuna search, etc.).
+
+## Requirements & Compatibility
+
+- Python 3.10/3.11, PyTorch ≥ 2.1, CUDA 12 image supplied via Dockerfile.
+- `gym_super_mario_bros>=7.4.0` (or `gymnasium-super-mario-bros`) and `nes-py>=8.2`.
+- FFmpeg must be available on the system for video logging.
+
+## Credits
+
+Originally authored by Viet Nguyen; modernisation inspired by the community’s continued experimentation with asynchronous RL, IMPALA, and scalable observability practices.
