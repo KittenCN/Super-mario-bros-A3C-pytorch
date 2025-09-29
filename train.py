@@ -2,20 +2,71 @@
 
 from __future__ import annotations
 
+# Set multiprocessing start method at the very top to avoid fork-related
+# deadlocks when native extensions or thread pools are initialised later.
+import multiprocessing as _mp
+try:
+    # Prefer 'fork' where available so the parent process can pre-initialise
+    # native libraries (nes_py, SDL, etc.) and have worker processes inherit
+    # that warmed state. If 'fork' is unsupported or unsafe on the platform,
+    # fall back to 'forkserver' or 'spawn'. We attempt this at module import
+    # time before other imports to avoid creating threads that make 'fork'
+    # unsafe.
+    _mp.set_start_method("fork", force=True)
+except Exception:
+    try:
+        _mp.set_start_method("forkserver", force=True)
+    except Exception:
+        try:
+            _mp.set_start_method("spawn", force=True)
+        except Exception:
+            # If none can be set, proceed with whatever the default is.
+            pass
+
+# Suppress the legacy Gym startup notice that prints to stderr when gym is
+# installed alongside gymnasium. We temporarily replace sys.stderr around the
+# import of gym-related packages to avoid noisy migration messages.
+import sys
+import io
+_stderr_orig = sys.stderr
+_suppress_stderr = False
+def _suppress_gym_notice(enable: bool = True):
+    global _stderr_orig, _suppress_stderr
+    if enable and not _suppress_stderr:
+        sys.stderr = io.StringIO()
+        _suppress_stderr = True
+    elif not enable and _suppress_stderr:
+        sys.stderr = _stderr_orig
+        _suppress_stderr = False
+
+_suppress_gym_notice(True)
+
 import argparse
+import multiprocessing as _mp
+
+# Prefer 'forkserver' start method to avoid fork-related deadlocks when native
+# extensions or thread pools are initialised in the parent process. Fall back
+# gracefully if unsupported on the current platform.
+try:
+    _mp.set_start_method("forkserver", force=False)
+except Exception:
+    # If start method already set or unsupported, continue.
+    pass
+
 import dataclasses
 import json
-import math
-from pathlib import Path
-from typing import Optional
-
 import os
+import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import subprocess
 import time
+import threading
+import warnings
+from pathlib import Path
+from typing import Optional
 from torch.distributions import Categorical
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -28,8 +79,10 @@ from src.config import (
     create_default_stage_schedule,
 )
 from src.envs import MarioEnvConfig, MarioVectorEnvConfig, create_vector_env
+_suppress_gym_notice(False)
 from src.models import MarioActorCritic
 from src.utils import CosineWithWarmup, PrioritizedReplay, RolloutBuffer, create_logger
+from src.utils.monitor import Monitor
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -60,6 +113,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--tau", type=float, default=1.0)
     parser.add_argument("--clip-grad", type=float, default=0.5)
     parser.add_argument("--sync-env", action="store_true", help="Use synchronous vector env")
+    parser.add_argument("--force-sync", action="store_true", help="Force synchronous vector env (overrides async heuristic)")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--use-noisy-linear", action="store_true")
@@ -76,6 +130,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--project", type=str, default="mario-a3c")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Device to run training on")
     parser.add_argument("--metrics-path", type=str, default=None, help="Path to JSONL file for periodic metrics dump")
+    parser.add_argument("--env-reset-timeout", type=float, default=None, help="Timeout (s) for environment construction/reset before fallback; if unset a heuristic is used")
+    parser.add_argument("--no-prewarm", action="store_true", default=False, help="Disable prewarming ROMs before training")
+    parser.add_argument("--no-monitor", action="store_true", default=False, help="Disable background resource monitor")
+    parser.add_argument("--monitor-interval", type=float, default=10.0, help="Monitor interval in seconds")
+    parser.add_argument("--enable-tensorboard", action="store_true", default=False, help="Enable TensorBoard logging (disabled by default)")
+    parser.add_argument("--parent-prewarm", action="store_true", default=False, help="Run a parent-process prewarm of the environment before launching workers")
+    parser.add_argument("--parent-prewarm-all", action="store_true", default=False, help="Sequentially prewarm each env configuration in the parent before launching workers (slower, safer)")
+    parser.add_argument("--worker-start-delay", type=float, default=0.2, help="Stagger delay (s) between worker initialisations when using async vector env")
     return parser.parse_args(argv)
 
 
@@ -88,14 +150,23 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
         frame_skip=args.frame_skip,
         frame_stack=args.frame_stack,
     )
+    async_flag = not args.sync_env
+    if getattr(args, "force_sync", False):
+        async_flag = False
     vec_cfg = MarioVectorEnvConfig(
         num_envs=args.num_envs,
-        asynchronous=not args.sync_env,
+        asynchronous=async_flag,
         stage_schedule=tuple(stage_schedule),
         random_start_stage=args.random_stage,
         base_seed=args.seed,
         env=env_cfg,
+        worker_start_delay=args.worker_start_delay,
     )
+    # allow CLI to override env reset/construct timeout; if not set, scale with num_envs
+    if args.env_reset_timeout is not None:
+        setattr(vec_cfg, "reset_timeout", args.env_reset_timeout)
+    else:
+        setattr(vec_cfg, "reset_timeout", max(60.0, args.num_envs * 10.0))
 
     train_cfg = TrainingConfig()
     train_cfg.seed = args.seed
@@ -191,6 +262,26 @@ def maybe_save_config(cfg: TrainingConfig, path: Optional[str]):
     Path(path).write_text(serialisable, encoding="utf-8")
 
 
+def call_with_timeout(fn, timeout: float, *args, **kwargs):
+    result: dict[str, object] = {}
+    error: dict[str, BaseException] = {}
+
+    def target():
+        try:
+            result["value"] = fn(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - propagate original exception
+            error["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise TimeoutError(f"Call to {getattr(fn, '__name__', repr(fn))} exceeded {timeout:.1f}s")
+    if error:
+        raise error["error"]
+    return result.get("value")
+
+
 def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     # Device and performance tuning
     if cfg.device == "auto":
@@ -200,6 +291,15 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
     # Repro/threads
     torch.manual_seed(cfg.seed)
+    # Silence known lr_scheduler ordering warning emitted in some PyTorch builds
+    try:
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Detected call of `lr_scheduler.step\(\)` before `optimizer.step\(\)`.",
+            category=UserWarning,
+        )
+    except Exception:
+        pass
     # Let PyTorch choose optimal algorithms for benchmarking when input sizes are stable
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
@@ -222,8 +322,106 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         f"rollout_steps={cfg.rollout.num_steps} grad_accum={cfg.gradient_accumulation}"
     )
 
-    env = create_vector_env(cfg.env)
-    obs_np, _ = env.reset(seed=cfg.seed)
+    # Parent-process prewarm: create and close a single env in the parent
+    # to perform heavy native initialisation once before spawning workers.
+    if args.parent_prewarm:
+        try:
+            print("[train] parent prewarming environment (single reset)...")
+            pre_env_cfg = dataclasses.replace(cfg.env, num_envs=1, asynchronous=False)
+            pre_env = create_vector_env(pre_env_cfg)
+            pre_env.reset(seed=args.seed)
+            pre_env.close()
+            print("[train] parent prewarm complete")
+        except Exception as exc:
+            print(f"[train] parent prewarm failed: {exc}")
+
+    # Optionally prewarm each worker configuration sequentially in the parent.
+    # This is slower but avoids a thundering herd of first-time imports in the
+    # worker processes which can lead to long blocking during vector env
+    # construction. Use --parent-prewarm-all to enable.
+    if args.parent_prewarm_all:
+        try:
+            print("[train] parent prewarming each worker configuration sequentially...")
+            for idx in range(cfg.env.num_envs):
+                try:
+                    # Build a single-env cfg for the current stage/seed
+                    single_cfg = dataclasses.replace(cfg.env, num_envs=1, asynchronous=False)
+                    # rotate stage schedule to pick per-index stage deterministically
+                    # this mirrors create_vector_env stage selection and therefore
+                    # warms the same code paths.
+                    pre_env = create_vector_env(single_cfg)
+                    pre_env.reset(seed=cfg.seed + idx)
+                    pre_env.close()
+                except Exception as exc:
+                    print(f"[train] parent prewarm for worker {idx} failed: {exc}")
+            print("[train] parent prewarm-all complete")
+        except Exception as exc:
+            print(f"[train] parent prewarm-all failed: {exc}")
+
+    def _initialise_env(env_cfg: MarioVectorEnvConfig):
+        timeout = getattr(env_cfg, "reset_timeout", 60.0)
+        start_construct = time.time()
+        try:
+            # Protect the potentially blocking vector env construction itself
+            env_instance = call_with_timeout(create_vector_env, timeout, env_cfg)
+            construct_time = time.time() - start_construct
+        except TimeoutError:
+            construct_time = time.time() - start_construct
+            if env_cfg.asynchronous:
+                print(f"[train] Async vector env construction timed out after {timeout}s; retrying with synchronous vector env.")
+                fallback_cfg = dataclasses.replace(env_cfg, asynchronous=False)
+                start_construct = time.time()
+                try:
+                    env_instance = call_with_timeout(create_vector_env, timeout, fallback_cfg)
+                    env_cfg = fallback_cfg
+                    construct_time = time.time() - start_construct
+                except TimeoutError:
+                    raise RuntimeError("Vector env construction timed out")
+            else:
+                raise RuntimeError("Vector env construction timed out")
+
+        start_reset = time.time()
+        try:
+            obs, info = call_with_timeout(env_instance.reset, timeout, seed=cfg.seed)
+            reset_time = time.time() - start_reset
+            print(f"[train] env constructed in {construct_time:.2f}s and reset in {reset_time:.2f}s")
+            return env_instance, obs, info, env_cfg
+        except TimeoutError as err:
+            reset_time = time.time() - start_reset
+            # If reset timed out, try fallback to synchronous env when async
+            try:
+                env_instance.close()
+            except Exception:
+                pass
+            if env_cfg.asynchronous:
+                print(f"[train] Async env reset timed out after {timeout}s; retrying with synchronous vector env.")
+                fallback_cfg = dataclasses.replace(env_cfg, asynchronous=False)
+                fallback_env = call_with_timeout(create_vector_env, timeout, fallback_cfg)
+                obs, info = call_with_timeout(fallback_env.reset, timeout, seed=cfg.seed)
+                print(f"[train] fallback env constructed in {construct_time:.2f}s and reset in {time.time()-start_reset:.2f}s")
+                return fallback_env, obs, info, fallback_cfg
+            raise RuntimeError("Vector env reset timed out") from err
+
+    env, obs_np, _, effective_env_cfg = _initialise_env(cfg.env)
+    cfg.env = effective_env_cfg
+
+    # Honor force-sync CLI flag
+    if getattr(args, "force_sync", False):
+        cfg.env = dataclasses.replace(cfg.env, asynchronous=False)
+
+    # Prewarm ROMs / envs to reduce first-time construction cost (can be disabled)
+    if not args.no_prewarm:
+        try:
+            print("[train] prewarming environment (single reset)...")
+            pre_env_cfg = dataclasses.replace(cfg.env, num_envs=1, asynchronous=False)
+            pre_env = create_vector_env(pre_env_cfg)
+            pre_env.reset(seed=cfg.seed)
+            pre_env.close()
+            print("[train] prewarm complete")
+        except Exception as exc:
+            print(f"[train] prewarm failed: {exc}")
+
+    # Start background resource monitor will be created after logger/metrics are set up
 
     def _to_cpu_tensor(array, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         tensor = torch.as_tensor(array, dtype=dtype)
@@ -243,14 +441,28 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     optimizer = AdamW(model.parameters(), lr=cfg.optimizer.learning_rate, weight_decay=cfg.optimizer.weight_decay, eps=1e-5)
     schedule_fn = CosineWithWarmup(cfg.scheduler.warmup_steps, cfg.scheduler.total_steps)
     scheduler = LambdaLR(optimizer, lr_lambda=schedule_fn)
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.mixed_precision)
+    # Use new torch.amp API where available
+    try:
+        scaler = torch.amp.GradScaler(enabled=cfg.mixed_precision)  # type: ignore[attr-defined]
+    except Exception:
+        scaler = torch.cuda.amp.GradScaler(enabled=cfg.mixed_precision)
 
-    writer, wandb_run = create_logger(cfg.log_dir, project=args.wandb_project, resume=bool(cfg.resume_from))
+    writer, wandb_run = create_logger(cfg.log_dir, project=args.wandb_project, resume=bool(cfg.resume_from), enable_tb=bool(args.enable_tensorboard))
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
     maybe_save_config(cfg, args.config_out)
 
     metrics_file = Path(cfg.metrics_path) if cfg.metrics_path else Path(writer.log_dir) / "metrics.jsonl"
     metrics_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Start background resource monitor (safe start)
+    monitor = None
+    if not args.no_monitor:
+        try:
+            monitor = Monitor(writer, wandb_run, metrics_file, interval=args.monitor_interval)
+            monitor.start()
+        except Exception as exc:
+            print(f"[train] Monitor failed to start: {exc}")
+            monitor = None
 
     rollout = RolloutBuffer(cfg.rollout.num_steps, cfg.env.num_envs, env.single_observation_space.shape, device, pin_memory=(device.type == "cuda"))
     per_buffer = None
@@ -289,7 +501,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             rollout.set_initial_hidden(None, None)
 
         for step in range(cfg.rollout.num_steps):
-            with torch.cuda.amp.autocast(enabled=cfg.mixed_precision):
+            # Use torch.amp.autocast with explicit device_type for compatibility
+            with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
                 output = model(obs_gpu, hidden_state, cell_state)
                 logits = output.logits
                 values = output.value
@@ -345,7 +558,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
         sequences = rollout.get_sequences(device)
 
-        with torch.cuda.amp.autocast(enabled=cfg.mixed_precision):
+        with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
             target_output = model(
                 sequences["obs"],
                 sequences["initial_hidden"].hidden,
@@ -377,7 +590,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             per_buffer.push(obs_flat, actions_flat, vs_flat, adv_flat)
             per_sample = per_buffer.sample(cfg.rollout.batch_size)
             if per_sample is not None:
-                with torch.cuda.amp.autocast(enabled=cfg.mixed_precision):
+                with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
                     per_output = model(per_sample.observations, None, None)
                     per_dist = Categorical(logits=per_output.logits)
                     per_values = per_output.value.squeeze(-1)
@@ -398,10 +611,21 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         if (update_idx + 1) % cfg.gradient_accumulation == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optimizer.max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
+            # Execute optimizer step via scaler then advance scheduler only if optimizer succeeded
+            try:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                try:
+                    scheduler.step()
+                except Exception:
+                    pass
+            except Exception:
+                # If optimizer step failed, still zero grads to avoid stale grads
+                try:
+                    optimizer.zero_grad(set_to_none=True)
+                except Exception:
+                    pass
 
         if update_idx % cfg.log_interval == 0:
             loss_total = float(total_loss.item())
@@ -419,6 +643,11 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             writer.add_scalar("Policy/entropy", entropy_val, global_step)
             writer.add_scalar("LearningRate", lr_value, global_step)
             writer.add_scalar("Reward/avg_return", avg_return, global_step)
+
+            print(
+                f"[train] update={update_idx} step={global_step} avg_return={avg_return:.2f} "
+                f"loss={loss_total:.4f} lr={lr_value:.2e}"
+            )
 
             metrics_entry = {
                 "timestamp": time.time(),
@@ -529,10 +758,44 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         if cfg.eval_interval and update_idx % cfg.eval_interval == 0 and update_idx > 0:
             torch.save(model.state_dict(), Path(cfg.save_dir) / "latest_model.pt")
 
-    env.close()
-    writer.close()
-    if wandb_run is not None:
-        wandb_run.finish()
+    # Robust cleanup: ensure resources are closed even if some fail
+    try:
+        # Prefer graceful close, but attempt terminate if available to ensure workers are cleaned up
+        try:
+            env.close()
+        except Exception:
+            try:
+                env.close(terminate=True)  # type: ignore[arg-type]
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        if monitor is not None:
+            monitor.stop()
+    except Exception:
+        pass
+    try:
+        if 'writer' in locals() and writer is not None:
+            writer.close()
+    except Exception:
+        pass
+    try:
+        if 'wandb_run' in locals() and wandb_run is not None:
+            wandb_run.finish()
+    except Exception:
+        pass
+    # Allow subprocesses and file descriptors to settle and run a GC cycle
+    try:
+        time.sleep(0.1)
+    except Exception:
+        pass
+    try:
+        import gc
+
+        gc.collect()
+    except Exception:
+        pass
 
     avg_return = float(np.mean(completed_returns[-100:])) if completed_returns else 0.0
     return {

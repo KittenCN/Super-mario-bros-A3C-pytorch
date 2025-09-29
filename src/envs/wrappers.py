@@ -5,8 +5,16 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Callable, Dict, Optional
 
-import gymnasium as gym
-import numpy as np
+import sys, io
+
+# Temporarily silence stderr during imports that may emit Gym migration notices
+_saved_stderr = sys.stderr
+try:
+    sys.stderr = io.StringIO()
+    import gymnasium as gym
+    import numpy as np
+finally:
+    sys.stderr = _saved_stderr
 
 
 @dataclasses.dataclass

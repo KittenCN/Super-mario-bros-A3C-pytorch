@@ -124,6 +124,13 @@ class MarioActorCritic(nn.Module):
         else:
             if hidden_state is None:
                 hidden_state, cell_state = self.initial_state(batch_size, features.device)
+            # Ensure hidden / cell states match the dtype of features (handles autocast mixed precision)
+            target_dtype = features.dtype
+            if hidden_state is not None and hidden_state.dtype != target_dtype:
+                hidden_state = hidden_state.to(dtype=target_dtype)
+            if cell_state is not None and cell_state.dtype != target_dtype:
+                cell_state = cell_state.to(dtype=target_dtype)
+
             if isinstance(self.recurrent, nn.LSTM):
                 core_output, (next_hidden, next_cell) = self.recurrent(features, (hidden_state, cell_state))
             else:
