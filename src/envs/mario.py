@@ -13,20 +13,55 @@ import numpy as np
 from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 from nes_py.wrappers import JoypadSpace
 
-try:  # pragma: no cover - dependency resolution handled externally
-    import gym_super_mario_bros  # type: ignore
+try:  # pragma: no cover - prefer maintained Gymnasium fork
+    from gymnasium_super_mario_bros import make as mario_make  # type: ignore
+    from gymnasium_super_mario_bros.actions import (  # type: ignore
+        RIGHT_ONLY,
+        SIMPLE_MOVEMENT,
+        COMPLEX_MOVEMENT,
+    )
 except ImportError:
     try:
-        import gymnasium_super_mario_bros as gym_super_mario_bros  # type: ignore
+        from gym_super_mario_bros import make as mario_make  # type: ignore
+        from gym_super_mario_bros.actions import RIGHT_ONLY, SIMPLE_MOVEMENT, COMPLEX_MOVEMENT  # type: ignore
     except ImportError as err:  # pragma: no cover
         raise RuntimeError(
-            "Install gymnasium-super-mario-bros to run this project"
+            "Install gymnasium-super-mario-bros >= 0.8.0"
         ) from err
 
-try:  # pragma: no cover
-    from gym_super_mario_bros.actions import RIGHT_ONLY, SIMPLE_MOVEMENT, COMPLEX_MOVEMENT  # type: ignore
-except ImportError:  # pragma: no cover
-    from gymnasium_super_mario_bros.actions import RIGHT_ONLY, SIMPLE_MOVEMENT, COMPLEX_MOVEMENT  # type: ignore
+
+def _patch_legacy_nes_py_uint8() -> None:
+    """Patch nes_py ROM helpers to avoid numpy uint8 overflow on Python 3.12 / NumPy 2."""
+
+    try:  # pragma: no cover - defensive for alternate forks
+        from nes_py import _rom as nes_rom  # type: ignore
+    except ImportError:  # pragma: no cover
+        return
+
+    rom_cls = getattr(nes_rom, "NESRom", None)
+    if rom_cls is None or getattr(rom_cls, "_uint8_patch_applied", False):  # pragma: no cover
+        return
+
+    def _wrap_property(prop_name: str) -> None:
+        prop = getattr(rom_cls, prop_name, None)
+        if isinstance(prop, property) and prop.fget is not None:
+            original = prop.fget
+
+            def patched(self, _orig=original):
+                value = _orig(self)
+                if hasattr(value, "item"):
+                    return int(value.item())
+                return int(value)
+
+            setattr(rom_cls, prop_name, property(patched))
+
+    for name in ("prg_rom_size", "chr_rom_size", "mapper", "submapper"):
+        _wrap_property(name)
+
+    setattr(rom_cls, "_uint8_patch_applied", True)
+
+
+_patch_legacy_nes_py_uint8()
 
 from .wrappers import MarioRewardWrapper, ProgressInfoWrapper, RewardConfig, TransformObservation, TransformReward
 
@@ -53,7 +88,7 @@ class MarioEnvConfig:
     reward_config: RewardConfig = dataclasses.field(default_factory=RewardConfig)
 
     def env_id(self) -> str:
-        return f"SuperMarioBros-{self.world}-{self.stage}-v0"
+        return f"SuperMarioBros-{self.world}-{self.stage}-v3"
 
 
 @dataclasses.dataclass
@@ -89,7 +124,7 @@ def _make_single_env(config: MarioEnvConfig, seed: Optional[int] = None):
     actions = _select_actions(config.action_type)
 
     def thunk():
-        env = gym_super_mario_bros.make(
+        env = mario_make(
             config.env_id(),
             apply_api_compatibility=True,
             render_mode=config.render_mode,
