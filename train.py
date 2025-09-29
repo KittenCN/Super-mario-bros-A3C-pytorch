@@ -9,9 +9,13 @@ import math
 from pathlib import Path
 from typing import Optional
 
+import os
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import subprocess
+import time
 from torch.distributions import Categorical
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -184,16 +188,34 @@ def maybe_save_config(cfg: TrainingConfig, path: Optional[str]):
 
 
 def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
-    device = torch.device(cfg.device)
+    # Device and performance tuning
+    if cfg.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(cfg.device)
+
+    # Repro/threads
     torch.manual_seed(cfg.seed)
+    # Let PyTorch choose optimal algorithms for benchmarking when input sizes are stable
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    # Use available CPU cores for intra-op parallelism
+    try:
+        cpu_count = os.cpu_count() or 1
+        torch.set_num_threads(max(1, cpu_count // 2))
+    except Exception:
+        pass
 
     env = create_vector_env(cfg.env)
     obs_np, _ = env.reset(seed=cfg.seed)
-    obs = torch.from_numpy(obs_np).to(device, dtype=torch.float32)
+    # Move observations to device using pinned memory and non-blocking copy for better throughput
+    obs = torch.from_numpy(obs_np).pin_memory().to(device, non_blocking=True, dtype=torch.float32)
 
     action_space = env.single_action_space.n
     cfg.model = dataclasses.replace(cfg.model, action_space=action_space, input_channels=env.single_observation_space.shape[0])
     model = prepare_model(cfg, action_space, device)
+    # Single-GPU / CPU path: model is already moved to device in prepare_model
     model.train()
 
     optimizer = AdamW(model.parameters(), lr=cfg.optimizer.learning_rate, weight_decay=cfg.optimizer.weight_decay, eps=1e-5)
@@ -205,7 +227,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
     maybe_save_config(cfg, args.config_out)
 
-    rollout = RolloutBuffer(cfg.rollout.num_steps, cfg.env.num_envs, env.single_observation_space.shape, device)
+    rollout = RolloutBuffer(cfg.rollout.num_steps, cfg.env.num_envs, env.single_observation_space.shape, device, pin_memory=(device.type == "cuda"))
     per_buffer = None
     if cfg.replay.enable:
         per_buffer = PrioritizedReplay(
@@ -254,12 +276,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             next_obs_np, reward_np, terminated, truncated, infos = env.step(actions.cpu().numpy())
             done = np.logical_or(terminated, truncated)
 
-            reward = torch.from_numpy(reward_np).to(device, dtype=torch.float32)
-            done_tensor = torch.from_numpy(done.astype(np.float32)).to(device)
+            # Use pinned memory + non-blocking copy for numerical arrays
+            reward = torch.from_numpy(reward_np).pin_memory().to(device, non_blocking=True, dtype=torch.float32)
+            done_tensor = torch.from_numpy(done.astype(np.float32)).pin_memory().to(device, non_blocking=True)
 
             rollout.insert(step, obs_tensor, actions, log_probs, reward, values, done_tensor)
 
-            obs = torch.from_numpy(next_obs_np).to(device, dtype=torch.float32)
+            obs = torch.from_numpy(next_obs_np).pin_memory().to(device, non_blocking=True, dtype=torch.float32)
             episode_returns += reward_np
             if done.any():
                 for idx_env, flag in enumerate(done):
@@ -373,6 +396,68 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         "global_step": global_step,
                     }
                 )
+
+            # Resource monitoring: GPU/CPU/memory
+            def _get_resource_stats():
+                stats = {}
+                # GPU stats via torch
+                try:
+                    if torch.cuda.is_available():
+                        stats["gpu_count"] = torch.cuda.device_count()
+                        for gi in range(torch.cuda.device_count()):
+                            stats[f"gpu_{gi}_mem_alloc_bytes"] = float(torch.cuda.memory_allocated(gi))
+                            stats[f"gpu_{gi}_mem_reserved_bytes"] = float(torch.cuda.memory_reserved(gi))
+                except Exception:
+                    pass
+
+                # GPU utilization and memory via nvidia-smi (if available)
+                try:
+                    cmd = [
+                        "nvidia-smi",
+                        "--query-gpu=utilization.gpu,memory.used,memory.total",
+                        "--format=csv,noheader,nounits",
+                    ]
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+                    if res.returncode == 0 and res.stdout.strip():
+                        lines = [l for l in res.stdout.strip().splitlines() if l.strip()]
+                        for idx, line in enumerate(lines):
+                            parts = [p.strip() for p in line.split(",")]
+                            if len(parts) >= 3:
+                                util, mem_used, mem_total = parts[:3]
+                                stats[f"gpu_{idx}_util_pct"] = float(util)
+                                stats[f"gpu_{idx}_mem_used_mb"] = float(mem_used)
+                                stats[f"gpu_{idx}_mem_total_mb"] = float(mem_total)
+                except Exception:
+                    pass
+
+                # Process and system stats via psutil if available
+                try:
+                    import psutil
+
+                    p = psutil.Process()
+                    stats["proc_cpu_percent"] = float(p.cpu_percent(interval=None))
+                    stats["proc_mem_rss_bytes"] = float(p.memory_info().rss)
+                    stats["system_cpu_percent"] = float(psutil.cpu_percent(interval=None))
+                    stats["system_mem_percent"] = float(psutil.virtual_memory().percent)
+                except Exception:
+                    try:
+                        load1, load5, load15 = os.getloadavg()
+                        stats["load1"] = float(load1)
+                    except Exception:
+                        pass
+
+                return stats
+
+            stats = _get_resource_stats()
+            for name, val in stats.items():
+                try:
+                    writer.add_scalar(f"Resource/{name}", float(val), global_step)
+                except Exception:
+                    pass
+            if wandb_run is not None and stats:
+                logd = dict(stats)
+                logd["global_step"] = global_step
+                wandb_run.log(logd)
 
         if cfg.checkpoint_interval and update_idx % cfg.checkpoint_interval == 0 and update_idx > 0:
             checkpoint_path = Path(cfg.save_dir) / f"mario_a3c_{update_idx:07d}.pt"

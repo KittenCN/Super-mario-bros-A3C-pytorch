@@ -15,23 +15,28 @@ class HiddenState:
 
 
 class RolloutBuffer:
-    def __init__(self, num_steps: int, num_envs: int, obs_shape: Tuple[int, ...], device: torch.device) -> None:
+    def __init__(self, num_steps: int, num_envs: int, obs_shape: Tuple[int, ...], device: torch.device, pin_memory: bool = True) -> None:
         self.num_steps = num_steps
         self.num_envs = num_envs
         self.device = device
-        self.obs = torch.zeros((num_steps + 1, num_envs, *obs_shape), device=device, dtype=torch.float32)
-        self.actions = torch.zeros((num_steps, num_envs), device=device, dtype=torch.long)
-        self.rewards = torch.zeros((num_steps, num_envs), device=device, dtype=torch.float32)
-        self.dones = torch.zeros((num_steps, num_envs), device=device, dtype=torch.float32)
-        self.behaviour_log_probs = torch.zeros((num_steps, num_envs), device=device, dtype=torch.float32)
-        self.values = torch.zeros((num_steps, num_envs), device=device, dtype=torch.float32)
+        # allocate on CPU using pinned memory to speed up host->device copies
+        cpu_device = torch.device("cpu")
+        pin = pin_memory if device.type == "cuda" else False
+        self.obs = torch.empty((num_steps + 1, num_envs, *obs_shape), device=cpu_device, dtype=torch.float32).pin_memory() if pin else torch.empty((num_steps + 1, num_envs, *obs_shape), device=cpu_device, dtype=torch.float32)
+        self.actions = torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.long).pin_memory() if pin else torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.long)
+        self.rewards = torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32).pin_memory() if pin else torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32)
+        self.dones = torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32).pin_memory() if pin else torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32)
+        self.behaviour_log_probs = torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32).pin_memory() if pin else torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32)
+        self.values = torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32).pin_memory() if pin else torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32)
         self.initial_hidden: HiddenState = HiddenState(None, None)
 
     def to(self, device: torch.device):
         self.device = device
         for attr in ("obs", "actions", "rewards", "dones", "behaviour_log_probs", "values"):
             tensor = getattr(self, attr)
-            setattr(self, attr, tensor.to(device))
+            # use non_blocking if the tensor is pinned in CPU memory
+            kwargs = {"non_blocking": True} if tensor.is_pinned() and device.type == "cuda" else {}
+            setattr(self, attr, tensor.to(device, **kwargs))
         if self.initial_hidden.hidden is not None:
             self.initial_hidden = HiddenState(
                 hidden=self.initial_hidden.hidden.to(device),
