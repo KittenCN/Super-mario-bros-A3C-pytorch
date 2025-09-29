@@ -8,7 +8,7 @@ dependencies:
   - torchvision>=0.16
   - cudatoolkit=12.1
   - gymnasium>=0.28
-  - gymnasium-super-mario-bros>=0.8
+  - gym-super-mario-bros>=7.4
   - nes-py>=8.2
   - opencv>=4.8
   - numpy>=1.24

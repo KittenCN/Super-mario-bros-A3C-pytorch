@@ -1,6 +1,6 @@
 # Super Mario Bros A3C (2025 Edition)
 
-Modernised PyTorch implementation of Asynchronous Advantage Actor-Critic (A3C) for the maintained `gymnasium-super-mario-bros` suite, refreshed with Gymnasium vector environments, IMPALA-style networks, V-trace targets, mixed precision, and advanced tooling for monitoring and hyperparameter search.
+Modernised PyTorch implementation of Asynchronous Advantage Actor-Critic (A3C) for the Super Mario Bros Gymnasium ecosystems (compatible with both `gymnasium-super-mario-bros` and the legacy `gym-super-mario-bros`), refreshed with Gymnasium vector environments, IMPALA-style networks, V-trace targets, mixed precision, and advanced tooling for monitoring and hyperparameter search.
 
 ## Key Features
 
@@ -75,7 +75,7 @@ Training checkpoints land in `trained_models/`, while TensorBoard runs live in `
 ## Requirements & Compatibility
 
 - Python 3.10/3.11, PyTorch ≥ 2.1, CUDA 12 image supplied via Dockerfile.
-- `gymnasium-super-mario-bros>=0.8.0` and `nes-py>=8.2`.
+- `gymnasium-super-mario-bros>=0.8.0` (preferred) or `gym-super-mario-bros>=7.4.0`, plus `nes-py>=8.2`.
 - FFmpeg must be available on the system for video logging.
 
 ## Credits

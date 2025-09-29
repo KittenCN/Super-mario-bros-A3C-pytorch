@@ -13,20 +13,24 @@ import numpy as np
 from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 from nes_py.wrappers import JoypadSpace
 
-try:  # pragma: no cover - prefer maintained Gymnasium fork
+_MARIO_PACKAGE = None
+
+try:  # pragma: no cover - prefer Gymnasium fork when available
     from gymnasium_super_mario_bros import make as mario_make  # type: ignore
     from gymnasium_super_mario_bros.actions import (  # type: ignore
         RIGHT_ONLY,
         SIMPLE_MOVEMENT,
         COMPLEX_MOVEMENT,
     )
+    _MARIO_PACKAGE = "gymnasium-super-mario-bros"
 except ImportError:
     try:
         from gym_super_mario_bros import make as mario_make  # type: ignore
         from gym_super_mario_bros.actions import RIGHT_ONLY, SIMPLE_MOVEMENT, COMPLEX_MOVEMENT  # type: ignore
+        _MARIO_PACKAGE = "gym-super-mario-bros"
     except ImportError as err:  # pragma: no cover
         raise RuntimeError(
-            "Install gymnasium-super-mario-bros >= 0.8.0"
+            "Install gymnasium-super-mario-bros>=0.8.0 or gym-super-mario-bros>=7.4.0"
         ) from err
 
 
@@ -50,7 +54,7 @@ def _patch_legacy_nes_py_uint8() -> None:
             def patched(self, _orig=original):
                 value = _orig(self)
                 if hasattr(value, "item"):
-                    return int(value.item())
+                    value = value.item()
                 return int(value)
 
             setattr(rom_cls, prop_name, property(patched))

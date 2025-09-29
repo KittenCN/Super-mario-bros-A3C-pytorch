@@ -2,7 +2,7 @@
 torch>=2.1.0
 torchvision>=0.16.0
 gymnasium>=0.28.0
-gymnasium-super-mario-bros>=0.8.0
+gym-super-mario-bros>=7.4.0
 nes-py>=8.2.1
 opencv-python>=4.8.0
 numpy>=1.24.0
