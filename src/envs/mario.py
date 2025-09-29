@@ -436,18 +436,161 @@ def create_vector_env(config: MarioVectorEnvConfig):
         _create_diag = None
 
     try:
-        # If using AsyncVectorEnv, force it to use the same multiprocessing
-        # start method as the parent and disable shared_memory. Passing an
-        # explicit context here prevents the vector implementation from
-        # accidentally using a different start method and avoids races when
-        # creating shared memory segments on some platforms.
+        # If using AsyncVectorEnv, prefer to pass a custom worker that first
+        # constructs the environment and writes diagnostics, then delegates
+        # to the original worker implementation. This makes early failures and
+        # long blocking visible and recoverable by the parent process.
+        worker_impl = None
+        try:
+            # gymnasium uses _async_worker
+            from gymnasium.vector.async_vector_env import _async_worker as _orig_async_worker  # type: ignore
+            worker_impl = _orig_async_worker
+        except Exception:
+            try:
+                from gym.vector.async_vector_env import _worker as _orig_worker  # type: ignore
+                worker_impl = _orig_worker
+            except Exception:
+                worker_impl = None
+
+        def _wrap_worker(*args, **kwargs):
+            # Accept arbitrary signature to match gym/gymnasium internal
+            # worker signatures (they vary across versions). We expect the
+            # second positional argument to be env_fn.
+            try:
+                index = args[0]
+                env_fn = args[1]
+            except Exception:
+                env_fn = kwargs.get("env_fn")
+            # Create a diag path local to this worker process
+            try:
+                diag_base = Path(tempfile.gettempdir()) / f"mario_env_diag_{os.getpid()}_{int(time.time())}"
+                diag_base.mkdir(parents=True, exist_ok=True)
+                diag_file = diag_base / f"worker_idx{index}_pid{os.getpid()}.log"
+            except Exception:
+                diag_file = None
+
+            def _d(msg: str):
+                try:
+                    if diag_file is not None:
+                        with open(diag_file, "a", encoding="utf-8") as f:
+                            f.write(f"{time.time():.6f}\t{msg}\n")
+                except Exception:
+                    pass
+
+            _d("worker_start")
+            try:
+                _d("worker_construct_start")
+                # Acquire a filesystem lock to serialize the expensive
+                # environment construction (mario_make / nes_py native init).
+                # This avoids a thundering herd of simultaneous native init
+                # calls which can deadlock or block on shared resources.
+                try:
+                    import fcntl
+
+                    lock_path = Path(tempfile.gettempdir()) / "mario_make.lock"
+                    lock_fd = open(lock_path, "w")
+                    lock_wait = 0.0
+                    lock_timeout = 120.0
+                    acquired = False
+                    while lock_wait < lock_timeout:
+                        try:
+                            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            acquired = True
+                            break
+                        except BlockingIOError:
+                            time.sleep(0.1)
+                            lock_wait += 0.1
+                    if not acquired:
+                        _d(f"lock_acquire_timeout:{lock_timeout}")
+                    else:
+                        _d("lock_acquired")
+                except Exception:
+                    lock_fd = None
+                    _d("lock_unavailable")
+
+                try:
+                    env = env_fn()
+                finally:
+                    try:
+                        if lock_fd is not None:
+                            try:
+                                import fcntl as _fcntl
+
+                                _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+                            except Exception:
+                                pass
+                            try:
+                                lock_fd.close()
+                            except Exception:
+                                pass
+                            _d("lock_released")
+                    except Exception:
+                        pass
+
+                _d("worker_construct_done")
+            except Exception as e:
+                import traceback
+
+                _d(f"worker_construct_error:{repr(e)}")
+                try:
+                    if diag_file is not None:
+                        with open(diag_file, "a", encoding="utf-8") as f:
+                            f.write(traceback.format_exc())
+                except Exception:
+                    pass
+                # Re-raise so parent can observe the failure
+                raise
+
+            # If we have the original worker implementation available, hand
+            # off to it for the standard step/reset/close loop.
+            if worker_impl is not None:
+                _d("delegating_to_orig_worker")
+                # Rebuild arguments with same tail but replace env_fn with
+                # a callable that returns the preconstructed env.
+                new_args = list(args)
+                if len(new_args) >= 2:
+                    new_args[1] = (lambda e=env: e)
+                try:
+                    return worker_impl(*new_args, **kwargs)
+                except TypeError:
+                    # As a fallback, try calling with env_fn keyword
+                    kwargs_copy = dict(kwargs)
+                    kwargs_copy["env_fn"] = (lambda e=env: e)
+                    return worker_impl(*args, **kwargs_copy)
+
+            # Minimal fallback worker loop (compatible with gym's older API).
+            _d("entering_fallback_loop")
+            try:
+                while True:
+                    try:
+                        cmd, data = in_pipe.recv()
+                    except EOFError:
+                        break
+                    if cmd == "step":
+                        o, r, t, tr, info = env.step(data)
+                        out_pipe.send((o, r, t, tr, info))
+                    elif cmd == "reset":
+                        o, info = env.reset(seed=data if isinstance(data, int) else None)
+                        out_pipe.send((o, info))
+                    elif cmd == "close":
+                        try:
+                            env.close()
+                        except Exception:
+                            pass
+                        break
+                    else:
+                        # unknown command, ignore
+                        pass
+            except Exception as e:
+                _d(f"fallback_loop_error:{repr(e)}")
+                raise
+
         if vector_cls is AsyncVectorEnv:
             try:
                 ctx = multiprocessing.get_start_method()
             except Exception:
                 ctx = None
-            # AsyncVectorEnv accepts a 'context' name (str) in newer gym versions
-            vec_env = vector_cls(env_fns, shared_memory=False, context=ctx)
+            vec_env = vector_cls(env_fns, shared_memory=False, context=ctx, worker=_wrap_worker)
         else:
             vec_env = vector_cls(env_fns)
         try:
