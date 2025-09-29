@@ -74,6 +74,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--config-out", type=str, default=None, help="Persist effective config to JSON")
     parser.add_argument("--per", action="store_true", help="Enable prioritized replay (hybrid)")
     parser.add_argument("--project", type=str, default="mario-a3c")
+    parser.add_argument("--metrics-path", type=str, default=None, help="Path to JSONL file for periodic metrics dump")
     return parser.parse_args(argv)
 
 
@@ -131,6 +132,7 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     train_cfg.log_interval = args.log_interval
     train_cfg.resume_from = args.resume
     train_cfg.replay = dataclasses.replace(train_cfg.replay, enable=args.per)
+    train_cfg.metrics_path = args.metrics_path
     return train_cfg
 
 
@@ -200,17 +202,25 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
-    # Use available CPU cores for intra-op parallelism
+    # Use available CPU cores for intra-op parallelism while leaving headroom for env workers
     try:
         cpu_count = os.cpu_count() or 1
-        torch.set_num_threads(max(1, cpu_count // 2))
+        reserve = max(2, cfg.env.num_envs)
+        torch.set_num_threads(max(1, cpu_count - reserve))
     except Exception:
         pass
 
     env = create_vector_env(cfg.env)
     obs_np, _ = env.reset(seed=cfg.seed)
-    # Move observations to device using pinned memory and non-blocking copy for better throughput
-    obs = torch.from_numpy(obs_np).pin_memory().to(device, non_blocking=True, dtype=torch.float32)
+
+    def _to_cpu_tensor(array, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        tensor = torch.as_tensor(array, dtype=dtype)
+        if device.type == "cuda":
+            tensor = tensor.pin_memory()
+        return tensor
+
+    obs_cpu = _to_cpu_tensor(obs_np)
+    obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
 
     action_space = env.single_action_space.n
     cfg.model = dataclasses.replace(cfg.model, action_space=action_space, input_channels=env.single_observation_space.shape[0])
@@ -226,6 +236,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     writer, wandb_run = create_logger(cfg.log_dir, project=args.wandb_project, resume=bool(cfg.resume_from))
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
     maybe_save_config(cfg, args.config_out)
+
+    metrics_file = Path(cfg.metrics_path) if cfg.metrics_path else Path(writer.log_dir) / "metrics.jsonl"
+    metrics_file.parent.mkdir(parents=True, exist_ok=True)
 
     rollout = RolloutBuffer(cfg.rollout.num_steps, cfg.env.num_envs, env.single_observation_space.shape, device, pin_memory=(device.type == "cuda"))
     per_buffer = None
@@ -243,6 +256,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
     global_step = 0
     global_update = 0
+    last_resource_log = 0.0
     episode_returns = np.zeros(cfg.env.num_envs, dtype=np.float32)
     completed_returns: list[float] = []
 
@@ -263,9 +277,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             rollout.set_initial_hidden(None, None)
 
         for step in range(cfg.rollout.num_steps):
-            obs_tensor = obs.clone()
             with torch.cuda.amp.autocast(enabled=cfg.mixed_precision):
-                output = model(obs_tensor, hidden_state, cell_state)
+                output = model(obs_gpu, hidden_state, cell_state)
                 logits = output.logits
                 values = output.value
 
@@ -273,16 +286,20 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             actions = dist.sample()
             log_probs = dist.log_prob(actions)
 
-            next_obs_np, reward_np, terminated, truncated, infos = env.step(actions.cpu().numpy())
+            actions_cpu = actions.detach().cpu()
+            log_probs_cpu = log_probs.detach().cpu()
+            values_cpu = values.detach().cpu()
+
+            next_obs_np, reward_np, terminated, truncated, infos = env.step(actions_cpu.numpy())
             done = np.logical_or(terminated, truncated)
 
-            # Use pinned memory + non-blocking copy for numerical arrays
-            reward = torch.from_numpy(reward_np).pin_memory().to(device, non_blocking=True, dtype=torch.float32)
-            done_tensor = torch.from_numpy(done.astype(np.float32)).pin_memory().to(device, non_blocking=True)
+            reward_cpu = _to_cpu_tensor(reward_np, dtype=torch.float32)
+            done_cpu = _to_cpu_tensor(done.astype(np.float32), dtype=torch.float32)
 
-            rollout.insert(step, obs_tensor, actions, log_probs, reward, values, done_tensor)
+            rollout.insert(step, obs_cpu, actions_cpu, log_probs_cpu, reward_cpu, values_cpu, done_cpu)
 
-            obs = torch.from_numpy(next_obs_np).pin_memory().to(device, non_blocking=True, dtype=torch.float32)
+            obs_cpu = _to_cpu_tensor(next_obs_np)
+            obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
             episode_returns += reward_np
             if done.any():
                 for idx_env, flag in enumerate(done):
@@ -294,12 +311,12 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             if output.hidden_state is not None:
                 hidden_state = output.hidden_state.detach()
                 if done.any():
-                    mask = torch.tensor(done, dtype=torch.bool, device=device)
+                    mask = torch.as_tensor(done, dtype=torch.bool, device=device)
                     hidden_state[:, mask] = 0.0
                 if output.cell_state is not None:
                     cell_state = output.cell_state.detach()
                     if done.any():
-                        mask = torch.tensor(done, dtype=torch.bool, device=device)
+                        mask = torch.as_tensor(done, dtype=torch.bool, device=device)
                         cell_state[:, mask] = 0.0
                 else:
                     cell_state = None
@@ -309,12 +326,12 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
             global_step += cfg.env.num_envs
 
-        rollout.set_next_obs(obs)
+        rollout.set_next_obs(obs_cpu)
 
         with torch.no_grad():
-            bootstrap = model(obs, hidden_state, cell_state).value.detach()
+            bootstrap = model(obs_gpu, hidden_state, cell_state).value.detach()
 
-        sequences = rollout.get_sequences()
+        sequences = rollout.get_sequences(device)
 
         with torch.cuda.amp.autocast(enabled=cfg.mixed_precision):
             target_output = model(
@@ -375,27 +392,37 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             scheduler.step()
 
         if update_idx % cfg.log_interval == 0:
-            writer.add_scalar("Loss/total", total_loss.item(), global_step)
-            writer.add_scalar("Loss/policy", policy_loss.item(), global_step)
-            writer.add_scalar("Loss/value", value_loss.item(), global_step)
-            writer.add_scalar("Loss/per", per_loss.item(), global_step)
-            writer.add_scalar("Policy/entropy", entropy.item(), global_step)
-            writer.add_scalar("LearningRate", scheduler.get_last_lr()[0], global_step)
+            loss_total = float(total_loss.item())
+            loss_policy = float(policy_loss.item())
+            loss_value = float(value_loss.item())
+            loss_per = float(per_loss.item())
+            entropy_val = float(entropy.item())
+            lr_value = float(scheduler.get_last_lr()[0])
             avg_return = float(np.mean(completed_returns[-100:])) if completed_returns else 0.0
+
+            writer.add_scalar("Loss/total", loss_total, global_step)
+            writer.add_scalar("Loss/policy", loss_policy, global_step)
+            writer.add_scalar("Loss/value", loss_value, global_step)
+            writer.add_scalar("Loss/per", loss_per, global_step)
+            writer.add_scalar("Policy/entropy", entropy_val, global_step)
+            writer.add_scalar("LearningRate", lr_value, global_step)
             writer.add_scalar("Reward/avg_return", avg_return, global_step)
+
+            metrics_entry = {
+                "timestamp": time.time(),
+                "update": update_idx,
+                "global_step": global_step,
+                "loss_total": loss_total,
+                "loss_policy": loss_policy,
+                "loss_value": loss_value,
+                "loss_per": loss_per,
+                "entropy": entropy_val,
+                "learning_rate": lr_value,
+                "avg_return": avg_return,
+            }
+
             if wandb_run is not None:
-                wandb_run.log(
-                    {
-                        "loss_total": total_loss.item(),
-                        "loss_policy": policy_loss.item(),
-                        "loss_value": value_loss.item(),
-                        "loss_per": per_loss.item(),
-                        "entropy": entropy.item(),
-                        "lr": scheduler.get_last_lr()[0],
-                        "avg_return": avg_return,
-                        "global_step": global_step,
-                    }
-                )
+                wandb_run.log({**metrics_entry})
 
             # Resource monitoring: GPU/CPU/memory
             def _get_resource_stats():
@@ -448,16 +475,29 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
                 return stats
 
-            stats = _get_resource_stats()
-            for name, val in stats.items():
-                try:
-                    writer.add_scalar(f"Resource/{name}", float(val), global_step)
-                except Exception:
-                    pass
-            if wandb_run is not None and stats:
-                logd = dict(stats)
-                logd["global_step"] = global_step
-                wandb_run.log(logd)
+            stats = {}
+            current_time = time.time()
+            if current_time - last_resource_log >= 60.0:
+                stats = _get_resource_stats()
+                last_resource_log = current_time
+                for name, val in stats.items():
+                    try:
+                        writer.add_scalar(f"Resource/{name}", float(val), global_step)
+                    except Exception:
+                        pass
+                if wandb_run is not None and stats:
+                    logd = dict(stats)
+                    logd["global_step"] = global_step
+                    wandb_run.log(logd)
+
+            if stats:
+                metrics_entry["resource"] = stats
+
+            try:
+                with metrics_file.open("a", encoding="utf-8") as fp:
+                    fp.write(json.dumps(metrics_entry, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
 
         if cfg.checkpoint_interval and update_idx % cfg.checkpoint_interval == 0 and update_idx > 0:
             checkpoint_path = Path(cfg.save_dir) / f"mario_a3c_{update_idx:07d}.pt"

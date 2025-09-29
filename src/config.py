@@ -76,6 +76,7 @@ class TrainingConfig:
     save_dir: str = "trained_models"
     log_dir: str = "tensorboard/a3c_super_mario_bros"
     resume_from: Optional[str] = None
+    metrics_path: Optional[str] = None
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     optimizer: OptimizerConfig = dataclasses.field(default_factory=OptimizerConfig)
@@ -101,4 +102,3 @@ def create_default_stage_schedule(world: int, stage: int, span: int = 4) -> Sequ
         world_idx = world + (stage - 1 + offset) // 4
         stages.append((world_idx, stage_idx))
     return stages
-

@@ -18,30 +18,26 @@ class RolloutBuffer:
     def __init__(self, num_steps: int, num_envs: int, obs_shape: Tuple[int, ...], device: torch.device, pin_memory: bool = True) -> None:
         self.num_steps = num_steps
         self.num_envs = num_envs
-        self.device = device
-        # allocate on CPU using pinned memory to speed up host->device copies
-        cpu_device = torch.device("cpu")
-        pin = pin_memory if device.type == "cuda" else False
-        self.obs = torch.empty((num_steps + 1, num_envs, *obs_shape), device=cpu_device, dtype=torch.float32).pin_memory() if pin else torch.empty((num_steps + 1, num_envs, *obs_shape), device=cpu_device, dtype=torch.float32)
-        self.actions = torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.long).pin_memory() if pin else torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.long)
-        self.rewards = torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32).pin_memory() if pin else torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32)
-        self.dones = torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32).pin_memory() if pin else torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32)
-        self.behaviour_log_probs = torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32).pin_memory() if pin else torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32)
-        self.values = torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32).pin_memory() if pin else torch.empty((num_steps, num_envs), device=cpu_device, dtype=torch.float32)
+        self.target_device = device
+        storage_device = torch.device("cpu")
+        pin = pin_memory and device.type == "cuda"
+
+        def _alloc(shape: Tuple[int, ...], dtype: torch.dtype):
+            tensor = torch.empty(shape, device=storage_device, dtype=dtype)
+            if pin:
+                tensor = tensor.pin_memory()
+            return tensor
+
+        self.obs = _alloc((num_steps + 1, num_envs, *obs_shape), torch.float32)
+        self.actions = _alloc((num_steps, num_envs), torch.long)
+        self.rewards = _alloc((num_steps, num_envs), torch.float32)
+        self.dones = _alloc((num_steps, num_envs), torch.float32)
+        self.behaviour_log_probs = _alloc((num_steps, num_envs), torch.float32)
+        self.values = _alloc((num_steps, num_envs), torch.float32)
         self.initial_hidden: HiddenState = HiddenState(None, None)
 
     def to(self, device: torch.device):
-        self.device = device
-        for attr in ("obs", "actions", "rewards", "dones", "behaviour_log_probs", "values"):
-            tensor = getattr(self, attr)
-            # use non_blocking if the tensor is pinned in CPU memory
-            kwargs = {"non_blocking": True} if tensor.is_pinned() and device.type == "cuda" else {}
-            setattr(self, attr, tensor.to(device, **kwargs))
-        if self.initial_hidden.hidden is not None:
-            self.initial_hidden = HiddenState(
-                hidden=self.initial_hidden.hidden.to(device),
-                cell=self.initial_hidden.cell.to(device) if self.initial_hidden.cell is not None else None,
-            )
+        self.target_device = device
         return self
 
     def reset(self):
@@ -50,8 +46,8 @@ class RolloutBuffer:
         self.initial_hidden = HiddenState(None, None)
 
     def set_initial_hidden(self, hidden: Optional[torch.Tensor], cell: Optional[torch.Tensor]):
-        hidden_detached = hidden.detach().to(self.device) if hidden is not None else None
-        cell_detached = cell.detach().to(self.device) if cell is not None else None
+        hidden_detached = hidden.detach().cpu() if hidden is not None else None
+        cell_detached = cell.detach().cpu() if cell is not None else None
         self.initial_hidden = HiddenState(hidden_detached, cell_detached)
 
     def insert(
@@ -74,8 +70,8 @@ class RolloutBuffer:
     def set_next_obs(self, obs: torch.Tensor):
         self.obs[-1].copy_(obs)
 
-    def get_sequences(self):
-        return {
+    def get_sequences(self, device: Optional[torch.device] = None, non_blocking: bool = True):
+        data = {
             "obs": self.obs[:-1],
             "next_obs": self.obs[-1],
             "actions": self.actions,
@@ -84,4 +80,26 @@ class RolloutBuffer:
             "behaviour_log_probs": self.behaviour_log_probs,
             "values": self.values,
             "initial_hidden": self.initial_hidden,
+        }
+
+        if device is None:
+            return data
+
+        def _to(t: torch.Tensor) -> torch.Tensor:
+            kwargs = {"non_blocking": non_blocking} if t.is_pinned() else {}
+            return t.to(device, **kwargs)
+
+        initial_hidden = self.initial_hidden
+        hidden = _to(initial_hidden.hidden) if initial_hidden.hidden is not None else None
+        cell = _to(initial_hidden.cell) if initial_hidden.cell is not None else None
+
+        return {
+            "obs": _to(data["obs"]),
+            "next_obs": _to(data["next_obs"]),
+            "actions": _to(data["actions"]),
+            "rewards": _to(data["rewards"]),
+            "dones": _to(data["dones"]),
+            "behaviour_log_probs": _to(data["behaviour_log_probs"]),
+            "values": _to(data["values"]),
+            "initial_hidden": HiddenState(hidden=hidden, cell=cell),
         }
