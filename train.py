@@ -74,6 +74,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--config-out", type=str, default=None, help="Persist effective config to JSON")
     parser.add_argument("--per", action="store_true", help="Enable prioritized replay (hybrid)")
     parser.add_argument("--project", type=str, default="mario-a3c")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Device to run training on")
     parser.add_argument("--metrics-path", type=str, default=None, help="Path to JSONL file for periodic metrics dump")
     return parser.parse_args(argv)
 
@@ -132,6 +133,7 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     train_cfg.log_interval = args.log_interval
     train_cfg.resume_from = args.resume
     train_cfg.replay = dataclasses.replace(train_cfg.replay, enable=args.per)
+    train_cfg.device = args.device
     train_cfg.metrics_path = args.metrics_path
     return train_cfg
 
@@ -205,10 +207,20 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     # Use available CPU cores for intra-op parallelism while leaving headroom for env workers
     try:
         cpu_count = os.cpu_count() or 1
-        reserve = max(2, cfg.env.num_envs)
-        torch.set_num_threads(max(1, cpu_count - reserve))
+        if device.type == "cuda":
+            reserve = min(cfg.env.num_envs, max(1, cpu_count // 2))
+            threads = max(1, cpu_count - reserve)
+        else:
+            threads = max(1, cpu_count - 1)
+        torch.set_num_threads(threads)
     except Exception:
         pass
+
+    torch_threads = torch.get_num_threads()
+    print(
+        f"[train] device={device.type} threads={torch_threads} num_envs={cfg.env.num_envs} "
+        f"rollout_steps={cfg.rollout.num_steps} grad_accum={cfg.gradient_accumulation}"
+    )
 
     env = create_vector_env(cfg.env)
     obs_np, _ = env.reset(seed=cfg.seed)
