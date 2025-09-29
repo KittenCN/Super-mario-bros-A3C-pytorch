@@ -10,3 +10,11 @@ Files created/modified by the debugging agent session:
 Notes:
 - These changes were performed to improve robustness and observability of environment construction in systems where native libraries (nes_py, SDL) and NumPy/Python version mismatches can cause runtime failures.
 - See `docs/ENV_DEBUGGING_REPORT.md` for the full experimental log and the recommended next steps.
+
+Additional housekeeping:
+- The following previously root-level markdown files were moved into `docs/` for consolidation:
+	- `docs/PROJECT_ANALYSIS.md` (moved from `PROJECT_ANALYSIS.md`)
+	- `docs/PROJECT_OPTIMIZATION_PLAN.md` (moved from `PROJECT_OPTIMIZATION_PLAN.md`)
+	- `docs/GPU_UTILIZATION_ANALYSIS.md` (moved from `GPU_UTILIZATION_ANALYSIS.md`)
+	- `docs/AGENT.md` (moved from `AGENT.md`)
+
