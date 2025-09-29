@@ -9,7 +9,7 @@ from pathlib import Path
 import time
 import os
 import random
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 import sys, io
 
@@ -241,7 +241,7 @@ class MarioVectorEnvConfig:
     observation_normalize: bool = True
     compile_model: bool = True
     use_amp: bool = True
-    reset_timeout: float = 60.0
+    reset_timeout: float = 180.0
     # Delay in seconds between starting subsequent worker initialisation
     worker_start_delay: float = 0.2
 
@@ -261,7 +261,14 @@ def list_available_stages(max_world: int = 8, max_stage: int = 4) -> List[Tuple[
     return [(world, stage) for world in range(1, max_world + 1) for stage in range(1, max_stage + 1)]
 
 
-def _make_single_env(config: MarioEnvConfig, seed: Optional[int] = None, diag_dir: Optional[str] = None, idx: Optional[int] = None):
+def _make_single_env(
+    config: MarioEnvConfig,
+    seed: Optional[int] = None,
+    diag_dir: Optional[str] = None,
+    idx: Optional[int] = None,
+    startup_event: Optional[Any] = None,
+    next_start_event: Optional[Any] = None,
+):
     actions = _select_actions(config.action_type)
     # Dummy environment returned when creating a single instance in the main
     # process for space inspection. Real NES env will be created in worker
@@ -295,6 +302,24 @@ def _make_single_env(config: MarioEnvConfig, seed: Optional[int] = None, diag_di
             _diag_file = _diag_base / f"env_init_idx{idx}_pid{os.getpid()}.log"
         except Exception:
             _diag_file = None
+
+        if startup_event is not None:
+            try:
+                if _diag_file is not None:
+                    with open(_diag_file, "a", encoding="utf-8") as f:
+                        f.write(f"{time.time():.6f}\tstartup_wait\n")
+            except Exception:
+                pass
+            try:
+                startup_event.wait()
+            except Exception:
+                pass
+            try:
+                if _diag_file is not None:
+                    with open(_diag_file, "a", encoding="utf-8") as f:
+                        f.write(f"{time.time():.6f}\tstartup_granted\n")
+            except Exception:
+                pass
 
         def _diag(msg: str):
             try:
@@ -382,7 +407,20 @@ def _make_single_env(config: MarioEnvConfig, seed: Optional[int] = None, diag_di
             _diag("recordvideo_done")
         # Worker processes will reset as needed; don't reset here.
         _diag("done")
-        return env
+        try:
+            return env
+        finally:
+            if next_start_event is not None:
+                try:
+                    next_start_event.set()
+                except Exception:
+                    pass
+                try:
+                    if _diag_file is not None:
+                        with open(_diag_file, "a", encoding="utf-8") as f:
+                            f.write(f"{time.time():.6f}\tstartup_release\n")
+                except Exception:
+                    pass
 
     return thunk
 
@@ -403,6 +441,28 @@ def create_vector_env(config: MarioVectorEnvConfig):
     # Diagnostic directory to capture per-worker init progress
     diag_dir = str(Path(tempfile.gettempdir()) / f"mario_env_diag_{os.getpid()}_{int(time.time())}")
     print(f"[env] diagnostic dir: {diag_dir}")
+
+    ctx_obj = None
+    startup_events: List[Optional[Any]] = [None] * config.num_envs
+    if config.asynchronous:
+        try:
+            current_method = multiprocessing.get_start_method()
+        except Exception:
+            current_method = None
+        try:
+            ctx_obj = multiprocessing.get_context(current_method) if current_method else multiprocessing.get_context()
+        except Exception:
+            ctx_obj = multiprocessing.get_context()
+        try:
+            startup_events = [ctx_obj.Event() for _ in range(config.num_envs)]
+        except Exception:
+            startup_events = [multiprocessing.Event() for _ in range(config.num_envs)]
+        if startup_events:
+            try:
+                startup_events[0].set()
+            except Exception:
+                pass
+
     for idx in range(config.num_envs):
         if config.random_start_stage:
             world, stage = random.choice(stage_list)
@@ -410,11 +470,21 @@ def create_vector_env(config: MarioVectorEnvConfig):
             world, stage = next(stage_cycle)
         stage_env_cfg = dataclasses.replace(config.env, world=world, stage=stage)
         seed = config.base_seed + idx
+        start_event = startup_events[idx] if idx < len(startup_events) else None
+        next_event = startup_events[idx + 1] if idx + 1 < len(startup_events) else None
+        thunk = _make_single_env(
+            stage_env_cfg,
+            seed=seed,
+            diag_dir=diag_dir,
+            idx=idx,
+            startup_event=start_event,
+            next_start_event=next_event,
+        )
         # Wrap thunk to stagger worker startup when running asynchronously.
         if config.asynchronous and getattr(config, "worker_start_delay", 0.0) > 0.0:
             delay = float(config.worker_start_delay) * float(idx)
 
-            def _thunk_with_delay(fn=_make_single_env(stage_env_cfg, seed=seed, diag_dir=diag_dir, idx=idx), d=delay):
+            def _thunk_with_delay(fn=thunk, d=delay):
                 try:
                     if d > 0:
                         time.sleep(d)
@@ -424,7 +494,7 @@ def create_vector_env(config: MarioVectorEnvConfig):
 
             env_fns.append(_thunk_with_delay)
         else:
-            env_fns.append(_make_single_env(stage_env_cfg, seed=seed, diag_dir=diag_dir, idx=idx))
+            env_fns.append(thunk)
 
     vector_cls = AsyncVectorEnv if config.asynchronous else SyncVectorEnv
     # Create a file to capture vector env construction timing / exceptions
@@ -586,11 +656,26 @@ def create_vector_env(config: MarioVectorEnvConfig):
                 raise
 
         if vector_cls is AsyncVectorEnv:
-            try:
-                ctx = multiprocessing.get_start_method()
-            except Exception:
-                ctx = None
-            vec_env = vector_cls(env_fns, shared_memory=False, context=ctx, worker=_wrap_worker)
+            context_to_use = ctx_obj
+            if context_to_use is None:
+                try:
+                    method = multiprocessing.get_start_method()
+                except Exception:
+                    method = None
+                try:
+                    context_to_use = (
+                        multiprocessing.get_context(method)
+                        if method
+                        else multiprocessing.get_context()
+                    )
+                except Exception:
+                    context_to_use = None
+            vec_env = vector_cls(
+                env_fns,
+                shared_memory=False,
+                context=context_to_use,
+                worker=_wrap_worker,
+            )
         else:
             vec_env = vector_cls(env_fns)
         try:

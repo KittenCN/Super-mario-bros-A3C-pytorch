@@ -166,7 +166,7 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     if args.env_reset_timeout is not None:
         setattr(vec_cfg, "reset_timeout", args.env_reset_timeout)
     else:
-        setattr(vec_cfg, "reset_timeout", max(60.0, args.num_envs * 10.0))
+        setattr(vec_cfg, "reset_timeout", max(180.0, args.num_envs * 60.0))
 
     train_cfg = TrainingConfig()
     train_cfg.seed = args.seed

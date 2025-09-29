@@ -4,6 +4,12 @@ Date: 2025-09-29
 
 This document captures the diagnosis, experiments, observations and suggested fixes performed while investigating instability when constructing `AsyncVectorEnv` for the Super Mario Bros A3C training pipeline. It is intended to survive repository reloads and provide a single source-of-truth for the current state.
 
+## 2025-09-30 更新（本次代理执行）
+
+- 已在 `create_vector_env` 内实现**严格的按序启动机制**：每个 worker 只有在上一个 worker 完成 NES 环境构建后才会开始初始化，从根源上消除了同时调用 `mario_make` 导致的竞争。
+- 同步调整默认环境构建/重置超时时间，现按 `max(180s, num_envs * 60s)` 计算，避免长流程因累计等待而被误判超时。
+- 保留原有文件锁与诊断日志机制，方便继续排查潜在的 NES 底层阻塞问题。
+
 ## Summary of the problem
 
 - Symptom: Training sometimes fails to construct an `AsyncVectorEnv` in the parent process. The parent prints:
