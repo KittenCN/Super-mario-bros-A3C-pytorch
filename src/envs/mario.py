@@ -13,20 +13,28 @@ import numpy as np
 from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 from nes_py.wrappers import JoypadSpace
 
-try:
-    import gym_super_mario_bros
-except ImportError as err:  # pragma: no cover - dependency resolution handled externally
-    raise RuntimeError(
-        "gym_super_mario_bros must be installed. Suggested package: gymnasium-super-mario-bros"
-    ) from err
+try:  # pragma: no cover - dependency resolution handled externally
+    import gym_super_mario_bros  # type: ignore
+except ImportError:
+    try:
+        import gymnasium_super_mario_bros as gym_super_mario_bros  # type: ignore
+    except ImportError as err:  # pragma: no cover
+        raise RuntimeError(
+            "Install gymnasium-super-mario-bros to run this project"
+        ) from err
+
+try:  # pragma: no cover
+    from gym_super_mario_bros.actions import RIGHT_ONLY, SIMPLE_MOVEMENT, COMPLEX_MOVEMENT  # type: ignore
+except ImportError:  # pragma: no cover
+    from gymnasium_super_mario_bros.actions import RIGHT_ONLY, SIMPLE_MOVEMENT, COMPLEX_MOVEMENT  # type: ignore
 
 from .wrappers import MarioRewardWrapper, ProgressInfoWrapper, RewardConfig, TransformObservation, TransformReward
 
 
 _ACTION_SPACES = {
-    "right": gym_super_mario_bros.actions.RIGHT_ONLY,
-    "simple": gym_super_mario_bros.actions.SIMPLE_MOVEMENT,
-    "complex": gym_super_mario_bros.actions.COMPLEX_MOVEMENT,
+    "right": RIGHT_ONLY,
+    "simple": SIMPLE_MOVEMENT,
+    "complex": COMPLEX_MOVEMENT,
 }
 
 
