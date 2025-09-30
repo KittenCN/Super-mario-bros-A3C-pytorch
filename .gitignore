@@ -2,5 +2,6 @@ __pycache__/
 runs/
 tensorboard/
 trained_models/
+output/
 *.pyc
 *.pyo

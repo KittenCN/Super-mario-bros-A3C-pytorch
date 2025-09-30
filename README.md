@@ -22,8 +22,8 @@ pip install -r requirements.txt
 # Train
 python train.py --world 1 --stage 1 --num-envs 8 --total-updates 50000
 
-# Evaluate
-python test.py --world 1 --stage 1 --checkpoint trained_models/latest_model.pt --episodes 5
+# Evaluate (metadata-driven)
+python test.py --checkpoint trained_models/a3c_world1_stage1_latest.pt --episodes 5
 
 # Run TensorBoard (logs written per run timestamp)
 tensorboard --logdir tensorboard/a3c_super_mario_bros
@@ -80,6 +80,8 @@ If you run into environment construction issues with `AsyncVectorEnv` (especiall
 
 - Python 3.10/3.11, PyTorch ≥ 2.1, CUDA 12 image supplied via Dockerfile.
 - `gymnasium-super-mario-bros>=0.8.0` (preferred) or `gym-super-mario-bros>=7.4.0`, plus `nes-py>=8.2`.
+
+> Every checkpoint is saved as `a3c_world{W}_stage{S}_*.pt` alongside a JSON metadata file of the same stem. Evaluation and resumed training automatically consume this metadata, so manual overrides of immutable parameters are no longer required.
 - FFmpeg must be available on the system for video logging.
 
 ## Credits

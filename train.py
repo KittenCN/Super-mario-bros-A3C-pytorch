@@ -57,6 +57,10 @@ import dataclasses
 import json
 import os
 import math
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -65,8 +69,6 @@ import subprocess
 import time
 import threading
 import warnings
-from pathlib import Path
-from typing import Optional
 from torch.distributions import Categorical
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -83,6 +85,11 @@ _suppress_gym_notice(False)
 from src.models import MarioActorCritic
 from src.utils import CosineWithWarmup, PrioritizedReplay, RolloutBuffer, create_logger
 from src.utils.monitor import Monitor
+
+try:  # optional dependency for resource monitoring
+    import psutil  # type: ignore
+except ImportError:  # pragma: no cover
+    psutil = None  # type: ignore
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -252,6 +259,184 @@ def compute_returns(
         advantages[t] = gae
         vs[t] = advantages[t] + values[t]
     return vs, advantages
+
+
+def _checkpoint_stem(cfg: TrainingConfig) -> str:
+    env_cfg = cfg.env.env
+    return f"a3c_world{env_cfg.world}_stage{env_cfg.stage}"
+
+
+def _serialise_stage_schedule(schedule: Sequence[Tuple[int, int]]) -> list[list[int]]:
+    return [[int(world), int(stage)] for world, stage in schedule]
+
+
+def _build_checkpoint_metadata(
+    cfg: TrainingConfig,
+    global_step: int,
+    update_idx: int,
+    variant: str,
+) -> Dict[str, Any]:
+    env_cfg = cfg.env.env
+    vector_cfg = cfg.env
+    metadata: Dict[str, Any] = {
+        "version": 1,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "world": env_cfg.world,
+        "stage": env_cfg.stage,
+        "action_type": env_cfg.action_type,
+        "frame_skip": env_cfg.frame_skip,
+        "frame_stack": env_cfg.frame_stack,
+        "video_dir": env_cfg.video_dir,
+        "record_video": env_cfg.record_video,
+        "vector_env": {
+            "num_envs": vector_cfg.num_envs,
+            "asynchronous": vector_cfg.asynchronous,
+            "stage_schedule": _serialise_stage_schedule(vector_cfg.stage_schedule),
+            "random_start_stage": vector_cfg.random_start_stage,
+            "base_seed": vector_cfg.base_seed,
+        },
+        "model": dataclasses.asdict(cfg.model),
+        "save_state": {
+            "global_step": int(global_step),
+            "global_update": int(update_idx),
+            "type": variant,
+        },
+    }
+    return metadata
+
+
+def _write_metadata(base_path: Path, metadata: Dict[str, Any]) -> None:
+    metadata_path = base_path.with_suffix(".json")
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def load_checkpoint_metadata(path: Path) -> Dict[str, Any]:
+    metadata_path = path.with_suffix(".json")
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Checkpoint metadata not found: {metadata_path}")
+    return json.loads(metadata_path.read_text(encoding="utf-8"))
+
+
+def _metadata_matches_config(metadata: Dict[str, Any], cfg: TrainingConfig) -> bool:
+    env_cfg = cfg.env.env
+    if int(metadata.get("world", env_cfg.world)) != env_cfg.world:
+        return False
+    if int(metadata.get("stage", env_cfg.stage)) != env_cfg.stage:
+        return False
+    if str(metadata.get("action_type", env_cfg.action_type)) != env_cfg.action_type:
+        return False
+    if int(metadata.get("frame_skip", env_cfg.frame_skip)) != env_cfg.frame_skip:
+        return False
+    if int(metadata.get("frame_stack", env_cfg.frame_stack)) != env_cfg.frame_stack:
+        return False
+
+    vector_meta = metadata.get("vector_env", {})
+    vector_cfg = cfg.env
+    if int(vector_meta.get("num_envs", vector_cfg.num_envs)) != vector_cfg.num_envs:
+        return False
+    if bool(vector_meta.get("asynchronous", vector_cfg.asynchronous)) != vector_cfg.asynchronous:
+        return False
+    if bool(vector_meta.get("random_start_stage", vector_cfg.random_start_stage)) != vector_cfg.random_start_stage:
+        return False
+    if int(vector_meta.get("base_seed", vector_cfg.base_seed)) != vector_cfg.base_seed:
+        return False
+    schedule_meta = vector_meta.get("stage_schedule")
+    target_schedule = _serialise_stage_schedule(vector_cfg.stage_schedule)
+    if schedule_meta != target_schedule:
+        return False
+
+    model_meta = metadata.get("model")
+    if not isinstance(model_meta, dict):
+        return False
+    model_cfg = dataclasses.asdict(cfg.model)
+    for key, value in model_cfg.items():
+        if model_meta.get(key) != value:
+            return False
+
+    return True
+
+
+def find_matching_checkpoint(cfg: TrainingConfig) -> Optional[Tuple[Path, Dict[str, Any]]]:
+    save_dir = Path(cfg.save_dir)
+    if not save_dir.exists():
+        return None
+
+    matches: List[Tuple[int, int, int, Path, Dict[str, Any]]] = []
+    for metadata_path in save_dir.glob("a3c_world*_stage*.json"):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not _metadata_matches_config(metadata, cfg):
+            continue
+        checkpoint_path = metadata_path.with_suffix(".pt")
+        if not checkpoint_path.exists():
+            continue
+        save_state = metadata.get("save_state", {})
+        update_idx = int(save_state.get("global_update", 0))
+        global_step = int(save_state.get("global_step", 0))
+        variant = str(save_state.get("type", "checkpoint"))
+        priority = 1 if variant == "checkpoint" else 0
+        matches.append((update_idx, priority, global_step, checkpoint_path, metadata))
+
+    if not matches:
+        return None
+
+    matches.sort(reverse=True)
+    _, _, _, path, metadata = matches[0]
+    return path, metadata
+
+
+def save_checkpoint(
+    cfg: TrainingConfig,
+    model: MarioActorCritic,
+    optimizer: AdamW,
+    scheduler: LambdaLR,
+    scaler: torch.cuda.amp.GradScaler,
+    global_step: int,
+    update_idx: int,
+) -> Path:
+    base_dir = Path(cfg.save_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = base_dir / f"{_checkpoint_stem(cfg)}_{update_idx:07d}.pt"
+    payload = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "global_step": global_step,
+        "global_update": update_idx,
+        "config": dataclasses.asdict(cfg),
+    }
+    torch.save(payload, checkpoint_path)
+    metadata = _build_checkpoint_metadata(cfg, global_step, update_idx, variant="checkpoint")
+    _write_metadata(checkpoint_path, metadata)
+    return checkpoint_path
+
+
+def save_model_snapshot(
+    cfg: TrainingConfig,
+    model: MarioActorCritic,
+    global_step: int,
+    update_idx: int,
+) -> Path:
+    base_dir = Path(cfg.save_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = base_dir / f"{_checkpoint_stem(cfg)}_latest.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "global_step": global_step,
+            "global_update": update_idx,
+        },
+        snapshot_path,
+    )
+    metadata = _build_checkpoint_metadata(cfg, global_step, update_idx, variant="latest")
+    _write_metadata(snapshot_path, metadata)
+    return snapshot_path
 
 
 def maybe_save_config(cfg: TrainingConfig, path: Optional[str]):
@@ -447,7 +632,24 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     except Exception:
         scaler = torch.cuda.amp.GradScaler(enabled=cfg.mixed_precision)
 
-    writer, wandb_run = create_logger(cfg.log_dir, project=args.wandb_project, resume=bool(cfg.resume_from), enable_tb=bool(args.enable_tensorboard))
+    resume_path: Optional[Path] = None
+    resume_metadata: Optional[Dict[str, Any]] = None
+    if cfg.resume_from:
+        resume_path = Path(cfg.resume_from)
+        resume_metadata = load_checkpoint_metadata(resume_path)
+        if not _metadata_matches_config(resume_metadata, cfg):
+            raise ValueError("Resume checkpoint metadata is incompatible with current configuration.")
+    else:
+        found = find_matching_checkpoint(cfg)
+        if found is not None:
+            resume_path, resume_metadata = found
+
+    writer, wandb_run = create_logger(
+        cfg.log_dir,
+        project=args.wandb_project,
+        resume=bool(resume_path),
+        enable_tb=bool(args.enable_tensorboard),
+    )
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
     maybe_save_config(cfg, args.config_out)
 
@@ -484,14 +686,15 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     episode_returns = np.zeros(cfg.env.num_envs, dtype=np.float32)
     completed_returns: list[float] = []
 
-    if cfg.resume_from:
-        checkpoint = torch.load(cfg.resume_from, map_location=device)
+    if resume_path is not None:
+        checkpoint = torch.load(resume_path, map_location=device)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         scaler.load_state_dict(checkpoint["scaler"])
         global_step = checkpoint.get("global_step", 0)
         global_update = checkpoint.get("global_update", 0)
+        print(f"[train] Resuming training from {resume_path}")
 
     for update_idx in range(global_update, cfg.total_updates):
         rollout.reset()
@@ -699,15 +902,18 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     pass
 
                 # Process and system stats via psutil if available
-                try:
-                    import psutil
-
-                    p = psutil.Process()
-                    stats["proc_cpu_percent"] = float(p.cpu_percent(interval=None))
-                    stats["proc_mem_rss_bytes"] = float(p.memory_info().rss)
-                    stats["system_cpu_percent"] = float(psutil.cpu_percent(interval=None))
-                    stats["system_mem_percent"] = float(psutil.virtual_memory().percent)
-                except Exception:
+                collected = False
+                if psutil is not None:
+                    try:
+                        p = psutil.Process()
+                        stats["proc_cpu_percent"] = float(p.cpu_percent(interval=None))
+                        stats["proc_mem_rss_bytes"] = float(p.memory_info().rss)
+                        stats["system_cpu_percent"] = float(psutil.cpu_percent(interval=None))
+                        stats["system_mem_percent"] = float(psutil.virtual_memory().percent)
+                        collected = True
+                    except Exception:
+                        pass
+                if not collected:
                     try:
                         load1, load5, load15 = os.getloadavg()
                         stats["load1"] = float(load1)
@@ -741,22 +947,18 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 pass
 
         if cfg.checkpoint_interval and update_idx % cfg.checkpoint_interval == 0 and update_idx > 0:
-            checkpoint_path = Path(cfg.save_dir) / f"mario_a3c_{update_idx:07d}.pt"
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "scaler": scaler.state_dict(),
-                    "global_step": global_step,
-                    "global_update": update_idx,
-                    "config": dataclasses.asdict(cfg),
-                },
-                checkpoint_path,
+            checkpoint_path = save_checkpoint(
+                cfg,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                global_step,
+                update_idx,
             )
 
         if cfg.eval_interval and update_idx % cfg.eval_interval == 0 and update_idx > 0:
-            torch.save(model.state_dict(), Path(cfg.save_dir) / "latest_model.pt")
+            save_model_snapshot(cfg, model, global_step, update_idx)
 
     # Robust cleanup: ensure resources are closed even if some fail
     try:

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
+import json
 from pathlib import Path
-from typing import Optional
+from typing import Dict
 
 import numpy as np
 import torch
@@ -18,63 +18,80 @@ from src.models import MarioActorCritic
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a trained Mario policy")
-    parser.add_argument("--world", type=int, default=1)
-    parser.add_argument("--stage", type=int, default=1)
-    parser.add_argument("--action-type", type=str, default="complex", choices=["right", "simple", "complex"])
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--episodes", type=int, default=5)
-    parser.add_argument("--render", action="store_true")
-    parser.add_argument("--video-dir", type=str, default="output/eval")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to the trained model checkpoint (.pt)")
+    parser.add_argument("--episodes", type=int, default=5, help="Number of evaluation episodes")
+    parser.add_argument("--render", action="store_true", help="Render the environment during evaluation")
+    parser.add_argument("--video-dir", type=str, default=None, help="Directory to store evaluation videos (defaults to metadata)")
+    parser.add_argument("--no-video", action="store_true", help="Disable video recording even if metadata enables it")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--hidden-size", type=int, default=512)
-    parser.add_argument("--frame-skip", type=int, default=4)
-    parser.add_argument("--frame-stack", type=int, default=4)
-    parser.add_argument("--recurrent-type", type=str, default="gru", choices=["gru", "lstm", "transformer", "none"])
-    parser.add_argument("--transformer-layers", type=int, default=2)
-    parser.add_argument("--transformer-heads", type=int, default=4)
-    parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--use-noisy-linear", action="store_true")
     return parser.parse_args()
 
 
-def build_eval_config(args: argparse.Namespace) -> EvaluationConfig:
+def _metadata_path(checkpoint_path: Path) -> Path:
+    return checkpoint_path.with_suffix(".json")
+
+
+def load_checkpoint_metadata(checkpoint_path: Path) -> Dict:
+    metadata_path = _metadata_path(checkpoint_path)
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+    return json.loads(metadata_path.read_text(encoding="utf-8"))
+
+
+def build_eval_config(args: argparse.Namespace, metadata: Dict) -> EvaluationConfig:
+    video_dir = args.video_dir or metadata.get("video_dir", "output/eval")
+    record_video = not args.no_video
     env_cfg = MarioEnvConfig(
-        world=args.world,
-        stage=args.stage,
-        action_type=args.action_type,
-        frame_skip=args.frame_skip,
-        frame_stack=args.frame_stack,
-        record_video=True,
-        video_dir=args.video_dir,
+        world=int(metadata["world"]),
+        stage=int(metadata["stage"]),
+        action_type=str(metadata.get("action_type", "complex")),
+        frame_skip=int(metadata.get("frame_skip", 4)),
+        frame_stack=int(metadata.get("frame_stack", 4)),
+        record_video=record_video,
+        video_dir=video_dir,
     )
-    return EvaluationConfig(episodes=args.episodes, video_dir=args.video_dir, render=args.render, env=env_cfg)
+    return EvaluationConfig(
+        episodes=args.episodes,
+        video_dir=video_dir,
+        record_video=record_video,
+        render=args.render,
+        env=env_cfg,
+    )
 
 
-def load_model(checkpoint_path: str, action_space: int, cfg: argparse.Namespace, device: torch.device) -> MarioActorCritic:
-    model_cfg = ModelConfig(
-        input_channels=cfg.frame_stack,
-        action_space=action_space,
-        hidden_size=cfg.hidden_size,
-        recurrent_type="none" if cfg.recurrent_type == "none" else cfg.recurrent_type,
-        transformer_layers=cfg.transformer_layers,
-        transformer_heads=cfg.transformer_heads,
-        dropout=cfg.dropout,
-        use_noisy_linear=cfg.use_noisy_linear,
-    )
+def load_model(checkpoint_path: Path, metadata: Dict, device: torch.device) -> MarioActorCritic:
+    model_data = metadata.get("model")
+    if not isinstance(model_data, dict):
+        raise ValueError("Checkpoint metadata is missing required 'model' configuration.")
+    model_cfg = ModelConfig(**model_data)
     model = MarioActorCritic(model_cfg).to(device)
     state_dict = torch.load(checkpoint_path, map_location=device)
     if isinstance(state_dict, dict) and "model" in state_dict:
-        model.load_state_dict(state_dict["model"])
+        model_state = state_dict["model"]
     else:
-        model.load_state_dict(state_dict)
+        model_state = state_dict
+    if any(key.startswith("_orig_mod.") for key in model_state.keys()):
+        model_state = {
+            key.split("_orig_mod.", 1)[1]: value
+            for key, value in model_state.items()
+            if key.startswith("_orig_mod.")
+        }
+    model.load_state_dict(model_state)
     model.eval()
     return model
 
 
-def evaluate(model: MarioActorCritic, cfg: EvaluationConfig, device: torch.device):
-    env = create_eval_env(cfg.env, seed=cfg.episodes)
+def evaluate(model: MarioActorCritic, cfg: EvaluationConfig, metadata: Dict, device: torch.device):
+    env = create_eval_env(cfg.env, seed=metadata.get("vector_env", {}).get("base_seed"))
     total_rewards = []
-    Path(cfg.video_dir).mkdir(parents=True, exist_ok=True)
+    if cfg.record_video:
+        Path(cfg.video_dir).mkdir(parents=True, exist_ok=True)
+    expected_actions = metadata.get("model", {}).get("action_space")
+    if expected_actions is not None and hasattr(env.action_space, "n"):
+        if env.action_space.n != int(expected_actions):
+            raise ValueError(
+                f"Action space mismatch: metadata expects {expected_actions}, environment reports {env.action_space.n}."
+            )
     for episode in range(cfg.episodes):
         obs, info = env.reset()
         obs = torch.from_numpy(obs).to(device, dtype=torch.float32)
@@ -97,7 +114,11 @@ def evaluate(model: MarioActorCritic, cfg: EvaluationConfig, device: torch.devic
             if cfg.render:
                 env.render()
         total_rewards.append(cumulative_reward)
-        print(f"Episode {episode + 1}: reward={cumulative_reward:.2f}, flag={info.get('flag_get', False)}")
+        world = metadata.get("world")
+        stage = metadata.get("stage")
+        print(
+            f"Episode {episode + 1} (World {world} Stage {stage}): reward={cumulative_reward:.2f}, flag={info.get('flag_get', False)}"
+        )
 
     print(f"Average reward over {cfg.episodes} episodes: {np.mean(total_rewards):.2f}")
     env.close()
@@ -105,14 +126,12 @@ def evaluate(model: MarioActorCritic, cfg: EvaluationConfig, device: torch.devic
 
 def main():
     args = parse_args()
-    eval_cfg = build_eval_config(args)
+    checkpoint_path = Path(args.checkpoint)
+    metadata = load_checkpoint_metadata(checkpoint_path)
+    eval_cfg = build_eval_config(args, metadata)
     device = torch.device(args.device)
-    env = create_eval_env(eval_cfg.env)
-    action_space = env.action_space.n
-    env.close()
-
-    model = load_model(args.checkpoint, action_space, args, device)
-    evaluate(model, eval_cfg, device)
+    model = load_model(checkpoint_path, metadata, device)
+    evaluate(model, eval_cfg, metadata, device)
 
 
 if __name__ == "__main__":
