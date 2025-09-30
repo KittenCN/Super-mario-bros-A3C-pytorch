@@ -644,7 +644,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         if found is not None:
             resume_path, resume_metadata = found
 
-    writer, wandb_run = create_logger(
+    writer, wandb_run, run_dir = create_logger(
         cfg.log_dir,
         project=args.wandb_project,
         resume=bool(resume_path),
@@ -653,7 +653,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
     maybe_save_config(cfg, args.config_out)
 
-    metrics_file = Path(cfg.metrics_path) if cfg.metrics_path else Path(writer.log_dir) / "metrics.jsonl"
+    metrics_file = Path(cfg.metrics_path).expanduser() if cfg.metrics_path else Path(run_dir) / "metrics.jsonl"
     metrics_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Start background resource monitor (safe start)
@@ -686,6 +686,11 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     episode_returns = np.zeros(cfg.env.num_envs, dtype=np.float32)
     completed_returns: list[float] = []
 
+    last_grad_norm = 0.0
+    last_log_time = time.time()
+    last_log_step = global_step
+    last_log_update = global_update
+
     if resume_path is not None:
         checkpoint = torch.load(resume_path, map_location=device)
         model.load_state_dict(checkpoint["model"])
@@ -695,6 +700,10 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         global_step = checkpoint.get("global_step", 0)
         global_update = checkpoint.get("global_update", 0)
         print(f"[train] Resuming training from {resume_path}")
+
+    last_log_step = global_step
+    last_log_update = global_update
+    last_log_time = time.time()
 
     for update_idx in range(global_update, cfg.total_updates):
         rollout.reset()
@@ -813,7 +822,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
         if (update_idx + 1) % cfg.gradient_accumulation == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optimizer.max_grad_norm)
+            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optimizer.max_grad_norm)
+            last_grad_norm = float(grad_norm_tensor)
             # Execute optimizer step via scaler then advance scheduler only if optimizer succeeded
             try:
                 scaler.step(optimizer)
@@ -837,7 +847,17 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             loss_per = float(per_loss.item())
             entropy_val = float(entropy.item())
             lr_value = float(scheduler.get_last_lr()[0])
-            avg_return = float(np.mean(completed_returns[-100:])) if completed_returns else 0.0
+            recent_returns = completed_returns[-100:] if completed_returns else []
+            avg_return = float(np.mean(recent_returns)) if recent_returns else 0.0
+            return_std = float(np.std(recent_returns)) if recent_returns else 0.0
+            return_max = float(np.max(recent_returns)) if recent_returns else 0.0
+            return_min = float(np.min(recent_returns)) if recent_returns else 0.0
+            now = time.time()
+            updates_since_last = max(update_idx - last_log_update, 1)
+            steps_since_last = max(global_step - last_log_step, cfg.env.num_envs)
+            elapsed = max(now - last_log_time, 1e-6)
+            updates_per_sec = updates_since_last / elapsed
+            env_steps_per_sec = steps_since_last / elapsed
 
             writer.add_scalar("Loss/total", loss_total, global_step)
             writer.add_scalar("Loss/policy", loss_policy, global_step)
@@ -846,10 +866,12 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             writer.add_scalar("Policy/entropy", entropy_val, global_step)
             writer.add_scalar("LearningRate", lr_value, global_step)
             writer.add_scalar("Reward/avg_return", avg_return, global_step)
+            writer.add_scalar("Reward/recent_std", return_std, global_step)
+            writer.add_scalar("Grad/global_norm", last_grad_norm, global_step)
 
             print(
                 f"[train] update={update_idx} step={global_step} avg_return={avg_return:.2f} "
-                f"loss={loss_total:.4f} lr={lr_value:.2e}"
+                f"loss={loss_total:.4f} lr={lr_value:.2e} grad={last_grad_norm:.3f}"
             )
 
             metrics_entry = {
@@ -863,6 +885,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 "entropy": entropy_val,
                 "learning_rate": lr_value,
                 "avg_return": avg_return,
+                "recent_return_std": return_std,
+                "recent_return_max": return_max,
+                "recent_return_min": return_min,
+                "episodes_completed": len(completed_returns),
+                "grad_norm": last_grad_norm,
+                "env_steps_per_sec": env_steps_per_sec,
+                "updates_per_sec": updates_per_sec,
             }
 
             if wandb_run is not None:
@@ -945,6 +974,10 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     fp.write(json.dumps(metrics_entry, ensure_ascii=False) + "\n")
             except Exception:
                 pass
+
+            last_log_time = now
+            last_log_step = global_step
+            last_log_update = update_idx
 
         if cfg.checkpoint_interval and update_idx % cfg.checkpoint_interval == 0 and update_idx > 0:
             checkpoint_path = save_checkpoint(
