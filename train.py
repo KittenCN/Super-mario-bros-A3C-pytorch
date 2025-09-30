@@ -134,7 +134,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--log-dir", type=str, default="tensorboard/a3c_super_mario_bros")
     parser.add_argument("--save-dir", type=str, default="trained_models")
     parser.add_argument("--eval-interval", type=int, default=5_000)
-    parser.add_argument("--checkpoint-interval", type=int, default=10_000)
+    parser.add_argument("--checkpoint-interval", type=int, default=1_000)
     parser.add_argument("--log-interval", type=int, default=100)
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--wandb-project", type=str, default=None)
