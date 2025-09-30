@@ -52,7 +52,7 @@ import dataclasses
 import json
 import os
 import math
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -302,7 +302,8 @@ def _build_checkpoint_metadata(
     vector_cfg = cfg.env
     metadata: Dict[str, Any] = {
         "version": 1,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        # 使用时区感知 UTC 时间避免弃用警告
+        "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "world": env_cfg.world,
         "stage": env_cfg.stage,
         "action_type": env_cfg.action_type,
@@ -327,12 +328,28 @@ def _build_checkpoint_metadata(
     return metadata
 
 
+def _json_default(obj):  # noqa: D401 - 简短工具函数
+    """JSON 序列化回退：转换 numpy / Path / 其它不可序列化对象。"""
+    try:
+        import numpy as _np  # 局部导入避免启动加重
+        if isinstance(obj, (_np.integer,)):
+            return int(obj)
+        if isinstance(obj, (_np.floating,)):
+            return float(obj)
+        if isinstance(obj, (_np.ndarray,)):
+            return obj.tolist()
+    except Exception:
+        pass
+    if isinstance(obj, Path):
+        return str(obj)
+    # 最后兜底
+    return str(obj)
+
+
 def _write_metadata(base_path: Path, metadata: Dict[str, Any]) -> None:
     metadata_path = base_path.with_suffix(".json")
-    metadata_path.write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    payload = json.dumps(metadata, indent=2, ensure_ascii=False, default=_json_default)
+    metadata_path.write_text(payload, encoding="utf-8")
 
 
 def load_checkpoint_metadata(path: Path) -> Dict[str, Any]:
@@ -1018,6 +1035,10 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     fp.write(json.dumps(metrics_entry, ensure_ascii=False) + "\n")
             except Exception:
                 pass
+
+            # 训练健康度检查：长时间没有完成 episode 可能意味着仍在使用 Dummy env（历史 bug）或奖励逻辑异常
+            if update_idx > 0 and len(completed_returns) == 0 and update_idx % (cfg.log_interval * 10) == 0:
+                print("[train][warn] No completed episodes yet – verify environments are real (not Dummy) and reward/done signals are propagating.")
 
             last_log_time = now
             last_log_step = global_step

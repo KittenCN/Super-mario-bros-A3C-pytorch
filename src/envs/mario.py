@@ -268,6 +268,7 @@ def _make_single_env(
     idx: Optional[int] = None,
     startup_event: Optional[Any] = None,
     next_start_event: Optional[Any] = None,
+    allow_dummy_in_main: bool = True,
 ):
     actions = _select_actions(config.action_type)
     # Dummy environment returned when creating a single instance in the main
@@ -288,10 +289,9 @@ def _make_single_env(
             return obs, 0.0, False, False, {}
 
     def thunk():
-        # If we are in the main process, return a lightweight dummy env to
-        # avoid performing heavy native initialization (ROM loading, C++ lib
-        # setup). Worker processes will construct the real env.
-        if multiprocessing.current_process().name == "MainProcess":
+        # 仅在异步模式（worker 进程会真正创建 env）时、且允许的情况下在 MainProcess 返回 Dummy
+        # 同步模式 (SyncVectorEnv) 下 env_fns 永远在主进程运行，不能返回 Dummy，否则训练得到全 0 奖励/永不 done。
+        if allow_dummy_in_main and multiprocessing.current_process().name == "MainProcess":
             obs_shape = (config.frame_stack, 84, 84)
             return _DummyEnv(obs_shape, len(actions))
         # Prepare a simple diagnostics file so worker startup progress can be
@@ -524,6 +524,8 @@ def create_vector_env(config: MarioVectorEnvConfig):
             idx=idx,
             startup_event=start_event,
             next_start_event=next_event,
+            # 只有异步模式下允许 main process 返回 Dummy。同步模式必须真实构建 env。
+            allow_dummy_in_main=bool(config.asynchronous),
         )
         # Wrap thunk to stagger worker startup when running asynchronously.
         if config.asynchronous and getattr(config, "worker_start_delay", 0.0) > 0.0:
