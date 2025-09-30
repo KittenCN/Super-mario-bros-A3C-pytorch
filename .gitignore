@@ -3,5 +3,6 @@ runs/
 tensorboard/
 trained_models/
 output/
+.ipynb_checkpoints/
 *.pyc
 *.pyo
