@@ -5,23 +5,24 @@ from __future__ import annotations
 # Set multiprocessing start method at the very top to avoid fork-related
 # deadlocks when native extensions or thread pools are initialised later.
 import multiprocessing as _mp
+# Choose a safe multiprocessing start method if one hasn't been set yet.
+# Avoid forcing `fork` early as it can cause deadlocks when other threads
+# or native extensions are initialised. Prefer `forkserver` then `spawn`.
 try:
-    # Prefer 'fork' where available so the parent process can pre-initialise
-    # native libraries (nes_py, SDL, etc.) and have worker processes inherit
-    # that warmed state. If 'fork' is unsupported or unsafe on the platform,
-    # fall back to 'forkserver' or 'spawn'. We attempt this at module import
-    # time before other imports to avoid creating threads that make 'fork'
-    # unsafe.
-    _mp.set_start_method("fork", force=True)
+    current_method = _mp.get_start_method(allow_none=True)
+    if current_method is None:
+        for _method in ("forkserver", "spawn", "fork"):
+            try:
+                _mp.set_start_method(_method, force=False)
+                print(f"[train] multiprocessing start method set to {_method}")
+                break
+            except (RuntimeError, ValueError):
+                # method not available or already initialised; try next
+                continue
 except Exception:
-    try:
-        _mp.set_start_method("forkserver", force=True)
-    except Exception:
-        try:
-            _mp.set_start_method("spawn", force=True)
-        except Exception:
-            # If none can be set, proceed with whatever the default is.
-            pass
+    # Best-effort: if we cannot query/set the start method, continue with
+    # whatever the runtime default provides.
+    pass
 
 # Suppress the legacy Gym startup notice that prints to stderr when gym is
 # installed alongside gymnasium. We temporarily replace sys.stderr around the
@@ -44,14 +45,8 @@ _suppress_gym_notice(True)
 import argparse
 import multiprocessing as _mp
 
-# Prefer 'forkserver' start method to avoid fork-related deadlocks when native
-# extensions or thread pools are initialised in the parent process. Fall back
-# gracefully if unsupported on the current platform.
-try:
-    _mp.set_start_method("forkserver", force=False)
-except Exception:
-    # If start method already set or unsupported, continue.
-    pass
+# Ensure we don't attempt to override an already-initialised start method
+# later in the module; the selection above is sufficient.
 
 import dataclasses
 import json
@@ -81,6 +76,8 @@ from src.config import (
     create_default_stage_schedule,
 )
 from src.envs import MarioEnvConfig, MarioVectorEnvConfig, create_vector_env
+# Import patch utilities to allow parent process to prewarm and patch nes_py
+from src.envs.mario import _patch_legacy_nes_py_uint8, _patch_nes_py_ram_dtype
 _suppress_gym_notice(False)
 from src.models import MarioActorCritic
 from src.utils import CosineWithWarmup, PrioritizedReplay, RolloutBuffer, create_logger
@@ -120,6 +117,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--tau", type=float, default=1.0)
     parser.add_argument("--clip-grad", type=float, default=0.5)
     parser.add_argument("--sync-env", action="store_true", help="Use synchronous vector env")
+    parser.add_argument("--async-env", action="store_true", help="Force asynchronous vector env")
     parser.add_argument("--force-sync", action="store_true", help="Force synchronous vector env (overrides async heuristic)")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--no-compile", action="store_true")
@@ -157,8 +155,15 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
         frame_skip=args.frame_skip,
         frame_stack=args.frame_stack,
     )
-    async_flag = not args.sync_env
+    # Default to synchronous vector env unless the user explicitly requests async.
+    # Priority: force_sync -> explicit async flag -> sync flag -> default sync
     if getattr(args, "force_sync", False):
+        async_flag = False
+    elif getattr(args, "async_env", False):
+        async_flag = True
+    elif getattr(args, "sync_env", False):
+        async_flag = False
+    else:
         async_flag = False
     vec_cfg = MarioVectorEnvConfig(
         num_envs=args.num_envs,
@@ -512,6 +517,18 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     if args.parent_prewarm:
         try:
             print("[train] parent prewarming environment (single reset)...")
+            # Apply nes_py compatibility patches in the parent process before
+            # constructing vector envs/workers. This reduces the probability of
+            # worker-side OverflowError in nes_py when using newer Python/NumPy.
+            try:
+                _patch_legacy_nes_py_uint8()
+            except Exception:
+                pass
+            try:
+                _patch_nes_py_ram_dtype()
+            except Exception:
+                pass
+
             pre_env_cfg = dataclasses.replace(cfg.env, num_envs=1, asynchronous=False)
             pre_env = create_vector_env(pre_env_cfg)
             pre_env.reset(seed=args.seed)
@@ -534,6 +551,16 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     # rotate stage schedule to pick per-index stage deterministically
                     # this mirrors create_vector_env stage selection and therefore
                     # warms the same code paths.
+                    # Apply patches before each prewarm to be extra safe.
+                    try:
+                        _patch_legacy_nes_py_uint8()
+                    except Exception:
+                        pass
+                    try:
+                        _patch_nes_py_ram_dtype()
+                    except Exception:
+                        pass
+
                     pre_env = create_vector_env(single_cfg)
                     pre_env.reset(seed=cfg.seed + idx)
                     pre_env.close()

@@ -18,8 +18,8 @@
 - `src/envs/mario.py`：<br>`src/envs/mario.py`:
   - 逐 worker 生成 `/tmp/mario_env_diag_<parentpid>_<ts>/worker_idx<pid>.log`，记录 `start`、`patch_start`、`patch_uint8_ok`、`import_*`、`calling_mario_make` 等事件。<br>Per worker diagnostic logs at `/tmp/mario_env_diag_<parentpid>_<ts>/worker_idx<pid>.log` recording events such as `start`, `patch_start`, `patch_uint8_ok`, `import_*`, and `calling_mario_make`.
   - `_patch_legacy_nes_py_uint8()` 与 `_patch_nes_py_ram_dtype()` 修复 uint8 溢出及 RAM dtype 不兼容问题。<br>`_patch_legacy_nes_py_uint8()` and `_patch_nes_py_ram_dtype()` mitigate uint8 overflows and RAM dtype mismatches.
-  - `_wrap_worker` 包装器在构造环境时写入诊断信息，并使用 `mario_make.lock` 串行化重型初始化。<br>The `_wrap_worker` wrapper logs diagnostics during env construction and uses `mario_make.lock` to serialise heavy initialisation.
-  - 构建 `AsyncVectorEnv` 时传入 `shared_memory=False`、指定 `context`，同时允许自定义 worker。<br>When creating `AsyncVectorEnv`, `shared_memory=False` and an explicit `context` are provided along with the custom worker.
+- `_make_single_env` 在 `mario_make` 调用前获取文件锁并写入诊断日志，保证重型初始化串行化。<br>`_make_single_env` acquires a file lock and logs diagnostics before invoking `mario_make`, keeping the heavy initialisation serialised.
+  - 构建 `AsyncVectorEnv` 时传入 `shared_memory=False` 并依据平台推导 `context`，避免默认共享内存导致的关闭异常。<br>When creating `AsyncVectorEnv`, pass `shared_memory=False` and derive the appropriate `context` per platform to avoid shutdown issues tied to shared memory.
 - `train.py`：<br>`train.py`:
   - 添加 CLI 参数：`--parent-prewarm`、`--parent-prewarm-all`、`--worker-start-delay`、`--env-reset-timeout`、`--enable-tensorboard`。<br>Added CLI flags: `--parent-prewarm`, `--parent-prewarm-all`, `--worker-start-delay`, `--env-reset-timeout`, `--enable-tensorboard`.
   - 将父进程预热移动到构建向量环境之前，以便主进程先加载 NES 相关库。<br>Moved parent prewarm ahead of vector-env construction so the main process can preload NES libraries.
