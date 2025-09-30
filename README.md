@@ -34,6 +34,14 @@ python scripts/optuna_search.py --trials 5
 
 > **提示 | Tip**：默认依赖 `torch>=2.1`。如改用 `gymnasium-super-mario-bros`，请同步调整 `requirements.txt`。<br>Default dependency targets `torch>=2.1`. If you switch to `gymnasium-super-mario-bros`, update `requirements.txt` accordingly.
 
+### 无元数据 JSON 的评估回退 | Evaluation Without Metadata JSON
+如果遗失了与 checkpoint 同名的 `.json` 元数据文件（例如只保留了 `a3c_world1_stage1_latest.pt`），`test.py` 会：
+1. 尝试从 checkpoint 内部 `config` 字段重建必要信息；
+2. 若无 `config`，依据文件名模式 `a3c_world{W}_stage{S}_...` 推断 world 与 stage；
+3. 写出重建后的 `*.json` 旁路文件并继续评估。
+若以上步骤均失败则仍会抛出错误。你可以手动补齐一个最小 JSON（参考已存在的其他 checkpoint 元数据）。<br>
+If the sidecar metadata JSON is missing, `test.py` will reconstruct it from the checkpoint payload or filename pattern and persist a new JSON. If reconstruction fails, create a minimal JSON manually referencing another checkpoint as a template.
+
 ## 配置要点 | Configuration Highlights
 - CLI 参数覆盖环境、模型、优化、日志等选项，可通过 `python train.py --help` 查看完整列表。<br>CLI flags cover environment, model, optimisation, and logging options; run `python train.py --help` for the full list.
 - 常用参数：`--num-envs`、`--rollout-steps`、`--recurrent-type {gru,lstm,transformer,none}`、`--entropy-beta`、`--value-coef`、`--clip-grad`、`--random-stage`、`--stage-span`、`--per`。<br>Key flags include `--num-envs`, `--rollout-steps`, `--recurrent-type {gru,lstm,transformer,none}`, `--entropy-beta`, `--value-coef`, `--clip-grad`, `--random-stage`, `--stage-span`, and `--per`.

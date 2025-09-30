@@ -686,7 +686,9 @@ def create_vector_env(config: MarioVectorEnvConfig):
 
 
 def create_eval_env(config: MarioEnvConfig, seed: Optional[int] = None):
-    """Create a single evaluation environment with rendering enabled."""
+    """Create a single evaluation environment with rendering enabled.
 
+    注意：评估时需要真实环境（不能返回 Dummy），否则会导致 episode 永不结束。
+    """
     eval_cfg = dataclasses.replace(config, render_mode="rgb_array")
-    return _make_single_env(eval_cfg, seed=seed)()
+    return _make_single_env(eval_cfg, seed=seed, allow_dummy_in_main=False)()
