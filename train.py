@@ -118,6 +118,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--clip-grad", type=float, default=0.5)
     parser.add_argument("--sync-env", action="store_true", help="Use synchronous vector env")
     parser.add_argument("--async-env", action="store_true", help="Force asynchronous vector env")
+    parser.add_argument(
+        "--confirm-async",
+        action="store_true",
+        help=(
+            "Explicit confirmation to enable asynchronous vector env. "
+            "Async mode is known to be unstable in some environments; "
+            "set environment variable MARIO_ENABLE_ASYNC=1 or pass this flag to opt in."
+        ),
+    )
     parser.add_argument("--force-sync", action="store_true", help="Force synchronous vector env (overrides async heuristic)")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--no-compile", action="store_true")
@@ -155,12 +164,20 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
         frame_skip=args.frame_skip,
         frame_stack=args.frame_stack,
     )
-    # Default to synchronous vector env unless the user explicitly requests async.
-    # Priority: force_sync -> explicit async flag -> sync flag -> default sync
+    # Default to synchronous vector env unless the user explicitly requests async
+    # and confirms they accept the instability risk. Priority:
+    # force_sync -> explicit async flag + confirmation/env -> sync flag -> default sync
     if getattr(args, "force_sync", False):
         async_flag = False
     elif getattr(args, "async_env", False):
-        async_flag = True
+        # Require explicit confirmation or environment opt-in to enable async mode
+        env_allow = os.environ.get("MARIO_ENABLE_ASYNC", "0") == "1"
+        if getattr(args, "confirm_async", False) or env_allow:
+            async_flag = True
+        else:
+            print("[train] Async mode requested but not confirmed; defaulting to synchronous vector env. "
+                  "To enable async, set MARIO_ENABLE_ASYNC=1 or pass --confirm-async.")
+            async_flag = False
     elif getattr(args, "sync_env", False):
         async_flag = False
     else:
