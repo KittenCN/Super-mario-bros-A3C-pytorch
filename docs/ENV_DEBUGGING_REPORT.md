@@ -1,119 +1,50 @@
-# Environment & AsyncVectorEnv Debugging Report
+# AsyncVectorEnv 调试报告 | AsyncVectorEnv Debugging Report
 
-Date: 2025-09-29
+**记录日期 | Logged on**: 2025-09-29 ～ 2025-09-30
 
-This document captures the diagnosis, experiments, observations and suggested fixes performed while investigating instability when constructing `AsyncVectorEnv` for the Super Mario Bros A3C training pipeline. It is intended to survive repository reloads and provide a single source-of-truth for the current state.
+本文汇整在构建 `AsyncVectorEnv` 时遇到的阻塞、溢出等问题，以及针对 `nes_py` 的修复尝试、实验数据与后续建议，确保团队在仓库重置后也能快速上手。<br>This report captures the blocking and overflow issues observed while constructing `AsyncVectorEnv`, the runtime patches applied to `nes_py`, experiments that were run, and suggested next steps so the team can pick up the investigation after repository resets.
 
-## 2025-09-30 更新（本次代理执行）
+## 最新变更摘要 | Latest Update (2025-09-30)
+- 在 `create_vector_env` 中引入严格的按序启动：每个 worker 需等待前一个 NES 构建完成后再初始化，避免并发 `mario_make` 引发竞争。<br>Serialised worker start-up in `create_vector_env` so each worker waits for the previous NES construction to finish, preventing concurrent `mario_make` contention.
+- 将默认构建/重置超时设为 `max(180s, num_envs × 60s)`，兼顾大规模并发带来的累积等待。<br>Set the default construct/reset timeout to `max(180s, num_envs × 60s)` to accommodate accumulated waits in large asynchronous batches.
+- 保留文件锁与诊断日志机制，便于继续分析潜在的 NES 底层阻塞。<br>Retained the file-lock and diagnostic logging mechanisms to keep visibility into potential NES-level stalls.
 
-- 已在 `create_vector_env` 内实现**严格的按序启动机制**：每个 worker 只有在上一个 worker 完成 NES 环境构建后才会开始初始化，从根源上消除了同时调用 `mario_make` 导致的竞争。
-- 同步调整默认环境构建/重置超时时间，现按 `max(180s, num_envs * 60s)` 计算，避免长流程因累计等待而被误判超时。
-- 保留原有文件锁与诊断日志机制，方便继续排查潜在的 NES 底层阻塞问题。
+## 问题概述 | Problem Summary
+- 现象：父进程构建 `AsyncVectorEnv` 时偶发超时并回退到同步环境，同时输出 “Async vector env construction timed out…”。<br>Symptom: the parent process sporadically times out while building `AsyncVectorEnv`, prints “Async vector env construction timed out…”, and falls back to the synchronous env.
+- 额外现象：在 Python 3.12 + NumPy 2.x 下，单进程运行 `gym_super_mario_bros.make(...)` 会触发 `nes_py` 的 `OverflowError: Python integer 1024 out of bounds for uint8`。<br>Additional symptom: on Python 3.12 + NumPy 2.x, a single-process `gym_super_mario_bros.make(...)` call in `nes_py` raises `OverflowError: Python integer 1024 out of bounds for uint8`.
+- 诊断日志显示 worker 停在 `calling_mario_make` 处，有时崩溃（未打补丁），有时静默挂起（已打补丁），推测阻塞发生在 NES 原生初始化阶段。<br>Diagnostics show workers reaching `calling_mario_make` and then either crashing (without patches) or hanging silently (with patches), indicating the stall occurs during NES native initialisation.
 
-## Summary of the problem
+## 诊断入口 | Instrumentation
+- `src/envs/mario.py`：<br>`src/envs/mario.py`:
+  - 逐 worker 生成 `/tmp/mario_env_diag_<parentpid>_<ts>/worker_idx<pid>.log`，记录 `start`、`patch_start`、`patch_uint8_ok`、`import_*`、`calling_mario_make` 等事件。<br>Per worker diagnostic logs at `/tmp/mario_env_diag_<parentpid>_<ts>/worker_idx<pid>.log` recording events such as `start`, `patch_start`, `patch_uint8_ok`, `import_*`, and `calling_mario_make`.
+  - `_patch_legacy_nes_py_uint8()` 与 `_patch_nes_py_ram_dtype()` 修复 uint8 溢出及 RAM dtype 不兼容问题。<br>`_patch_legacy_nes_py_uint8()` and `_patch_nes_py_ram_dtype()` mitigate uint8 overflows and RAM dtype mismatches.
+  - `_wrap_worker` 包装器在构造环境时写入诊断信息，并使用 `mario_make.lock` 串行化重型初始化。<br>The `_wrap_worker` wrapper logs diagnostics during env construction and uses `mario_make.lock` to serialise heavy initialisation.
+  - 构建 `AsyncVectorEnv` 时传入 `shared_memory=False`、指定 `context`，同时允许自定义 worker。<br>When creating `AsyncVectorEnv`, `shared_memory=False` and an explicit `context` are provided along with the custom worker.
+- `train.py`：<br>`train.py`:
+  - 添加 CLI 参数：`--parent-prewarm`、`--parent-prewarm-all`、`--worker-start-delay`、`--env-reset-timeout`、`--enable-tensorboard`。<br>Added CLI flags: `--parent-prewarm`, `--parent-prewarm-all`, `--worker-start-delay`, `--env-reset-timeout`, `--enable-tensorboard`.
+  - 将父进程预热移动到构建向量环境之前，以便主进程先加载 NES 相关库。<br>Moved parent prewarm ahead of vector-env construction so the main process can preload NES libraries.
 
-- Symptom: Training sometimes fails to construct an `AsyncVectorEnv` in the parent process. The parent prints:
-  - "Async vector env construction timed out after <N>s; retrying with synchronous vector env." and then falls back to synchronous env.
-- Additional symptom: In single-process reproduction, `nes_py` raised OverflowError: `Python integer 1024 out of bounds for uint8` on Python 3.12 + NumPy 2.x.
-- Observation: diagnostic logs written by worker thunks show workers reach `calling_mario_make` and then either crash with OverflowError (if patches not applied) or become silent (hang) after `calling_mario_make` (if patches applied). This indicates blocking inside `mario_make` / nes_py / native initialization.
+## 观测时间线 | Observed Timeline
+1. 未打补丁时，单进程 `mario_make` 稳定复现 `OverflowError`，定位到 `nes_py/_rom.py`。<br>Without patches, single-process `mario_make` consistently triggers `OverflowError` originating from `nes_py/_rom.py`.
+2. 加入补丁后，溢出错误明显减少，但父进程仍会在多次运行中超时。<br>After applying patches, the overflow largely disappears yet the parent still times out in multiple runs.
+3. 诊断日志显示 worker 已进入 `calling_mario_make` 并偶尔拿到文件锁，但部分 worker 不再输出事件，怀疑卡在原生初始化。<br>Diagnostics show workers entering `calling_mario_make` and sometimes acquiring the lock, but some stop logging afterwards, suggesting a stall in native initialisation.
+4. 尝试更换多进程 start method（`fork` → `forkserver` → `spawn`）仅带来概率改善。<br>Switching the multiprocessing start method (`fork` → `forkserver` → `spawn`) only improved reliability probabilistically.
+5. `parent-prewarm-all`、`worker_start_delay`、`shared_memory=False`、文件锁串行化等手段缓解并发压力，但无法完全根除超时。<br>`parent-prewarm-all`, `worker_start_delay`, `shared_memory=False`, and file-lock serialisation reduce contention but do not eliminate timeouts entirely.
 
-## Where diagnostics were added
+## 已完成实验 | Experiments Conducted
+- **nes_py 补丁**：在 worker 与父进程预热阶段应用，显著降低 OverflowError 频率。<br>**nes_py patches**: applied during worker and parent prewarm phases, dramatically reducing OverflowError frequency.
+- **预热策略**：`--parent-prewarm` 与 `--parent-prewarm-all` 快速加载 ROM/库，减轻子进程初始化压力。<br>**Prewarm strategies**: `--parent-prewarm` and `--parent-prewarm-all` preload ROMs/libraries, easing child-process initialisation cost.
+- **启动延迟**：`--worker-start-delay` 以阶梯方式启动 worker，缓解“羊群效应”。<br>**Staggered start**: `--worker-start-delay` staggers worker start-up to mitigate the thundering herd effect.
+- **共享内存禁用**：`shared_memory=False` 避免 `AsyncVectorEnv` 在关闭阶段出现 EBADF 异常。<br>**Shared memory disabled**: `shared_memory=False` prevents EBADF exceptions during async env shutdown.
+- **文件锁串行化**：确保 `mario_make` 在同一时刻仅由一个进程执行，证明可减少超时但仍需超长等待。<br>**File-lock serialisation**: guarantees only one process runs `mario_make` at a time, reducing timeouts but still suffering from long waits.
 
-- `src/envs/mario.py`:
-  - Per-worker diagnostic files under `/tmp/mario_env_diag_<parentpid>_<ts>/worker_idx<pid>.log` capturing stage timestamps and events: `start`, `patch_start`, `patch_uint8_ok`, `patch_ramdtype_ok`, `import_start_gsm`, `import_done_gsm`, `calling_mario_make`, and additional worker-side logs.
-  - Runtime patches: `_patch_legacy_nes_py_uint8()` and `_patch_nes_py_ram_dtype()` to mitigate numpy uint8 → Python int overflow.
-  - A wrapped worker (`_wrap_worker`) that constructs the env inside the worker, logs progress and delegates to the original gym/gymnasium worker loop if available. The wrapper also implements a filesystem lock (`mario_make.lock`) to serialize heavy initialization.
-  - `create_vector_env` tries to pass `worker=_wrap_worker` when constructing `AsyncVectorEnv` and sets `shared_memory=False` and `context` to the parent start method.
+## 遗留问题 | Outstanding Issues
+- 异常仍然依赖时间与启动顺序，未完全复现/根除；需要进一步定位 NES 原生层的阻塞原因。<br>Timeouts still depend on timing and launch order; the root cause at the NES native layer needs deeper inspection.
+- Windows/macOS 平台的表现未充分验证，当前结论以 Linux 为主。<br>Behaviour on Windows/macOS remains under-tested; conclusions currently focus on Linux setups.
+- 预热与串行化增加构建耗时，在高并发场景中需要平衡稳定性与启动速度。<br>Prewarm and serialisation add start-up latency, so their trade-offs must be evaluated under high concurrency.
 
-- `train.py`:
-  - CLI flags added: `--parent-prewarm`, `--parent-prewarm-all`, `--worker-start-delay`, `--env-reset-timeout`, and `--enable-tensorboard` (default off).
-  - Parent prewarm was moved to run before vector env construction to warm native libs in the parent.
-
-## Observed behaviour (chronology)
-
-1. On an unpatched codepath (no nes_py patches), single-process reproduction of `gym_super_mario_bros.make(...)` raised `OverflowError` pointing into `nes_py/_rom.py` (numeric dtype issue).
-2. After adding nes_py runtime patches (in worker thumbs and parent prewarm), the OverflowError disappeared in many reproductions, but parent still reported Async construct timeouts in multiple runs.
-3. Diagnostic files show workers successfully reach `calling_mario_make` and sometimes `lock_acquired`; many runs stop producing further logs after `calling_mario_make` -> indicating the worker is blocked inside `mario_make()` or subsequent native initialization.
-4. Attempts tried and their immediate effects:
-   - Changing multiprocessing start method ordering (tried spawn, forkserver, then fork as primary) — mixed results: `fork` helps prewarm inheritance but not fully reliable; `spawn` can avoid some deadlocks but suffers from repeated heavy initializations.
-   - `parent-prewarm-all` (sequentially build 1-env instances in parent) — reduced some races but did not fully eliminate Async construct timeouts.
-   - `worker_start_delay` (staggering worker startup) — reduces probability of thundering herd but not a guarantee.
-   - Passing `shared_memory=False` to `AsyncVectorEnv` — avoids shared memory races/EBADF but does not remove blocking in `mario_make`.
-   - Implemented `wrap_worker` to expose worker-side errors/tracebacks into diagnostics — increased visibility but many runs still blocked inside `mario_make`.
-   - Added a file lock around `mario_make` in the worker to serialize native init — this reduced concurrent initialization pressure and allowed some workers to complete construct, but parent sometimes still timed out because some workers take long.
-
-## Experimental results (what was tried & outcome)
-
-- nes_py patches (uint8 → int key properties, and RAM dtype astype to int64):
-  - Implemented and executed in worker thunk and parent prewarm.
-  - Result: OverflowError reproducible before patch; after patch the error largely disappears in single-process tests.
-
-- Parent prewarm (single + all):
-  - Moved to run before AsyncVectorEnv construction.
-  - `--parent-prewarm` (single env) and `--parent-prewarm-all` (sequentially prewarm every worker config) both implemented.
-  - Result: Helps but does not fully eliminate Async construction timeouts in all runs.
-
-- Multiprocessing start method experiments:
-  - Tried `spawn`, `forkserver`, `fork` ordering.
-  - Result: `fork` allows prewarm inheritance but can be unsafe if threads are present; `spawn` avoids fork issues but multiplies first-time init cost.
-
-- Wrapped worker + file lock:
-  - Implemented `_wrap_worker` to log worker events; added `mario_make.lock` to serialize heavy init.
-  - Result: Increased visibility (per-worker logs have worker_construct_start/lock_acquired). Lock reduces concurrency but some workers still take long enough to cause parent timeout. Parent still falls back to Sync in some runs.
-
-- Passing `worker` to AsyncVectorEnv and `shared_memory=False`:
-  - Implemented to reduce FD/shm races.
-  - Result: Avoids EBADF in teardown; doesn't eliminate long blocking in `mario_make`.
-
-## Current diagnosis
-
-- The core blocker appears to be heavy native initialization in `mario_make()` / nes_py (SDL, ROM parsing, C extensions) which, when performed concurrently across multiple processes, can block/serialize internally or contend on system resources (I/O, locks, SDL display resources) causing some workers to take long time or hang.
-- While nes_py numeric dtype bugs were real and patched, they are not the sole cause of the Async timeout behaviour.
-- Serializing init (lock) or staggering helps but doesn't fully guarantee parent-timeout-free behaviour: some environments still take longer than the parent's configured timeout (60s by default), so parent falls back to Sync.
-
-## Recommendations & possible solutions (with status)
-
-1. Immediate / conservative (Recommended for 10-hour runs):
-   - Force synchronous vector env (`--force-sync`) for long runs. This is stable and has been verified in short tests. Trade-off: less sampling throughput but high reliability.
-   - Use `--parent-prewarm-all` to warm libraries in parent before training. This reduces rare first-use stalls.
-   - Increase `--env-reset-timeout` to a generous value (e.g., 300s) to reduce unintended fallbacks during early init.
-   - Status: Implemented and tested (Sync works reliably under short runs).
-
-2. Medium-term (improve Async reliability without sacrificing throughput):
-   - Implement sequential worker startup (strict ordered start): start worker 0, wait for worker-ready signal (explicit IPC), then start worker 1, etc. This is more invasive but avoids thundering herd and is likely to stabilize Async. I can implement this as the next step.
-   - Alternatively, implement batched startup (start 2–4 workers at a time) if fully sequential is too slow.
-   - Status: partially implemented ideas (we have wrap_worker and lock), but full sequential-start orchestration not yet implemented.
-
-3. Deeper / last-resort solutions:
-   - Investigate upgrading/downgrading native dependencies (nes_py, gymnasium/gym, gymnasium-super-mario-bros) to versions known to be stable on Python 3.12 + NumPy 2.x, or pin to Python 3.10/3.11 runtime where problematic behaviours are not present.
-   - If possible, move heavy native init to parent and serialize or snapshot state that workers can reuse (this requires intimate knowledge of nes_py internals and may not be feasible).
-   - Status: Not implemented (requires external package changes or deeper reverse-engineering of native libs).
-
-4. Observability & safety improvements (small changes that help long runs):
-   - Periodic checkpoints (`--checkpoint-interval`) and monitor process (`--monitor-interval`) to capture resource metrics.
-   - Persistent logging of per-worker diagnostics (already implemented under `/tmp/mario_env_diag_*`).
-   - Status: Implemented.
-
-## How to proceed now (concrete options)
-
-- If you want to run a 10-hour job right away and prefer safety: run with `--force-sync`, `--parent-prewarm-all`, and an expanded `--env-reset-timeout` as suggested above.
-- If you want to use Async for throughput, I recommend I implement sequential worker startup (option 2 above). I can do that next and run a short 5–15 minute smoke test to validate stability.
-
-## Locations of artefacts & logs
-
-- Code changes made:
-  - `src/envs/mario.py`: worker wrap, nes_py patches, diag logging, serialization lock, AsyncVectorEnv options.
-  - `train.py`: CLI flags, parent prewarm ordering, start-method adjustments.
-  - `src/utils/logger.py`: TensorBoard default-off changes.
-
-- Diagnostics:
-  - Per-worker logs: `/tmp/mario_env_diag_<parentpid>_<ts>/*` (contains `env_init_*.log` and `worker_idx*.log`).
-
-## Immediate next steps I can implement (pick one)
-
-1. Implement sequential worker startup (strongly recommended if you need Async) — I'll implement and run a short test.
-2. Increase default timeouts, worker_start_delay, lock timeout and run another battery of tests (quick).
-3. Stop here and use synchronous mode for long runs.
-
----
-Generated and updated by the in-repo debugging session on 2025-09-29. Keep this file under `docs/` so it's available after session restarts.
+## 推荐后续动作 | Recommended Next Steps
+- 使用 PyTorch Profiler 与 NVTX 标记测量 `mario_make` 周边代码的耗时，确定阻塞边界。<br>Profile sections around `mario_make` with the PyTorch Profiler and NVTX markers to pinpoint stall boundaries.
+- 进一步实验 `envpool` 或其他 C++ 向量环境方案，验证能否彻底替代 Python 进程池。<br>Experiment with `envpool` or other C++ vector-env solutions to assess whether they can replace the Python process pool entirely.
+- 维护 `docs/ENV_DEBUGGING_REPORT.md` 日志，记录每次新增实验的配置、结果及对稳定性的影响。<br>Keep this report updated with configuration details, results, and stability impact for every new experiment.
+- 若查明 NES 原生库瓶颈，考虑为 `nes_py` 提交补丁或构建本地替代实现。<br>If the NES native bottleneck is identified, consider upstreaming patches to `nes_py` or developing a local replacement implementation.

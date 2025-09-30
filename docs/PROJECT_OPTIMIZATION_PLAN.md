@@ -1,74 +1,41 @@
-# Super Mario Bros A3C 项目优化迭代计划
+# Super Mario Bros A3C 项目优化计划 | Project Optimisation Plan
 
-## 目标概述
+本计划概述 12 周内让 Super Mario Bros A3C 管线更高效、更稳定、更易复现的关键举措。<br>This plan outlines the 12-week roadmap to make the Super Mario Bros A3C pipeline faster, more stable, and easier to reproduce.
 
-- 提升训练效率与稳定性，将单机多进程 A3C 升级为可扩展的分布式/向量化训练框架。
-- 提高模型表现，引入更强的特征提取、序列建模与探索机制，缩短收敛时间。
-- 完善工程化能力，便于复现实验、自动化评估与可视化监控。
+## 核心目标 | Core Objectives
+- 提升训练吞吐与稳定性，使单机多进程方案可平滑扩展到分布式或更高并发。<br>Increase training throughput and stability so the single-machine multi-process design can scale to distributed or higher-concurrency setups.
+- 增强模型表现，引入更强特征提取、序列建模与探索策略，加快收敛。<br>Boost policy performance with stronger feature extractors, sequence models, and exploration strategies to speed up convergence.
+- 完善工程化能力，覆盖环境搭建、监控、测试、部署的全链路。<br>Harden engineering practices spanning environment setup, monitoring, testing, and deployment.
 
-## 核心技术升级方向
+## 技术升级方向 | Technical Upgrades
+- **环境与框架**：迁移至最新 `Gymnasium`/`nes-py`，深入利用 `gymnasium.vector.AsyncVectorEnv` 或 `envpool`，并引入随机关卡增强泛化。<br>**Environment & framework**: migrate to up-to-date `Gymnasium`/`nes-py`, leverage `gymnasium.vector.AsyncVectorEnv` or `envpool`, and add randomised stages for generalisation.
+- **模型与算法**：结合 `torch.compile`、AMP、IMPALA 残差骨干、GTrXL/GRU/LSTM 序列模块、NoisyNet 探索及 V-trace/R2D2 截断回传。<br>**Model & algorithm**: combine `torch.compile`, AMP, IMPALA residual backbones, GTrXL/GRU/LSTM modules, NoisyNet exploration, and V-trace/R2D2 truncated BPTT.
+- **训练策略**：采用 `AdamW`、梯度裁剪、余弦退火 + warmup、梯度累积、优先经验回放 (PER)、Optuna/PBT 超参搜索。<br>**Training strategy**: apply `AdamW`, gradient clipping, cosine decay with warmup, gradient accumulation, PER, and Optuna/PBT hyper-parameter search.
+- **监控与评估**：统一到 TensorBoard/W&B，补充基线评估、SPS/ETA 指标与自动化回归测试。<br>**Monitoring & evaluation**: standardise on TensorBoard/W&B, add baseline evaluations, SPS/ETA metrics, and automated regression tests.
+- **工程体系**：引入 Lightning Fabric/TorchRL 脚手架、Docker/conda/uv 环境、云端训练脚本与 CI/CD 流水线。<br>**Engineering**: employ Lightning Fabric/TorchRL scaffolding, provide Docker/conda/uv environments, cloud-training scripts, and CI/CD pipelines.
 
-- **环境与框架更新**
-  - 迁移至 `Gymnasium` 与 `NES-Py` 最新版本，确保与 2024 年生态兼容。
-  - 采用 `gymnasium.vector.AsyncVectorEnv` 或 `envpool` 构建向量化环境，取代手工多进程以提升吞吐。
-  - 引入 `SuperMarioBrosRandomStages-v0` 等随机化环境，增强泛化能力。
+## 分阶段路线 | Phased Roadmap
+1. **第 0–2 周：基础设施升级**<br>**Weeks 0–2: Infrastructure upgrades**
+   - 完成依赖升级与环境迁移，并重构日志/配置入口。<br>   Upgrade dependencies, complete the environment migration, and refactor logging/config entry points.
+   - 以向量化环境替换手写多进程实现，验证稳定性。<br>   Replace the custom multiprocessing implementation with vector environments and validate stability.
+2. **第 3–6 周：算法增强**<br>**Weeks 3–6: Algorithm enhancements**
+   - 集成编译优化、AMP、学习率调度；实验 ResNet/Impala/GTrXL 组合。<br>   Integrate compile optimisations, AMP, LR scheduling; experiment with ResNet/Impala/GTrXL combinations.
+   - 引入 V-trace、熵调度、PER，量化对收敛速度的影响。<br>   Add V-trace, entropy scheduling, and PER, measuring their impact on convergence speed.
+3. **第 7–9 周：探索与超参**<br>**Weeks 7–9: Exploration & hyper-parameters**
+   - 启动 Optuna/PBT 搜索，覆盖学习率、隐藏维度、循环类型、熵系数等。<br>   Launch Optuna/PBT sweeps covering learning rate, hidden sizes, recurrent types, entropy coefficients, and more.
+   - 实验随机关卡、观测扰动、参数噪声等泛化策略。<br>   Test random stage schedules, observation augmentations, and parameter-space noise strategies.
+4. **第 10–12 周：评估与交付**<br>**Weeks 10–12: Evaluation & delivery**
+   - 完成回归测试与多关卡基准，对比旧版/新版性能并生成报告。<br>   Finish regression tests and multi-stage benchmarks, comparing legacy vs. upgraded performance with reports.
+   - 打包 Docker 镜像与部署脚本，接入 CI/CD 并配置云端训练。<br>   Package Docker images and deployment scripts, wire them into CI/CD, and enable cloud training workflows.
 
-- **模型与算法改进**
-  - 使用 `torch.compile` (PyTorch 2.1+) 对模型进行编译优化，减少前向与反向开销。
-  - 升级特征提取器：引入 `ImpalaResBlock` 或 `ConvNeXt` 风格模块，结合 `LayerNorm` 稳定训练。
-  - 将 LSTM 替换为 `GRU` 或 `GTrXL`（基于注意力的记忆模块）以更好建模长程依赖。
-  - 结合 `V-trace` (IMPALA) 或 `R2D2` 的截断反向传播策略，提升多步返回的稳健性。
-  - 在策略头加入参数化噪声（NoisyNet）或使用 `A3C + UCB-Exploration` 改善探索。
+## 风险与缓解 | Risks & Mitigations
+- **依赖兼容性**：API 变化可能破坏现有流程；需配合适配层与单元测试。<br>**Dependency compatibility**: API changes may break flows; mitigate with adapters and unit tests.
+- **训练不稳定**：更复杂的模型/探索可能导致梯度爆炸；使用梯度裁剪、EMA、监控告警。<br>**Training instability**: richer models/exploration can cause gradient blow-ups; contain with gradient clipping, EMA, and alerting.
+- **资源成本**：分布式搜索耗费算力；设置预算上限与自动停机策略。<br>**Resource cost**: distributed sweeps are resource-intensive; enforce budget caps and auto-shutdown policies.
+- **工程复杂度**：大幅重构增加维护门槛；保持模块化设计并同步更新文档。<br>**Engineering complexity**: broad refactors raise maintenance overhead; keep modules modular and update documentation in lockstep.
 
-- **训练策略优化**
-  - 使用 `AdamW` + `GradClip`，配合 `lr cosine decay` 与 `warmup` 控制学习率。
-  - 实现 `Mixed Precision (AMP)` 训练与梯度累积，提升 GPU 利用率。
-  - 引入 `Prioritized Experience Replay (PER)` 的离线缓冲，混合 on-policy/off-policy 经验加速收敛。
-  - 利用 `Population Based Training (PBT)` 或 `Optuna` 超参搜索自动调优。
-
-- **监控与评估增强**
-  - 切换至 `TensorBoard` 原生记录或 `Weights & Biases`，实现训练曲线、超参与视频统一可视化。
-  - 增加评估基线（随机、右移、基线 A2C）与 `SPS/ETA` 指标跟踪。
-  - 引入单元测试与集成测试覆盖环境封装、模型初始化共享内存等关键逻辑。
-
-- **工程与部署**
-  - 构建基于 `Lightning Fabric` 或 `TorchRL` 的训练脚手架，整合分布式策略与日志。
-  - 提供 Docker 镜像与 `conda`/`uv` 环境文件，支持跨平台部署。
-  - 支持在云端（AWS EC2 G5/G6、Lambda Labs、Paperspace）一键启动训练，并配置自动保存与告警。
-
-## 分阶段迭代路线
-
-1. **基础设施升级（第 0-2 周）**
-   - 完成依赖升级与环境迁移至 `Gymnasium`/`torch>=2.1`。
-   - 替换自定义多进程实现，接入向量化环境与共享内存缓存。
-   - 重构日志体系为统一的可视化平台（TensorBoard/W&B）。
-
-2. **算法增强（第 3-6 周）**
-   - 逐步引入编译优化、混合精度与学习率调度策略。
-   - 实验不同特征提取器与序列建模结构（ResNet、GRU、GTrXL）。
-   - 实现 V-trace 校正与熵调度，验证收敛速度与稳定性提升幅度。
-
-3. **探索与超参（第 7-9 周）**
-   - 集成 PBT/Optuna，通过云端并行搜索关键超参组合。
-   - 测试 NoisyNet、参数空间噪声及对比性奖励塑形策略。
-   - 增加随机化关卡与数据增强（观测翻转、亮度扰动）评估泛化表现。
-
-4. **评估与部署（第 10-12 周）**
-   - 完成回归测试与稳定性实验，输出多关卡对比报告。
-   - 打包 Docker 镜像与 CI/CD 流水线，实现自动训练与模型发布。
-   - 上线云端训练脚本，支持断点续训与模型版本管理。
-
-## 风险与缓解
-
-- **依赖兼容性**：升级至 Gymnasium/NES-Py 可能引入 API 变化，需通过适配层与单元测试保障。
-- **训练不稳定**：高级模型（注意力、PER）可能带来爆炸梯度；需配合 `grad clip`、`ema` 监控数值稳定性。
-- **资源成本**：分布式/超参搜索增加云成本，可预设预算与自动停机策略。
-- **复杂度上升**：工程重构需保持模块化与文档同步更新，避免知识传递断层。
-
-## 预期产出
-
-- 新版代码框架（TorchRL/Lightning Fabric + 向量化环境）。
-- 多关卡基准实验结果（旧版 vs 新版 A3C、V-trace、GTrXL 等）。
-- 自动化训练/评估管线与可视化仪表盘。
-- 面向研究与产品化的部署手册与容器镜像。
-
+## 预期交付物 | Expected Deliverables
+- 新版训练框架及脚手架示例，含最小可运行案例。<br>The upgraded training framework with scaffold examples and a minimal runnable demo.
+- 多关卡性能对比报告与指标仪表盘。<br>Multi-stage performance comparison reports plus metrics dashboards.
+- 自动化测试、部署脚本、容器镜像与环境说明。<br>Automated tests, deployment scripts, container images, and environment guides.
+- 更新后的文档体系（FAQ、故障排查、运维手册）。<br>An updated documentation suite covering FAQ, troubleshooting, and operations guides.
