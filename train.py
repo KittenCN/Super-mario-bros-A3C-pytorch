@@ -75,7 +75,7 @@ from src.config import (
     TrainingConfig,
     create_default_stage_schedule,
 )
-from src.envs import MarioEnvConfig, MarioVectorEnvConfig, create_vector_env
+from src.envs.mario import MarioEnvConfig, MarioVectorEnvConfig, create_vector_env
 # Import patch utilities to allow parent process to prewarm and patch nes_py
 from src.envs.mario import _patch_legacy_nes_py_uint8, _patch_nes_py_ram_dtype
 _suppress_gym_notice(False)
