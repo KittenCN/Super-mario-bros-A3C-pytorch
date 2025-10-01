@@ -13,6 +13,7 @@
 5. 资源监控开销削减 (Resource monitor throttling)
 6. 双缓冲重叠采集 (Overlap rollout collection)
 7. 未来演进候选 (Future candidates)
+8. 自适应显存运行脚本 (Adaptive memory launcher)
 
 ---
 ## 1. 环境构建可观测性增强
@@ -86,6 +87,11 @@
 - 风险: 模型前向仍被锁串行，收益受限；线程异常处理仅打印警告；需后续引入无锁策略（快照网络或分离 actor inference）。
 
 ## 7. 未来演进候选
+### fc_emulator 阶段兼容性开关 (补充)
+新增环境变量：
+- `MARIO_SUPPRESS_FC_STAGE_WARN=1` 静默多阶段降级为 1-1 的警告。
+- `MARIO_FC_STRICT_STAGE=1` 将该警告升级为硬错误便于严苛实验。
+决策：提供灵活控制以兼顾批量日志整洁与严格实验验证。
 - 环境层：硬超时 + 失败 env 自动替补；结构化 JSON 诊断。
 - 训练架构：多生产者 env 线程 + 无锁环形缓冲；策略网络参数定期广播；多 GPU 扩展。
 - 数据路径：GPU 原生 PER，减少 `.cpu()`；异步数据预取 (prefetch queue)。
@@ -102,10 +108,12 @@
 | PER 抽样间隔 | 性能/灵活 | 降低频繁 PER 开销 | 中 (新鲜度) | 设为 1 即原行为 |
 | 监控节流 | 性能/可观测平衡 | 降低系统调用 | 低 | 调低间隔或关闭监控 |
 | 双缓冲 overlap | 性能 | 部分重叠采集/学习 | 中 (线程复杂度) | 去掉 flag 或代码块 |
+| 自适应显存脚本 AUTO_MEM | 易用性/稳定 | 启动期自动降载避免 OOM | 低 | 关闭 AUTO_MEM |
 
 ---
 ## 验证与状态 | Validation & Status
 - 代码均通过语法编译 (`py_compile`)；训练主路径（无 `--overlap-collect`）回归测试正常。
+- 启动脚本新增 AUTO_MEM=1 阶梯降载；dry-run 正常，需在真实 OOM 情况下进一步验证回退路径。
 - 尚未完成：系统化性能基准（需记录 baseline vs overlap 模式的 SPS、updates/s、GPU util）。
 - 日志中未新增高频告警；checkpoint 恢复路径（含递归）经过人工测试。
 

@@ -10,6 +10,7 @@
 # 5. PER 以较低频率抽样 (--per-sample-interval=4) 降低开销
 # 6. 每 2k updates checkpoint，latest 快照每次都会覆盖
 # 7. 可通过环境变量或参数覆盖关键超参
+# 8. (新增) 自适应显存模式：AUTO_MEM=1 时按阶梯尝试多组 (NUM_ENVS,ROLLOUT,GRAD_ACCUM) 直到训练启动成功
 #
 # 用法 / Usage:
 #   bash scripts/run_2080ti_resume.sh            # 直接启动
@@ -55,6 +56,9 @@ show_help() {
   PER_INTERVAL=4          # PER 抽样间隔
   SAVE_ROOT=trained_models # 根保存目录
   LOG_DIR=tensorboard/a3c_super_mario_bros
+  AUTO_MEM=0             # 1=开启自动显存降载重试
+  MEM_TARGET_GB=1.0      # 预留给系统/碎片的安全余量 (估算用, 不做硬限制)
+  MAX_RETRIES=4          # 自动降载最大尝试次数
 
 示例 / Example:
   NUM_ENVS=12 ROLLOUT=96 GRAD_ACCUM=1 PER_INTERVAL=2 bash scripts/run_2080ti_resume.sh
@@ -92,6 +96,9 @@ TOTAL_UPDATES=${TOTAL_UPDATES:-100000}
 PER_INTERVAL=${PER_INTERVAL:-4}
 SAVE_ROOT=${SAVE_ROOT:-trained_models}
 LOG_DIR=${LOG_DIR:-tensorboard/a3c_super_mario_bros}
+AUTO_MEM=${AUTO_MEM:-0}
+MEM_TARGET_GB=${MEM_TARGET_GB:-1.0}
+MAX_RETRIES=${MAX_RETRIES:-4}
 
 SAVE_DIR="${SAVE_ROOT}/${RUN_NAME}"
 mkdir -p "${SAVE_DIR}" || true
@@ -99,7 +106,8 @@ mkdir -p "${SAVE_DIR}" || true
 # 设备选择：如果有 CUDA 默认选 GPU
 DEVICE=auto
 
-CMD=(python train.py \
+build_cmd() {
+  CMD=(python train.py \
   --world "${WORLD}" \
   --stage "${STAGE}" \
   --action-type "${ACTION_TYPE}" \
@@ -127,10 +135,13 @@ CMD=(python train.py \
   --device "${DEVICE}" \
   --project mario-a3c-2080ti \
   --enable-tensorboard)
+}
+
+build_cmd
 
 # 自动恢复：不显式传 --resume，交由内部逻辑扫描 save_dir + 递归匹配
 
-echo "[run_2080ti_resume] Launch command:"
+echo "[run_2080ti_resume] Launch command (initial):"
 printf ' %q' "${CMD[@]}"; echo
 
 if [[ ${DRY_RUN} -eq 1 ]]; then
@@ -150,4 +161,57 @@ if (( EXISTING > 0 )); then
   echo "[run_2080ti_resume] Detected ${EXISTING} existing checkpoint file(s) in ${SAVE_DIR} (auto-resume will engage)."
 fi
 
-exec "${CMD[@]}"
+
+if (( AUTO_MEM == 0 )); then
+  exec "${CMD[@]}"
+fi
+
+echo "[run_2080ti_resume][auto-mem] Enabled. Will attempt up to ${MAX_RETRIES} fallback tiers on OOM."
+
+# 阶梯参数 (按优先顺序) : 格式 NUM_ENVS,ROLLOUT,GRAD_ACCUM
+TIERS=( \
+  "${NUM_ENVS},${ROLLOUT},${GRAD_ACCUM}" \
+  "${NUM_ENVS},$((ROLLOUT/2)),${GRAD_ACCUM}" \
+  "$((NUM_ENVS-2)),${ROLLOUT},${GRAD_ACCUM}" \
+  "$((NUM_ENVS-2)),$((ROLLOUT/2)),1" \
+  "$((NUM_ENVS-4)),$((ROLLOUT/2)),1" \
+  "$((NUM_ENVS-4)),$((ROLLOUT/3)),1" \
+)
+
+attempt=0
+for tier in "${TIERS[@]}"; do
+  if (( attempt >= MAX_RETRIES )); then
+    echo "[run_2080ti_resume][auto-mem] Reached max retries (${MAX_RETRIES}). Aborting." >&2
+    exit 1
+  fi
+  IFS=',' read -r T_NUM T_ROLLOUT T_ACCUM <<<"$tier"
+  # 合法性修正
+  (( T_NUM < 2 )) && T_NUM=2
+  (( T_ROLLOUT < 16 )) && T_ROLLOUT=16
+  (( T_ACCUM < 1 )) && T_ACCUM=1
+  NUM_ENVS=$T_NUM ROLLOUT=$T_ROLLOUT GRAD_ACCUM=$T_ACCUM build_cmd
+  echo "[run_2080ti_resume][auto-mem] Attempt ${attempt} -> num_envs=${T_NUM} rollout=${T_ROLLOUT} grad_accum=${T_ACCUM}" 
+  printf '  %q' "${CMD[@]}"; echo
+  # 运行并捕获 OOM 关键字
+  set +e
+  OUTPUT=$( "${CMD[@]}" 2>&1 )
+  CODE=$?
+  set -e
+  if (( CODE == 0 )); then
+    echo "[run_2080ti_resume][auto-mem] Training started successfully with tier ${attempt}." >&2
+    echo "$OUTPUT"
+    exit 0
+  fi
+  if echo "$OUTPUT" | grep -qi 'CUDA out of memory'; then
+    echo "[run_2080ti_resume][auto-mem] Detected OOM. Falling back to next tier." >&2
+    attempt=$((attempt+1))
+    continue
+  else
+    echo "[run_2080ti_resume][auto-mem] Non-OOM failure (exit $CODE). Printing output and aborting." >&2
+    echo "$OUTPUT"
+    exit $CODE
+  fi
+done
+
+echo "[run_2080ti_resume][auto-mem] Exhausted all fallback tiers without success." >&2
+exit 1

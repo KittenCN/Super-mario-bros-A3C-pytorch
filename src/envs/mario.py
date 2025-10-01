@@ -428,10 +428,16 @@ def _make_fc_emulator_env(config: MarioEnvConfig) -> "gym.Env":
         _FC_BACKEND_LOGGED = True
 
     if (config.world, config.stage) != (1, 1) and not _FC_STAGE_WARNING_EMITTED:
-        print(
-            f"[env][warn] fc_emulator backend currently spawns at world 1-1; "
-            f"requested stage {config.world}-{config.stage} will start from 1-1"
+        suppress = os.environ.get("MARIO_SUPPRESS_FC_STAGE_WARN", "0").lower() in {"1", "true", "on"}
+        strict = os.environ.get("MARIO_FC_STRICT_STAGE", "0").lower() in {"1", "true", "on"}
+        msg = (
+            f"fc_emulator backend currently spawns at world 1-1; requested stage "
+            f"{config.world}-{config.stage} will start from 1-1"
         )
+        if strict:
+            raise RuntimeError(f"[env][error] {msg} (MARIO_FC_STRICT_STAGE=1)")
+        if not suppress:
+            print(f"[env][warn] {msg}")
         _FC_STAGE_WARNING_EMITTED = True
 
     combos = _convert_action_set(_select_actions(config.action_type))

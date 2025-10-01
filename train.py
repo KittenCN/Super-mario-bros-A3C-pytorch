@@ -617,6 +617,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         f"[train] device={device.type} threads={torch_threads} num_envs={cfg.env.num_envs} "
         f"rollout_steps={cfg.rollout.num_steps} grad_accum={cfg.gradient_accumulation}"
     )
+    # 简单显存压力预估：obs (num_steps+1)*num_envs*frame_stack*84*84*4 bytes ~ baseline
+    est_obs_mem = (cfg.rollout.num_steps + 1) * cfg.env.num_envs * cfg.model.input_channels * 84 * 84 * 4 / (1024**3)
+    if device.type == "cuda" and est_obs_mem > 1.5:  # 粗略阈值
+        print(f"[train][info] Estimated CPU rollout buffer size ~{est_obs_mem:.2f} GiB (pinned). Consider reducing rollout-steps or num-envs if OOM occurs.")
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+    if device.type == "cuda" and not alloc_conf:
+        print("[train][hint] Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to mitigate fragmentation (export before running).")
     env_summary = cfg.env.env
     stage_desc = f"{env_summary.world}-{env_summary.stage}"
     print(
@@ -896,6 +903,24 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     # 只在同步向量环境下尝试重叠，异步环境不启用（避免复杂性）
     if overlap_enabled:
         print("[train] overlap collection enabled (double-buffer thread model)")
+        # 已知问题：torch.compile 产生的包装在新线程前向会触发 FX tracing 警告/失败。
+        # 优先尝试直接 unwrap 编译包装的原始模块 (._orig_mod)；若不可得则禁用 overlap。
+        if cfg.compile_model:
+            if hasattr(model, "_orig_mod"):
+                try:
+                    orig = getattr(model, "_orig_mod")
+                    # 保持设备与训练模式
+                    orig.to(device)
+                    orig.train()
+                    model = orig
+                    cfg.compile_model = False
+                    print("[train][info] unwrap compiled model -> 原始模块用于 overlap 线程前向，避免 FX 追踪冲突。")
+                except Exception as e:  # pragma: no cover
+                    print(f"[train][warn] unwrap 编译模型失败: {e}，禁用 overlap 以保证稳定。")
+                    overlap_enabled = False
+            else:
+                print("[train][warn] 未发现 _orig_mod，无法安全与 torch.compile 并用；禁用 overlap 模式。")
+                overlap_enabled = False
     model_lock = threading.Lock() if overlap_enabled else None
 
     # 用于存放后台线程结果
@@ -920,8 +945,10 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             buffer.set_initial_hidden(None, None)
         for step in range(cfg.rollout.num_steps):
             with model_lock or contextlib.nullcontext():
-                with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
-                    out = model(obs_local_cpu.to(device, non_blocking=(device.type == "cuda")), local_hidden, local_cell)
+                # inference_mode 防止 autograd 追踪，减少线程间潜在状态交叉
+                with torch.inference_mode():
+                    with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
+                        out = model(obs_local_cpu.to(device, non_blocking=(device.type == "cuda")), local_hidden, local_cell)
             dist = Categorical(logits=out.logits)
             actions = dist.sample()
             log_probs = dist.log_prob(actions)
@@ -1003,10 +1030,12 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             else:
                 rollout.set_initial_hidden(None, None)
             for step in range(cfg.rollout.num_steps):
-                with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
-                    output = model(obs_gpu, hidden_state, cell_state)
-                    logits = output.logits
-                    values = output.value
+                # 采集阶段不需要梯度，使用 inference_mode 防止构建计算图，降低显存占用
+                with torch.inference_mode():
+                    with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
+                        output = model(obs_gpu, hidden_state, cell_state)
+                        logits = output.logits
+                        values = output.value
                 dist = Categorical(logits=logits)
                 actions = dist.sample()
                 log_probs = dist.log_prob(actions)
@@ -1051,6 +1080,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 else:
                     hidden_state = None
                     cell_state = None
+                # 主动释放局部变量引用，帮助 Python 更快回收（避免长生存期列表）
+                del output, logits, values, dist, actions, log_probs
                 global_step += cfg.env.num_envs
                 if (step + 1) % 8 == 0 or step + 1 == cfg.rollout.num_steps:
                     heartbeat.notify(global_step=global_step, phase="rollout", message=f"采样进度 {step + 1}/{cfg.rollout.num_steps}")

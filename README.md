@@ -115,6 +115,19 @@ python train.py --per --per-sample-interval 4 ...
 
 基准指标（建议记录）：updates/sec、env_steps/sec、单轮耗时、GPU utilisation、PER 触发频率。<br>Recommended to log: updates/sec, env_steps/sec, per-update wall time, GPU utilisation, PER trigger frequency.
 
+#### 自适应显存模式 | Adaptive Memory Mode
+运行脚本 `scripts/run_2080ti_resume.sh` 增加 `AUTO_MEM=1` 支持在首启 OOM 时按阶梯自动回退参数组合：
+1. 原始配置 `(num_envs, rollout, grad_accum)`
+2. 半 rollout
+3. 减少 env 数
+4. 减 env + 半 rollout + 取消累积
+5. 继续缩减 env / rollout
+触发条件：捕获启动期标准输出中的 `CUDA out of memory`。若非 OOM 失败则立即中止并打印日志。<br>
+启用示例：
+```bash
+AUTO_MEM=1 bash scripts/run_2080ti_resume.sh
+```
+
 若发生后台线程异常将打印 `[train][warn] background collection failed:` 警告但主循环继续；首次迭代前台采集以填充缓冲。<br>Background thread failures emit a warning but training continues; first iteration collects in foreground.
 
 后续阶段计划：无锁 actor-learner 拆分、GPU 常驻 PER、NVML 原生监控、结构化性能基线表格。<br>Next steps: lock-free actor/learner split, GPU-resident PER, native NVML monitoring, structured performance baseline tables.
