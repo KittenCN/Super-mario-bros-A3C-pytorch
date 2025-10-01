@@ -11,6 +11,8 @@
 # 6. 每 2k updates checkpoint，latest 快照每次都会覆盖
 # 7. 可通过环境变量或参数覆盖关键超参
 # 8. (新增) 自适应显存模式：AUTO_MEM=1 时按阶梯尝试多组 (NUM_ENVS,ROLLOUT,GRAD_ACCUM) 直到训练启动成功
+# 9. (新增) 细粒度采样进度参数：--rollout-progress-* 可控制前若干 update 的每步心跳打印与常规间隔
+# 10.(新增) 优化 PER 内存：支持 uint8 压缩与上限自适应 (MARIO_PER_MAX_MEM_GB / MARIO_PER_COMPRESS)，脚本提供便捷变量
 #
 # 用法 / Usage:
 #   bash scripts/run_2080ti_resume.sh            # 直接启动
@@ -59,6 +61,14 @@ show_help() {
   AUTO_MEM=0             # 1=开启自动显存降载重试
   MEM_TARGET_GB=1.0      # 预留给系统/碎片的安全余量 (估算用, 不做硬限制)
   MAX_RETRIES=4          # 自动降载最大尝试次数
+  AUTO_MEM_STREAM=1      # 自适应模式流式输出日志 (1=是 0=否)
+  # ---- 进度打印粒度 (对应 train.py 新增 CLI) ----
+  ROLL_PROGRESS_INTERVAL=8          # 常规阶段步进间隔
+  ROLL_PROGRESS_WARMUP_UPDATES=2    # 前多少个 update 使用 warmup 间隔
+  ROLL_PROGRESS_WARMUP_INTERVAL=1   # warmup 阶段间隔 (1=每步)
+  # ---- PER 内存控制（脚本内转发为 MARIO_PER_*）----
+  PER_MAX_MEM_GB=2.0     # 观测缓存内存目标上限 GiB (传递为 MARIO_PER_MAX_MEM_GB)
+  PER_COMPRESS=1         # 1=uint8 压缩 0=float32 (传递为 MARIO_PER_COMPRESS)
   AUTO_MEM_STREAM=1      # 1=降载重试阶段实时输出日志 (stream); 0=缓冲到结束再输出
 
 示例 / Example:
@@ -102,6 +112,18 @@ MEM_TARGET_GB=${MEM_TARGET_GB:-1.0}
 MAX_RETRIES=${MAX_RETRIES:-4}
 AUTO_MEM_STREAM=${AUTO_MEM_STREAM:-1}
 
+# 细粒度进度相关（若未显式设定使用默认）
+ROLL_PROGRESS_INTERVAL=${ROLL_PROGRESS_INTERVAL:-8}
+ROLL_PROGRESS_WARMUP_UPDATES=${ROLL_PROGRESS_WARMUP_UPDATES:-2}
+ROLL_PROGRESS_WARMUP_INTERVAL=${ROLL_PROGRESS_WARMUP_INTERVAL:-1}
+
+# PER 内存控制（允许空字符串表示不覆盖）
+PER_MAX_MEM_GB=${PER_MAX_MEM_GB:-}
+PER_COMPRESS=${PER_COMPRESS:-}
+if [[ -n "$PER_MAX_MEM_GB" ]]; then export MARIO_PER_MAX_MEM_GB="$PER_MAX_MEM_GB"; fi
+if [[ -n "$PER_COMPRESS" ]]; then export MARIO_PER_COMPRESS="$PER_COMPRESS"; fi
+AUTO_MEM_STREAM=${AUTO_MEM_STREAM:-1}
+
 SAVE_DIR="${SAVE_ROOT}/${RUN_NAME}"
 mkdir -p "${SAVE_DIR}" || true
 
@@ -135,6 +157,9 @@ build_cmd() {
   --heartbeat-interval 30 \
   --heartbeat-timeout 300 \
   --step-timeout 15 \
+  --rollout-progress-interval "${ROLL_PROGRESS_INTERVAL}" \
+  --rollout-progress-warmup-updates "${ROLL_PROGRESS_WARMUP_UPDATES}" \
+  --rollout-progress-warmup-interval "${ROLL_PROGRESS_WARMUP_INTERVAL}" \
   --device "${DEVICE}" \
   --project mario-a3c-2080ti \
   --enable-tensorboard)

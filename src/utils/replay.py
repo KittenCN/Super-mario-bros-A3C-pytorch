@@ -1,10 +1,23 @@
-"""Prioritized experience replay buffer."""
+"""Prioritized experience replay buffer (内存优化版).
+
+改进点 / Improvements:
+1. 预分配环形缓冲，避免 Python list + dict 大量碎片化。(原实现: list[dict])
+2. 压缩观测为 uint8 (0~255) 存储，采样时再解码为 float32/255：占用约 1/4。
+3. 首次 push 时推断 (C,H,W)，惰性分配；支持按环境变量或阈值自动下调容量。
+4. 提供环境变量控制：
+    - MARIO_PER_COMPRESS=0 禁用 uint8 压缩 (改用 float32)
+    - MARIO_PER_MAX_MEM_GB=数值 约束观测缓存目标上限 GiB（默认 2.0）
+5. 计算并打印估算内存，给出调参建议。
+
+注：如需继续旧实现，可回退到早期版本或设 capacity 很小再禁用 PER。
+"""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
+import os
 
 import numpy as np
 import torch
@@ -21,6 +34,13 @@ class ReplaySample:
 
 
 class PrioritizedReplay:
+    """内存友好的 PER 环形缓冲.
+
+    Push: 批量写入 (B,C,H,W) 观测及 (B,) 动作 / 价值 / 优势。
+    Sample: 重要性抽样 + 权重。
+    Observations 在 CPU 上以 uint8 (压缩) 或 float32 (禁用压缩) 存储。
+    """
+
     def __init__(
         self,
         capacity: int,
@@ -30,17 +50,70 @@ class PrioritizedReplay:
         beta_steps: int,
         device: torch.device,
     ) -> None:
-        self.capacity = capacity
+        self.requested_capacity = capacity
+        self.capacity = capacity  # 可被自适应调整
         self.alpha = alpha
         self.beta_start = beta_start
         self.beta_final = beta_final
         self.beta_steps = beta_steps
         self.device = device
 
-        self.storage: list[dict[str, torch.Tensor]] = []
-        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        # 压缩控制
+        self._compress = os.environ.get("MARIO_PER_COMPRESS", "1").lower() not in {"0", "false", "off"}
+        self._max_mem_gb = float(os.environ.get("MARIO_PER_MAX_MEM_GB", "2.0"))  # 仅用于观测主体估算
+
+        # 惰性分配的张量容器
+        self.obs_storage: Optional[torch.Tensor] = None  # uint8 或 float32: (capacity,C,H,W)
+        self.actions: Optional[torch.Tensor] = None      # long (capacity,)
+        self.target_values: Optional[torch.Tensor] = None  # float32 (capacity,)
+        self.advantages: Optional[torch.Tensor] = None     # float32 (capacity,)
+        self.priorities = np.zeros((self.capacity,), dtype=np.float32)
         self.pos = 0
+        self.size = 0
         self.step = 0
+
+    # ----------------- 内部工具 -----------------
+    def _maybe_alloc(self, observations: torch.Tensor):
+        if self.obs_storage is not None:
+            return
+        if observations.dim() != 4:
+            raise ValueError("Expected observations shape (B,C,H,W)")
+        _, c, h, w = observations.shape
+        # 估算每条样本的字节数（仅观测部分）
+        obs_bytes_per = c * h * w * (1 if self._compress else 4)
+        total_bytes = obs_bytes_per * self.capacity
+        total_gb = total_bytes / (1024 ** 3)
+        # 自适应容量（只对观测主体约束，额外标量忽略）
+        if total_gb > self._max_mem_gb:
+            # 计算新的容量 (向下取整 >= batch size 或 1024)
+            new_cap = int(self._max_mem_gb * (1024 ** 3) // obs_bytes_per)
+            min_cap = max(1024, observations.shape[0] * 2)
+            if new_cap < min_cap:
+                new_cap = min_cap
+            if new_cap < self.capacity:
+                print(
+                    f"[replay][info] shrink capacity {self.capacity} -> {new_cap} due to mem cap {self._max_mem_gb} GiB (requested {self.requested_capacity})"
+                )
+                self.capacity = new_cap
+                self.priorities = np.zeros((self.capacity,), dtype=np.float32)
+
+        obs_dtype = torch.uint8 if self._compress else torch.float32
+        self.obs_storage = torch.empty((self.capacity, c, h, w), dtype=obs_dtype, device=torch.device("cpu"))
+        self.actions = torch.empty((self.capacity,), dtype=torch.long, device=torch.device("cpu"))
+        self.target_values = torch.empty((self.capacity,), dtype=torch.float32, device=torch.device("cpu"))
+        self.advantages = torch.empty((self.capacity,), dtype=torch.float32, device=torch.device("cpu"))
+        eff_bytes = self.capacity * c * h * w * (1 if self._compress else 4)
+        eff_gb = eff_bytes / (1024 ** 3)
+        mode = "uint8" if self._compress else "float32"
+        print(
+            f"[replay] allocated obs buffer capacity={self.capacity} shape=({c},{h},{w}) dtype={mode} ~{eff_gb:.2f} GiB (requested={self.requested_capacity})"
+        )
+        if self._compress:
+            print("[replay][hint] set MARIO_PER_COMPRESS=0 可禁用压缩；MARIO_PER_MAX_MEM_GB 调整内存上限。")
+
+    # ----------------- 公共 API -----------------
+    def __len__(self) -> int:
+        return self.size
 
     def __len__(self) -> int:
         return len(self.storage)
@@ -57,46 +130,74 @@ class PrioritizedReplay:
         advantages: torch.Tensor,
         priorities: Optional[torch.Tensor] = None,
     ) -> None:
-        obs_np = observations.detach().cpu()
-        act_np = actions.detach().cpu()
-        tgt_np = target_values.detach().cpu()
-        adv_np = advantages.detach().cpu()
-        if priorities is None:
-            priorities = adv_np.abs().sum(dim=tuple(range(1, adv_np.dim()))) if adv_np.dim() > 1 else adv_np.abs()
-        prio_np = priorities.detach().cpu().numpy().flatten()
+        """批量写入.
 
-        for idx in range(obs_np.shape[0]):
-            data = {
-                "obs": obs_np[idx],
-                "action": act_np[idx].view(-1),
-                "target_value": tgt_np[idx].view(-1),
-                "advantage": adv_np[idx].view(-1),
-            }
-            if len(self.storage) < self.capacity:
-                self.storage.append(data)
+        期望 shape:
+          observations: (B,C,H,W) float32 in [0,1]
+          actions/target_values/advantages: 兼容 (B,) 或 (B,1)
+        """
+        with torch.no_grad():
+            if observations.dim() != 4:
+                raise ValueError("observations must be (B,C,H,W)")
+            self._maybe_alloc(observations)
+            B = observations.shape[0]
+            act = actions.view(B)
+            tgt = target_values.view(B)
+            adv = advantages.view(B)
+            if priorities is None:
+                priorities = adv.abs()
+            prio = priorities.detach().cpu().view(B).numpy()
+            # 压缩
+            if self._compress:
+                obs_comp = (observations.clamp(0, 1) * 255.0).to(torch.uint8).cpu()
             else:
-                self.storage[self.pos] = data
-            self.priorities[self.pos] = prio_np[idx] + 1e-5
-            self.pos = (self.pos + 1) % self.capacity
+                obs_comp = observations.detach().cpu()
+            act_cpu = act.detach().cpu()
+            tgt_cpu = tgt.detach().cpu()
+            adv_cpu = adv.detach().cpu()
+            for i in range(B):
+                self.obs_storage[self.pos].copy_(obs_comp[i])  # type: ignore[arg-type]
+                self.actions[self.pos].copy_(act_cpu[i])       # type: ignore[arg-type]
+                self.target_values[self.pos].copy_(tgt_cpu[i]) # type: ignore[arg-type]
+                self.advantages[self.pos].copy_(adv_cpu[i])    # type: ignore[arg-type]
+                self.priorities[self.pos] = float(prio[i]) + 1e-5
+                self.pos = (self.pos + 1) % self.capacity
+                self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int) -> Optional[ReplaySample]:
-        if len(self.storage) < batch_size:
+        if self.size < batch_size or self.obs_storage is None:
             return None
-        priorities = self.priorities[: len(self.storage)]
+        valid = self.size
+        priorities = self.priorities[:valid]
         scaled = priorities ** self.alpha
-        probs = scaled / scaled.sum()
-        indices = np.random.choice(len(self.storage), batch_size, p=probs)
+        denom = scaled.sum()
+        if denom <= 0:
+            # 所有优先级为 0：退化为均匀分布
+            probs = np.full(valid, 1.0 / valid, dtype=np.float32)
+        else:
+            probs = scaled / denom
+        indices = np.random.choice(valid, batch_size, p=probs)
         beta = self.beta()
-        weights = (len(self.storage) * probs[indices]) ** (-beta)
+        weights = (valid * probs[indices]) ** (-beta)
         weights = weights / weights.max()
-
-        obs = torch.stack([self.storage[i]["obs"] for i in indices]).to(self.device)
-        actions = torch.stack([self.storage[i]["action"] for i in indices]).to(self.device).squeeze(-1).long()
-        target_values = torch.stack([self.storage[i]["target_value"] for i in indices]).to(self.device).squeeze(-1)
-        advantages = torch.stack([self.storage[i]["advantage"] for i in indices]).to(self.device).squeeze(-1)
+        # 取出 & 解压缩
+        obs_raw = self.obs_storage[indices]  # type: ignore[index]
+        if self._compress:
+            obs = obs_raw.float().div_(255.0).to(self.device)
+        else:
+            obs = obs_raw.to(self.device)
+        actions = self.actions[indices].to(self.device)  # type: ignore[index]
+        target_values = self.target_values[indices].to(self.device)  # type: ignore[index]
+        advantages = self.advantages[indices].to(self.device)  # type: ignore[index]
         weights_t = torch.tensor(weights, device=self.device, dtype=torch.float32)
         self.step += 1
         return ReplaySample(obs, actions, target_values, advantages, weights_t, indices)
 
     def update_priorities(self, indices: np.ndarray, priorities: torch.Tensor):
-        self.priorities[indices] = priorities.detach().cpu().numpy() + 1e-5
+        np_prior = priorities.detach().cpu().numpy().flatten()
+        for i, idx in enumerate(indices):
+            if idx < self.capacity:
+                self.priorities[idx] = float(np_prior[min(i, np_prior.shape[0]-1)]) + 1e-5
+        # 防止全部衰减为 0
+        if np.all(self.priorities[: self.size] <= 0):
+            self.priorities[: self.size] += 1e-5
