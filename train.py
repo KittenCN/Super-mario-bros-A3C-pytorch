@@ -945,8 +945,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             buffer.set_initial_hidden(None, None)
         for step in range(cfg.rollout.num_steps):
             with model_lock or contextlib.nullcontext():
-                # inference_mode 防止 autograd 追踪，减少线程间潜在状态交叉
-                with torch.inference_mode():
+                # 使用 no_grad 而非 inference_mode，避免生成 inference tensor 被后续保存进计算图时报错
+                with torch.no_grad():
                     with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
                         out = model(obs_local_cpu.to(device, non_blocking=(device.type == "cuda")), local_hidden, local_cell)
             dist = Categorical(logits=out.logits)
@@ -972,12 +972,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 if len(completed_returns) > 1000:
                     completed_returns[:] = completed_returns[-1000:]
             if out.hidden_state is not None:
-                local_hidden = out.hidden_state.detach()
+                # detach + clone 产生普通张量，避免 inference tensor backward 限制
+                local_hidden = out.hidden_state.detach().clone()
                 if done.any():
                     mask = torch.as_tensor(done, dtype=torch.bool, device=local_hidden.device)
                     local_hidden[:, mask] = 0.0
                 if out.cell_state is not None:
-                    local_cell = out.cell_state.detach()
+                    local_cell = out.cell_state.detach().clone()
                     if done.any():
                         mask = torch.as_tensor(done, dtype=torch.bool, device=local_cell.device)
                         local_cell[:, mask] = 0.0
@@ -1030,8 +1031,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             else:
                 rollout.set_initial_hidden(None, None)
             for step in range(cfg.rollout.num_steps):
-                # 采集阶段不需要梯度，使用 inference_mode 防止构建计算图，降低显存占用
-                with torch.inference_mode():
+                # 采集阶段不需要梯度：使用 no_grad 避免构建计算图，同时避免 inference_mode 的 backward 限制
+                with torch.no_grad():
                     with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
                         output = model(obs_gpu, hidden_state, cell_state)
                         logits = output.logits
@@ -1066,12 +1067,12 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     if len(completed_returns) > 1000:
                         completed_returns = completed_returns[-1000:]
                 if output.hidden_state is not None:
-                    hidden_state = output.hidden_state.detach()
+                    hidden_state = output.hidden_state.detach().clone()
                     if done.any():
                         mask = torch.as_tensor(done, dtype=torch.bool, device=device)
                         hidden_state[:, mask] = 0.0
                     if output.cell_state is not None:
-                        cell_state = output.cell_state.detach()
+                        cell_state = output.cell_state.detach().clone()
                         if done.any():
                             mask = torch.as_tensor(done, dtype=torch.bool, device=device)
                             cell_state[:, mask] = 0.0
