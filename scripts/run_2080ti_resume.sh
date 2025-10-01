@@ -139,9 +139,15 @@ if [[ ${DRY_RUN} -eq 1 ]]; then
 fi
 
 # 提示已有的 checkpoint（若存在）
-EXISTING=$(ls -1 "${SAVE_DIR}"/a3c_world${WORLD}_stage${STAGE}_*.pt 2>/dev/null | wc -l || echo 0)
-if [[ ${EXISTING} -gt 0 ]]; then
-  echo "[run_2080ti_resume] Detected ${EXISTING} existing checkpoint files in ${SAVE_DIR} (auto-resume will engage)."
+checkpoint_glob="${SAVE_DIR}/a3c_world${WORLD}_stage${STAGE}_*.pt"
+if compgen -G "${checkpoint_glob}" > /dev/null; then
+  # 使用 compgen + wc -l 统计，避免 ls 在无匹配时报错导致重复 0 行
+  EXISTING=$(compgen -G "${checkpoint_glob}" | wc -l | tr -d '[:space:]')
+else
+  EXISTING=0
+fi
+if (( EXISTING > 0 )); then
+  echo "[run_2080ti_resume] Detected ${EXISTING} existing checkpoint file(s) in ${SAVE_DIR} (auto-resume will engage)."
 fi
 
 exec "${CMD[@]}"
