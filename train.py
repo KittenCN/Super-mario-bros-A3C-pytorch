@@ -81,6 +81,7 @@ from src.envs.mario import _patch_legacy_nes_py_uint8, _patch_nes_py_ram_dtype
 _suppress_gym_notice(False)
 from src.models import MarioActorCritic
 from src.utils import CosineWithWarmup, PrioritizedReplay, RolloutBuffer, create_logger
+from src.utils.heartbeat import HeartbeatReporter
 from src.utils.monitor import Monitor
 
 try:  # optional dependency for resource monitoring
@@ -152,6 +153,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--parent-prewarm", action="store_true", default=False, help="Run a parent-process prewarm of the environment before launching workers")
     parser.add_argument("--parent-prewarm-all", action="store_true", default=False, help="Sequentially prewarm each env configuration in the parent before launching workers (slower, safer)")
     parser.add_argument("--worker-start-delay", type=float, default=0.2, help="Stagger delay (s) between worker initialisations when using async vector env")
+    parser.add_argument("--heartbeat-interval", type=float, default=30.0, help="心跳打印间隔（秒），<=0 表示关闭")
+    parser.add_argument("--heartbeat-timeout", type=float, default=300.0, help="无进展告警阈值（秒），<=0 则自动按间隔推算")
+    parser.add_argument(
+        "--step-timeout",
+        type=float,
+        default=15.0,
+        help="单次环境 step 超过该秒数将发出屏幕警告，<=0 表示关闭",
+    )
     return parser.parse_args(argv)
 
 
@@ -513,6 +522,20 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     else:
         device = torch.device(cfg.device)
 
+    hb_interval = getattr(args, "heartbeat_interval", 30.0)
+    hb_timeout = getattr(args, "heartbeat_timeout", 300.0)
+    if hb_timeout <= 0:
+        base_interval = hb_interval if hb_interval > 0 else 30.0
+        hb_timeout = max(base_interval * 4.0, 120.0)
+    heartbeat = HeartbeatReporter(
+        component="train",
+        interval=hb_interval if hb_interval > 0 else 30.0,
+        stall_timeout=hb_timeout,
+        enabled=hb_interval > 0,
+    )
+    heartbeat.start()
+    heartbeat.notify(phase="初始化", message="配置随机种子", progress=False)
+
     # Repro/threads
     torch.manual_seed(cfg.seed)
     # Silence known lr_scheduler ordering warning emitted in some PyTorch builds
@@ -545,6 +568,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         f"[train] device={device.type} threads={torch_threads} num_envs={cfg.env.num_envs} "
         f"rollout_steps={cfg.rollout.num_steps} grad_accum={cfg.gradient_accumulation}"
     )
+    env_summary = cfg.env.env
+    stage_desc = f"{env_summary.world}-{env_summary.stage}"
+    print(
+        f"[train] stage={stage_desc} action={env_summary.action_type} async={cfg.env.asynchronous} "
+        f"total_updates={cfg.total_updates} log_interval={cfg.log_interval}"
+    )
+    heartbeat.notify(phase="初始化", message=f"设备 {device.type} 线程{torch_threads}", progress=False)
 
     # Parent-process prewarm: create and close a single env in the parent
     # to perform heavy native initialisation once before spawning workers.
@@ -570,6 +600,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             print("[train] parent prewarm complete")
         except Exception as exc:
             print(f"[train] parent prewarm failed: {exc}")
+            heartbeat.notify(phase="env", message=f"父进程预热失败: {exc}", progress=False)
 
     # Optionally prewarm each worker configuration sequentially in the parent.
     # This is slower but avoids a thundering herd of first-time imports in the
@@ -600,9 +631,12 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     pre_env.close()
                 except Exception as exc:
                     print(f"[train] parent prewarm for worker {idx} failed: {exc}")
+                    heartbeat.notify(phase="env", message=f"worker {idx} 预热失败: {exc}", progress=False)
             print("[train] parent prewarm-all complete")
+            heartbeat.notify(phase="env", message="全量预热完成", progress=False)
         except Exception as exc:
             print(f"[train] parent prewarm-all failed: {exc}")
+            heartbeat.notify(phase="env", message=f"全量预热失败: {exc}", progress=False)
 
     def _initialise_env(env_cfg: MarioVectorEnvConfig):
         timeout = getattr(env_cfg, "reset_timeout", 60.0)
@@ -650,6 +684,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
     env, obs_np, _, effective_env_cfg = _initialise_env(cfg.env)
     cfg.env = effective_env_cfg
+    heartbeat.notify(phase="env", message=f"环境已就绪 async={cfg.env.asynchronous}", progress=False)
+    heartbeat.heartbeat_now()
 
     # Honor force-sync CLI flag
     if getattr(args, "force_sync", False):
@@ -664,8 +700,10 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             pre_env.reset(seed=cfg.seed)
             pre_env.close()
             print("[train] prewarm complete")
+            heartbeat.notify(phase="env", message="父进程预热完成", progress=False)
         except Exception as exc:
             print(f"[train] prewarm failed: {exc}")
+            heartbeat.notify(phase="env", message=f"预热失败: {exc}", progress=False)
 
     # Start background resource monitor will be created after logger/metrics are set up
 
@@ -713,6 +751,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     )
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
     maybe_save_config(cfg, args.config_out)
+    heartbeat.notify(phase="日志", message="日志与保存目录已就绪", progress=False)
 
     metrics_file = Path(cfg.metrics_path).expanduser() if cfg.metrics_path else Path(run_dir) / "metrics.jsonl"
     metrics_file.parent.mkdir(parents=True, exist_ok=True)
@@ -723,9 +762,19 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         try:
             monitor = Monitor(writer, wandb_run, metrics_file, interval=args.monitor_interval)
             monitor.start()
+            heartbeat.notify(phase="监控", message="资源监控已启动", progress=False)
         except Exception as exc:
             print(f"[train] Monitor failed to start: {exc}")
             monitor = None
+            heartbeat.notify(phase="监控", message="资源监控启动失败", progress=False)
+
+    step_timeout = getattr(args, "step_timeout", 0.0)
+    if step_timeout is not None and step_timeout <= 0:
+        step_timeout = None
+    slow_step_cooldown = None
+    if step_timeout is not None:
+        slow_step_cooldown = max(step_timeout * 0.5, 5.0)
+    last_slow_step_warn = 0.0
 
     rollout = RolloutBuffer(cfg.rollout.num_steps, cfg.env.num_envs, env.single_observation_space.shape, device, pin_memory=(device.type == "cuda"))
     per_buffer = None
@@ -761,12 +810,20 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         global_step = checkpoint.get("global_step", 0)
         global_update = checkpoint.get("global_update", 0)
         print(f"[train] Resuming training from {resume_path}")
+        heartbeat.notify(phase="恢复", message=f"加载检查点 {resume_path.name}", progress=False)
 
     last_log_step = global_step
     last_log_update = global_update
     last_log_time = time.time()
 
     for update_idx in range(global_update, cfg.total_updates):
+        update_wall_start = time.time()
+        heartbeat.notify(
+            update_idx=update_idx,
+            global_step=global_step,
+            phase="rollout",
+            message=f"采集第{update_idx}轮数据",
+        )
         rollout.reset()
         if hidden_state is not None:
             rollout.set_initial_hidden(hidden_state.detach(), cell_state.detach() if cell_state is not None else None)
@@ -788,7 +845,17 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             log_probs_cpu = log_probs.detach().cpu()
             values_cpu = values.detach().cpu()
 
+            step_start_time = time.time()
             next_obs_np, reward_np, terminated, truncated, infos = env.step(actions_cpu.numpy())
+            step_duration = time.time() - step_start_time
+            if step_timeout is not None and step_duration > step_timeout:
+                now_warn = time.time()
+                if slow_step_cooldown is None or now_warn - last_slow_step_warn >= slow_step_cooldown:
+                    print(
+                        f"[train][warn] env.step 耗时 {step_duration:.1f}s (阈值 {step_timeout:.1f}s)，可能存在卡顿。"
+                    )
+                    heartbeat.notify(phase="rollout", message=f"env.step {step_duration:.1f}s", progress=False)
+                    last_slow_step_warn = now_warn
             done = np.logical_or(terminated, truncated)
 
             reward_cpu = _to_cpu_tensor(reward_np, dtype=torch.float32)
@@ -823,8 +890,23 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 cell_state = None
 
             global_step += cfg.env.num_envs
+            if (step + 1) % 8 == 0 or step + 1 == cfg.rollout.num_steps:
+                heartbeat.notify(
+                    global_step=global_step,
+                    phase="rollout",
+                    message=f"采样进度 {step + 1}/{cfg.rollout.num_steps}",
+                )
 
         rollout.set_next_obs(obs_cpu)
+
+        rollout_duration = time.time() - update_wall_start
+        heartbeat.notify(
+            update_idx=update_idx,
+            global_step=global_step,
+            phase="learn",
+            message="回放采样完成，开始计算回报",
+        )
+        learn_start = time.time()
 
         with torch.no_grad():
             bootstrap = model(obs_gpu, hidden_state, cell_state).value.detach()
@@ -901,6 +983,15 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 except Exception:
                     pass
 
+        learn_duration = time.time() - learn_start
+        total_update_time = time.time() - update_wall_start
+        heartbeat.notify(
+            update_idx=update_idx,
+            global_step=global_step,
+            phase="log",
+            message=f"单轮耗时 {total_update_time:.1f}s",
+        )
+
         if update_idx % cfg.log_interval == 0:
             loss_total = float(total_loss.item())
             loss_policy = float(policy_loss.item())
@@ -932,7 +1023,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
             print(
                 f"[train] update={update_idx} step={global_step} avg_return={avg_return:.2f} "
-                f"loss={loss_total:.4f} lr={lr_value:.2e} grad={last_grad_norm:.3f}"
+                f"loss={loss_total:.4f} lr={lr_value:.2e} grad={last_grad_norm:.3f} "
+                f"steps/s={env_steps_per_sec:.1f} upd/s={updates_per_sec:.2f} "
+                f"update={total_update_time:.1f}s rollout={rollout_duration:.1f}s learn={learn_duration:.1f}s"
             )
 
             metrics_entry = {
@@ -953,6 +1046,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 "grad_norm": last_grad_norm,
                 "env_steps_per_sec": env_steps_per_sec,
                 "updates_per_sec": updates_per_sec,
+                "update_time": total_update_time,
+                "rollout_time": rollout_duration,
+                "learn_time": learn_duration,
             }
 
             if wandb_run is not None:
@@ -1054,9 +1150,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 global_step,
                 update_idx,
             )
+            print(f"[train] checkpoint saved -> {checkpoint_path}")
+            heartbeat.notify(phase="checkpoint", message=f"保存 {checkpoint_path.name}", progress=False)
 
         if cfg.eval_interval and update_idx % cfg.eval_interval == 0 and update_idx > 0:
             save_model_snapshot(cfg, model, global_step, update_idx)
+            print("[train] latest snapshot refreshed")
+            heartbeat.notify(phase="checkpoint", message="最新快照已更新", progress=False)
 
     # Robust cleanup: ensure resources are closed even if some fail
     try:
@@ -1096,6 +1196,10 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         gc.collect()
     except Exception:
         pass
+
+    heartbeat.notify(phase="完成", message="训练循环结束，整理指标", progress=False)
+    heartbeat.heartbeat_now()
+    heartbeat.stop(timeout=2.0)
 
     avg_return = float(np.mean(completed_returns[-100:])) if completed_returns else 0.0
     return {

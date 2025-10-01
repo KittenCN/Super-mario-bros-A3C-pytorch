@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -14,6 +15,7 @@ from torch.distributions import Categorical
 from src.config import EvaluationConfig, ModelConfig
 from src.envs import MarioEnvConfig, create_eval_env
 from src.models import MarioActorCritic
+from src.utils.heartbeat import HeartbeatReporter
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,6 +26,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-dir", type=str, default=None, help="Directory to store evaluation videos (defaults to metadata)")
     parser.add_argument("--no-video", action="store_true", help="Disable video recording even if metadata enables it")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--heartbeat-interval", type=float, default=15.0, help="心跳打印间隔（秒），<=0 表示关闭")
+    parser.add_argument("--heartbeat-timeout", type=float, default=60.0, help="无进展告警阈值（秒），<=0 时自动按间隔推算")
+    parser.add_argument("--step-timeout", type=float, default=8.0, help="单次 env.step 超过该秒数即提示可能卡顿，<=0 关闭")
+    parser.add_argument("--progress-interval", type=int, default=50, help="每隔多少步输出一次评估进度")
     return parser.parse_args()
 
 
@@ -226,9 +232,19 @@ def load_model(checkpoint_path: Path, metadata: Dict, device: torch.device) -> M
     return model
 
 
-def evaluate(model: MarioActorCritic, cfg: EvaluationConfig, metadata: Dict, device: torch.device):
+def evaluate(
+    model: MarioActorCritic,
+    cfg: EvaluationConfig,
+    metadata: Dict,
+    device: torch.device,
+    *,
+    heartbeat: Optional[HeartbeatReporter] = None,
+    step_timeout: Optional[float] = None,
+    progress_interval: int = 50,
+) -> None:
     env = create_eval_env(cfg.env, seed=metadata.get("vector_env", {}).get("base_seed"))
-    total_rewards = []
+    total_rewards: list[float] = []
+    total_steps = 0
     if cfg.record_video:
         Path(cfg.video_dir).mkdir(parents=True, exist_ok=True)
     expected_actions = metadata.get("model", {}).get("action_space")
@@ -237,46 +253,155 @@ def evaluate(model: MarioActorCritic, cfg: EvaluationConfig, metadata: Dict, dev
             raise ValueError(
                 f"Action space mismatch: metadata expects {expected_actions}, environment reports {env.action_space.n}."
             )
-    for episode in range(cfg.episodes):
-        obs, info = env.reset()
-        obs = torch.from_numpy(obs).to(device, dtype=torch.float32)
-        hidden_state, cell_state = model.initial_state(1, device)
-        done = False
-        cumulative_reward = 0.0
-        while not done:
-            with torch.no_grad():
-                output = model(obs.unsqueeze(0), hidden_state, cell_state)
-                dist = Categorical(logits=output.logits.squeeze(0))
-                action = dist.probs.argmax().item()
-            next_obs, reward, terminated, truncated, info = env.step(action)
-            done = bool(terminated or truncated)
-            cumulative_reward += reward
-            obs = torch.from_numpy(next_obs).to(device, dtype=torch.float32)
-            if output.hidden_state is not None:
-                hidden_state = output.hidden_state.detach()
-                if output.cell_state is not None:
-                    cell_state = output.cell_state.detach()
-            if cfg.render:
-                env.render()
-        total_rewards.append(cumulative_reward)
-        world = metadata.get("world")
-        stage = metadata.get("stage")
-        print(
-            f"Episode {episode + 1} (World {world} Stage {stage}): reward={cumulative_reward:.2f}, flag={info.get('flag_get', False)}"
-        )
 
-    print(f"Average reward over {cfg.episodes} episodes: {np.mean(total_rewards):.2f}")
-    env.close()
+    slow_step_cooldown = None
+    last_slow_step_warn = 0.0
+    if step_timeout is not None and step_timeout > 0:
+        slow_step_cooldown = max(step_timeout * 0.5, 3.0)
+    else:
+        step_timeout = None
+
+    try:
+        for episode in range(cfg.episodes):
+            if heartbeat is not None:
+                heartbeat.notify(update_idx=episode, phase="episode", message=f"开始第{episode + 1}集", progress=False)
+            obs, info = env.reset()
+            obs = torch.from_numpy(obs).to(device, dtype=torch.float32)
+            hidden_state, cell_state = model.initial_state(1, device)
+            done = False
+            cumulative_reward = 0.0
+            step_count = 0
+            episode_start = time.time()
+            info = info or {}
+
+            while not done:
+                step_count += 1
+                total_steps += 1
+                if heartbeat is not None:
+                    heartbeat.notify(
+                        update_idx=episode,
+                        global_step=total_steps,
+                        phase="step",
+                        message=f"ep{episode + 1} step{step_count}",
+                    )
+
+                with torch.no_grad():
+                    output = model(obs.unsqueeze(0), hidden_state, cell_state)
+                    dist = Categorical(logits=output.logits.squeeze(0))
+                    action = dist.probs.argmax().item()
+
+                step_start = time.time()
+                next_obs, reward, terminated, truncated, info = env.step(action)
+                step_duration = time.time() - step_start
+                if step_timeout is not None and step_duration > step_timeout:
+                    now_warn = time.time()
+                    if slow_step_cooldown is None or now_warn - last_slow_step_warn >= slow_step_cooldown:
+                        print(
+                            f"[eval][warn] Episode {episode + 1} step {step_count}: env.step {step_duration:.1f}s "
+                            f"(阈值 {step_timeout:.1f}s)"
+                        )
+                        if heartbeat is not None:
+                            heartbeat.notify(phase="step", message=f"env.step {step_duration:.1f}s", progress=False)
+                        last_slow_step_warn = now_warn
+
+                done = bool(terminated or truncated)
+                cumulative_reward += reward
+                obs = torch.from_numpy(next_obs).to(device, dtype=torch.float32)
+                if output.hidden_state is not None:
+                    hidden_state = output.hidden_state.detach()
+                    if output.cell_state is not None:
+                        cell_state = output.cell_state.detach()
+                if cfg.render:
+                    env.render()
+
+                if progress_interval > 0 and step_count % progress_interval == 0:
+                    elapsed = time.time() - episode_start
+                    print(
+                        f"[eval] Episode {episode + 1} step {step_count}: elapsed={elapsed:.1f}s "
+                        f"reward={cumulative_reward:.2f}"
+                    )
+
+            total_rewards.append(cumulative_reward)
+            episode_duration = time.time() - episode_start
+            avg_step_time = episode_duration / max(step_count, 1)
+            world = metadata.get("world")
+            stage = metadata.get("stage")
+            print(
+                f"[eval] Episode {episode + 1} (World {world} Stage {stage}) "
+                f"reward={cumulative_reward:.2f} steps={step_count} duration={episode_duration:.1f}s "
+                f"avg_step={avg_step_time:.2f}s flag={info.get('flag_get', False)}"
+            )
+            if heartbeat is not None:
+                heartbeat.notify(
+                    update_idx=episode + 1,
+                    global_step=total_steps,
+                    phase="episode",
+                    message=f"第{episode + 1}集完成 reward={cumulative_reward:.2f}",
+                )
+    finally:
+        env.close()
+
+    avg_reward = float(np.mean(total_rewards)) if total_rewards else 0.0
+    print(f"[eval] Average reward over {cfg.episodes} episodes: {avg_reward:.2f}")
+    if heartbeat is not None:
+        heartbeat.notify(phase="总结", message=f"平均回报 {avg_reward:.2f}", progress=False)
 
 
 def main():
     args = parse_args()
     checkpoint_path = Path(args.checkpoint)
-    metadata = load_checkpoint_metadata(checkpoint_path)
-    eval_cfg = build_eval_config(args, metadata)
-    device = torch.device(args.device)
-    model = load_model(checkpoint_path, metadata, device)
-    evaluate(model, eval_cfg, metadata, device)
+    hb_interval = args.heartbeat_interval
+    hb_timeout = args.heartbeat_timeout
+    if hb_timeout <= 0:
+        base_interval = hb_interval if hb_interval > 0 else 15.0
+        hb_timeout = max(base_interval * 4.0, 60.0)
+
+    heartbeat = HeartbeatReporter(
+        component="eval",
+        interval=hb_interval if hb_interval > 0 else 15.0,
+        stall_timeout=hb_timeout,
+        enabled=hb_interval > 0,
+    )
+    heartbeat.start()
+    heartbeat.notify(phase="初始化", message="加载 checkpoint 元数据", progress=False)
+
+    try:
+        metadata = load_checkpoint_metadata(checkpoint_path)
+        eval_cfg = build_eval_config(args, metadata)
+        device = torch.device(args.device)
+        heartbeat.notify(phase="初始化", message="构建模型", progress=False)
+        model = load_model(checkpoint_path, metadata, device)
+
+        step_timeout = args.step_timeout if args.step_timeout > 0 else None
+        progress_interval = max(args.progress_interval, 0)
+        hb_desc = f"{hb_interval:.0f}s" if hb_interval > 0 else "off"
+        timeout_desc = f"{step_timeout:.1f}s" if step_timeout is not None else "off"
+
+        print(f"[eval] checkpoint={checkpoint_path} episodes={args.episodes} render={args.render}")
+        world = metadata.get("world")
+        stage = metadata.get("stage")
+        action_type = metadata.get("action_type", "complex")
+        print(
+            f"[eval] stage={world}-{stage} action={action_type} video_dir={eval_cfg.video_dir} "
+            f"heartbeat={hb_desc} step_timeout={timeout_desc} progress_every={progress_interval} steps"
+        )
+
+        heartbeat.notify(phase="评估", message=f"准备评估 {args.episodes} 集", progress=False)
+        heartbeat.heartbeat_now()
+
+        evaluate(
+            model,
+            eval_cfg,
+            metadata,
+            device,
+            heartbeat=heartbeat,
+            step_timeout=step_timeout,
+            progress_interval=progress_interval,
+        )
+        heartbeat.notify(phase="完成", message="评估完成", progress=False)
+    finally:
+        heartbeat.heartbeat_now()
+        heartbeat.stop(timeout=2.0)
 
 
 if __name__ == "__main__":
