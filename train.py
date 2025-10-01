@@ -50,6 +50,7 @@ import multiprocessing as _mp
 
 import dataclasses
 import json
+import contextlib
 import os
 import math
 from datetime import datetime, UTC
@@ -142,6 +143,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--config-out", type=str, default=None, help="Persist effective config to JSON")
     parser.add_argument("--per", action="store_true", help="Enable prioritized replay (hybrid)")
+    parser.add_argument("--per-sample-interval", type=int, default=1, help="PER 抽样更新间隔（>=1）。例如 4 表示每4次更新做一次 PER batch")
     parser.add_argument("--project", type=str, default="mario-a3c")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Device to run training on")
     parser.add_argument("--metrics-path", type=str, default=None, help="Path to JSONL file for periodic metrics dump")
@@ -155,6 +157,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--worker-start-delay", type=float, default=0.2, help="Stagger delay (s) between worker initialisations when using async vector env")
     parser.add_argument("--heartbeat-interval", type=float, default=30.0, help="心跳打印间隔（秒），<=0 表示关闭")
     parser.add_argument("--heartbeat-timeout", type=float, default=300.0, help="无进展告警阈值（秒），<=0 则自动按间隔推算")
+    parser.add_argument("--overlap-collect", action="store_true", help="启用采集-学习重叠：后台线程采集下一批 rollout")
     parser.add_argument(
         "--step-timeout",
         type=float,
@@ -242,6 +245,8 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     train_cfg.log_interval = args.log_interval
     train_cfg.resume_from = args.resume
     train_cfg.replay = dataclasses.replace(train_cfg.replay, enable=args.per)
+    # 将 per_sample_interval 写入 replay 配置
+    train_cfg.replay = dataclasses.replace(train_cfg.replay, per_sample_interval=max(1, getattr(args, 'per_sample_interval', 1)))
     train_cfg.device = args.device
     train_cfg.metrics_path = args.metrics_path
     return train_cfg
@@ -887,6 +892,101 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     last_log_update = global_update
     last_log_time = time.time()
 
+    overlap_enabled = bool(getattr(args, "overlap_collect", False)) and not cfg.env.asynchronous
+    # 只在同步向量环境下尝试重叠，异步环境不启用（避免复杂性）
+    if overlap_enabled:
+        print("[train] overlap collection enabled (double-buffer thread model)")
+    model_lock = threading.Lock() if overlap_enabled else None
+
+    # 用于存放后台线程结果
+    class _CollectResult:
+        __slots__ = ("obs_cpu", "obs_gpu", "hidden", "cell", "rollout", "episode_returns")
+
+        def __init__(self):
+            self.obs_cpu = None
+            self.obs_gpu = None
+            self.hidden = None
+            self.cell = None
+            self.rollout = None
+            self.episode_returns = None
+
+    def _collect_rollout(buffer: RolloutBuffer, start_obs_cpu: torch.Tensor, start_hidden, start_cell, ep_returns: np.ndarray, update_idx_hint: int, progress_heartbeat: bool = False):
+        local_hidden = start_hidden
+        local_cell = start_cell
+        obs_local_cpu = start_obs_cpu
+        if local_hidden is not None:
+            buffer.set_initial_hidden(local_hidden.detach(), local_cell.detach() if local_cell is not None else None)
+        else:
+            buffer.set_initial_hidden(None, None)
+        for step in range(cfg.rollout.num_steps):
+            with model_lock or contextlib.nullcontext():
+                with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
+                    out = model(obs_local_cpu.to(device, non_blocking=(device.type == "cuda")), local_hidden, local_cell)
+            dist = Categorical(logits=out.logits)
+            actions = dist.sample()
+            log_probs = dist.log_prob(actions)
+            values = out.value
+            actions_cpu = actions.detach().cpu()
+            log_probs_cpu = log_probs.detach().cpu()
+            values_cpu = values.detach().cpu()
+            step_start = time.time()
+            next_obs_np, reward_np, terminated, truncated, _infos = env.step(actions_cpu.numpy())
+            done = np.logical_or(terminated, truncated)
+            reward_cpu = _to_cpu_tensor(reward_np, dtype=torch.float32)
+            done_cpu = _to_cpu_tensor(done.astype(np.float32), dtype=torch.float32)
+            buffer.insert(step, obs_local_cpu, actions_cpu, log_probs_cpu, reward_cpu, values_cpu, done_cpu)
+            obs_local_cpu = _to_cpu_tensor(next_obs_np)
+            ep_returns += reward_np
+            if done.any():
+                for idx_env, flag in enumerate(done):
+                    if flag:
+                        completed_returns.append(float(ep_returns[idx_env]))
+                        ep_returns[idx_env] = 0.0
+                if len(completed_returns) > 1000:
+                    completed_returns[:] = completed_returns[-1000:]
+            if out.hidden_state is not None:
+                local_hidden = out.hidden_state.detach()
+                if done.any():
+                    mask = torch.as_tensor(done, dtype=torch.bool, device=local_hidden.device)
+                    local_hidden[:, mask] = 0.0
+                if out.cell_state is not None:
+                    local_cell = out.cell_state.detach()
+                    if done.any():
+                        mask = torch.as_tensor(done, dtype=torch.bool, device=local_cell.device)
+                        local_cell[:, mask] = 0.0
+                else:
+                    local_cell = None
+            else:
+                local_hidden = None
+                local_cell = None
+            if progress_heartbeat and (step + 1) % 8 == 0:
+                heartbeat.notify(global_step=-1, phase="rollout", message=f"(bg) 采样 {step+1}/{cfg.rollout.num_steps}")
+        buffer.set_next_obs(obs_local_cpu)
+        return obs_local_cpu, local_hidden, local_cell, ep_returns
+
+    # 双缓冲：当前 buffer / 下一个 buffer
+    current_buffer = rollout
+    next_buffer = RolloutBuffer(cfg.rollout.num_steps, cfg.env.num_envs, env.single_observation_space.shape, device, pin_memory=(device.type == "cuda")) if overlap_enabled else None
+    pending_thread = None
+    pending_result = _CollectResult() if overlap_enabled else None
+
+    def _start_background_collection(start_obs_cpu, hidden_state, cell_state, ep_returns, next_update_idx):
+        assert overlap_enabled and next_buffer is not None and pending_result is not None
+        next_buffer.reset()
+        pending_result.obs_cpu = None
+        def _runner():
+            try:
+                obs_cpu_final, h_final, c_final, ep_ret = _collect_rollout(next_buffer, start_obs_cpu, hidden_state, cell_state, ep_returns, next_update_idx, progress_heartbeat=False)
+                pending_result.obs_cpu = obs_cpu_final
+                pending_result.hidden = h_final
+                pending_result.cell = c_final
+                pending_result.episode_returns = ep_ret
+            except Exception as e:  # pragma: no cover - 仅日志
+                print(f"[train][warn] background collection failed: {e}")
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
+        return t
+
     for update_idx in range(global_update, cfg.total_updates):
         update_wall_start = time.time()
         heartbeat.notify(
@@ -895,80 +995,89 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             phase="rollout",
             message=f"采集第{update_idx}轮数据",
         )
-        rollout.reset()
-        if hidden_state is not None:
-            rollout.set_initial_hidden(hidden_state.detach(), cell_state.detach() if cell_state is not None else None)
-        else:
-            rollout.set_initial_hidden(None, None)
-
-        for step in range(cfg.rollout.num_steps):
-            # Use torch.amp.autocast with explicit device_type for compatibility
-            with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
-                output = model(obs_gpu, hidden_state, cell_state)
-                logits = output.logits
-                values = output.value
-
-            dist = Categorical(logits=logits)
-            actions = dist.sample()
-            log_probs = dist.log_prob(actions)
-
-            actions_cpu = actions.detach().cpu()
-            log_probs_cpu = log_probs.detach().cpu()
-            values_cpu = values.detach().cpu()
-
-            step_start_time = time.time()
-            next_obs_np, reward_np, terminated, truncated, infos = env.step(actions_cpu.numpy())
-            step_duration = time.time() - step_start_time
-            if step_timeout is not None and step_duration > step_timeout:
-                now_warn = time.time()
-                if slow_step_cooldown is None or now_warn - last_slow_step_warn >= slow_step_cooldown:
-                    print(
-                        f"[train][warn] env.step 耗时 {step_duration:.1f}s (阈值 {step_timeout:.1f}s)，可能存在卡顿。"
-                    )
-                    heartbeat.notify(phase="rollout", message=f"env.step {step_duration:.1f}s", progress=False)
-                    last_slow_step_warn = now_warn
-            done = np.logical_or(terminated, truncated)
-
-            reward_cpu = _to_cpu_tensor(reward_np, dtype=torch.float32)
-            done_cpu = _to_cpu_tensor(done.astype(np.float32), dtype=torch.float32)
-
-            rollout.insert(step, obs_cpu, actions_cpu, log_probs_cpu, reward_cpu, values_cpu, done_cpu)
-
-            obs_cpu = _to_cpu_tensor(next_obs_np)
-            obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
-            episode_returns += reward_np
-            if done.any():
-                for idx_env, flag in enumerate(done):
-                    if flag:
-                        completed_returns.append(float(episode_returns[idx_env]))
-                        episode_returns[idx_env] = 0.0
-                if len(completed_returns) > 1000:
-                    completed_returns = completed_returns[-1000:]
-            if output.hidden_state is not None:
-                hidden_state = output.hidden_state.detach()
+        if not overlap_enabled:
+            # 原始同步采集逻辑保留
+            rollout.reset()
+            if hidden_state is not None:
+                rollout.set_initial_hidden(hidden_state.detach(), cell_state.detach() if cell_state is not None else None)
+            else:
+                rollout.set_initial_hidden(None, None)
+            for step in range(cfg.rollout.num_steps):
+                with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
+                    output = model(obs_gpu, hidden_state, cell_state)
+                    logits = output.logits
+                    values = output.value
+                dist = Categorical(logits=logits)
+                actions = dist.sample()
+                log_probs = dist.log_prob(actions)
+                actions_cpu = actions.detach().cpu()
+                log_probs_cpu = log_probs.detach().cpu()
+                values_cpu = values.detach().cpu()
+                step_start_time = time.time()
+                next_obs_np, reward_np, terminated, truncated, infos = env.step(actions_cpu.numpy())
+                step_duration = time.time() - step_start_time
+                if step_timeout is not None and step_duration > step_timeout:
+                    now_warn = time.time()
+                    if slow_step_cooldown is None or now_warn - last_slow_step_warn >= slow_step_cooldown:
+                        print(f"[train][warn] env.step 耗时 {step_duration:.1f}s (阈值 {step_timeout:.1f}s)，可能存在卡顿。")
+                        heartbeat.notify(phase="rollout", message=f"env.step {step_duration:.1f}s", progress=False)
+                        last_slow_step_warn = now_warn
+                done = np.logical_or(terminated, truncated)
+                reward_cpu = _to_cpu_tensor(reward_np, dtype=torch.float32)
+                done_cpu = _to_cpu_tensor(done.astype(np.float32), dtype=torch.float32)
+                rollout.insert(step, obs_cpu, actions_cpu, log_probs_cpu, reward_cpu, values_cpu, done_cpu)
+                obs_cpu = _to_cpu_tensor(next_obs_np)
+                obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
+                episode_returns += reward_np
                 if done.any():
-                    mask = torch.as_tensor(done, dtype=torch.bool, device=device)
-                    hidden_state[:, mask] = 0.0
-                if output.cell_state is not None:
-                    cell_state = output.cell_state.detach()
+                    for idx_env, flag in enumerate(done):
+                        if flag:
+                            completed_returns.append(float(episode_returns[idx_env]))
+                            episode_returns[idx_env] = 0.0
+                    if len(completed_returns) > 1000:
+                        completed_returns = completed_returns[-1000:]
+                if output.hidden_state is not None:
+                    hidden_state = output.hidden_state.detach()
                     if done.any():
                         mask = torch.as_tensor(done, dtype=torch.bool, device=device)
-                        cell_state[:, mask] = 0.0
+                        hidden_state[:, mask] = 0.0
+                    if output.cell_state is not None:
+                        cell_state = output.cell_state.detach()
+                        if done.any():
+                            mask = torch.as_tensor(done, dtype=torch.bool, device=device)
+                            cell_state[:, mask] = 0.0
+                    else:
+                        cell_state = None
                 else:
+                    hidden_state = None
                     cell_state = None
+                global_step += cfg.env.num_envs
+                if (step + 1) % 8 == 0 or step + 1 == cfg.rollout.num_steps:
+                    heartbeat.notify(global_step=global_step, phase="rollout", message=f"采样进度 {step + 1}/{cfg.rollout.num_steps}")
+            rollout.set_next_obs(obs_cpu)
+        else:
+            # overlap 模式
+            if update_idx == global_update:
+                # 首次需要前台采集以获得初始缓冲
+                current_buffer.reset()
+                obs_cpu, hidden_state, cell_state, episode_returns = _collect_rollout(current_buffer, obs_cpu, hidden_state, cell_state, episode_returns, update_idx, progress_heartbeat=True)
+                obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
             else:
-                hidden_state = None
-                cell_state = None
-
-            global_step += cfg.env.num_envs
-            if (step + 1) % 8 == 0 or step + 1 == cfg.rollout.num_steps:
-                heartbeat.notify(
-                    global_step=global_step,
-                    phase="rollout",
-                    message=f"采样进度 {step + 1}/{cfg.rollout.num_steps}",
-                )
-
-        rollout.set_next_obs(obs_cpu)
+                # 等待后台线程完成上一个 next_buffer
+                if pending_thread is not None:
+                    pending_thread.join()
+                # 将 next_buffer 变为当前
+                current_buffer, next_buffer = next_buffer, current_buffer  # type: ignore
+                rollout = current_buffer  # 保持后续变量引用一致
+                obs_cpu = pending_result.obs_cpu  # type: ignore
+                obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
+                hidden_state = pending_result.hidden
+                cell_state = pending_result.cell
+                if pending_result.episode_returns is not None:
+                    episode_returns = pending_result.episode_returns
+            # 在学习阶段开始前启动下一次后台采集（除非最后一次）
+            if update_idx + 1 < cfg.total_updates:
+                pending_thread = _start_background_collection(obs_cpu, hidden_state, cell_state, episode_returns, update_idx + 1)
 
         rollout_duration = time.time() - update_wall_start
         heartbeat.notify(
@@ -1008,7 +1117,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         )
 
         per_loss = torch.tensor(0.0, device=device)
-        if per_buffer is not None:
+        if per_buffer is not None and (update_idx % cfg.replay.per_sample_interval == 0):
             obs_flat = sequences["obs"].reshape(-1, *sequences["obs"].shape[2:])
             actions_flat = sequences["actions"].reshape(-1)
             vs_flat = vs.detach().reshape(-1, 1)
@@ -1194,6 +1303,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     logd["global_step"] = global_step
                     wandb_run.log(logd)
 
+            # 降低 nvidia-smi 调用频率：仅当距离上次记录 >=120s 再写入 GPU util（否则仅使用 torch.cuda.memory 信息）
             if stats:
                 metrics_entry["resource"] = stats
 

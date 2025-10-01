@@ -12,6 +12,7 @@
 1. 功能/接口层面的显式变更在 `CHANGELOG.md`（若尚未创建，可后续补充）记录，遵循 Keep a Changelog + SemVer。
 2. 调试、性能、环境稳定性一类过程性报告放在 `docs/`：例如 `ENV_DEBUGGING_REPORT.md`、`GPU_UTILIZATION_ANALYSIS.md`。
 3. 对 `README.md` 或 `AGENTS.md` 的更新，不在文件内写“更新历史”段落；若需说明重大规范切换，在 `docs/DOCUMENTATION_POLICY.md` 增补一条“版本里程碑”即可。
+ 4. 跨文件的多项相关变更以合并条目形式汇总在 `docs/decision_record.md`，集中描述动机/备选/决策/验证，避免重复叙述。
 
 ## Checkpoint / 训练恢复 | Checkpoint & Resume
 （详见 `README.md` 的训练恢复章节）

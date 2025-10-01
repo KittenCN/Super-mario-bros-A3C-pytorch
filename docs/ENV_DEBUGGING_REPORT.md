@@ -59,3 +59,23 @@
 **验证 | Validation**：`PYTHONPATH=. python train.py --world 1 --stage 1 --num-envs 8 --total-updates 50000` 构建与训练均顺利，未再触发超时告警。<br>Run succeeded without timeout warnings.
 
 **后续 | Next**：考虑阶段级超时 & 可选容错跳过；聚合日志为 JSON 便于统计。<br>Plan stage-level timeouts & optional fault tolerance; aggregate logs into JSON.
+
+### 新增（2025-10-01 PM）Overlap 采集实验 | Overlap Collection Experiment
+**背景**：GPU 空转主要发生在同步“采集→学习”串行之间。<br>GPU idle gaps appear between strictly serial collect→learn phases.
+
+**实现**：在 `train.py` 引入 `--overlap-collect` 双缓冲线程：
+1. 前台学习当前 rollout；
+2. 后台线程并行采集下一批；
+3. 迭代开始时交换缓冲。
+
+**取舍**：
+- 采用线程 + 互斥锁包裹模型前向，避免 PyTorch 非线程安全风险；牺牲部分并行度换稳定性。
+- 未做 step-level 流水线，保持实现简单便于回退。
+
+**风险**：
+- 线程异常仅日志告警，需后续指标化监控。
+- 模型前向仍串行，性能提升受限（后续考虑 actor 快照网络解锁无锁读）。
+
+**验证**：CLI help 出现参数；无 flag 时路径不变；语法编译通过。等待基准数据（SPS、updates/sec）。
+
+**下一步**：收集基线 vs overlap 模式 300~1000 updates 的耗时比与 GPU util 曲线，决定是否推进 actor-learner 分离。

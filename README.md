@@ -93,6 +93,32 @@ PYTHONPATH=. python train.py --world 1 --stage 1 --num-envs 8 --total-updates 50
 
 后续潜在改进（未实施）：mario_make 硬超时 + 可跳过策略、结构化 JSON 诊断、`--env-progress-quiet` 静默开关。<br>Future (not implemented): hard timeout + skip policy, structured JSON diagnostics, `--env-progress-quiet` flag.
 
+### 2025-10-01 性能改进（阶段一）| 2025-10-01 Performance Improvements (Phase 1)
+为缓解 GPU 空转与 Python 包装层开销，本日合入如下低风险优化（细节/取舍见 `docs/decision_record.md`）：<br>To reduce GPU idling and Python wrapper overhead, the following low-risk optimisations were merged (see `docs/decision_record.md` for rationale):
+
+1. Fused 观测预处理：将灰度、缩放、归一化、帧堆叠合并为单一 wrapper，减少多次函数调用。<br>Fused observation preprocessing to cut multiple Python calls.
+2. PER 抽样间隔：新增 `--per-sample-interval N`，允许每 N 轮才做一次 PER 样本/优先级更新。<br>`--per-sample-interval N` reduces frequency of PER sampling.
+3. 监控节流：降低外部 GPU 查询频率，为后续 NVML 方案预留接口。<br>Throttled external GPU metric polling.
+4. 双缓冲重叠采集（实验特性）：`--overlap-collect` 在同步向量环境下启用后台线程采集下一批 rollout，与当前批学习重叠。<br>Experimental `--overlap-collect` flag: background thread collects next rollout while learning current one (sync env only).
+
+使用建议 | Usage tips:
+```bash
+# 基线运行
+python train.py --world 1 --stage 1 --num-envs 8 --rollout-steps 64 --total-updates 500 --log-interval 50
+
+# 启用重叠采集对比
+python train.py --world 1 --stage 1 --num-envs 8 --rollout-steps 64 --total-updates 500 --log-interval 50 --overlap-collect
+
+# 降低 PER 频率示例（每 4 轮）
+python train.py --per --per-sample-interval 4 ...
+```
+
+基准指标（建议记录）：updates/sec、env_steps/sec、单轮耗时、GPU utilisation、PER 触发频率。<br>Recommended to log: updates/sec, env_steps/sec, per-update wall time, GPU utilisation, PER trigger frequency.
+
+若发生后台线程异常将打印 `[train][warn] background collection failed:` 警告但主循环继续；首次迭代前台采集以填充缓冲。<br>Background thread failures emit a warning but training continues; first iteration collects in foreground.
+
+后续阶段计划：无锁 actor-learner 拆分、GPU 常驻 PER、NVML 原生监控、结构化性能基线表格。<br>Next steps: lock-free actor/learner split, GPU-resident PER, native NVML monitoring, structured performance baseline tables.
+
 ## 文档与归档策略 | Documentation Policy
 完整规则见 `docs/DOCUMENTATION_POLICY.md`。核心要点：<br>See `docs/DOCUMENTATION_POLICY.md` for full rules. Summary:
 - 根目录只保留最新 `README.md` 与 `AGENTS.md`；其余文档放入 `docs/`。

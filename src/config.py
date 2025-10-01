@@ -59,6 +59,7 @@ class ReplayBufferConfig:
     priority_beta_final: float = 1.0
     priority_beta_steps: int = 1_000_000
     enable: bool = True
+    per_sample_interval: int = 1  # 新增：间隔多少次 update 执行一次 PER 采样（1 表示每次）
 
 
 @dataclasses.dataclass

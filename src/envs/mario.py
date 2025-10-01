@@ -335,6 +335,83 @@ def _apply_frame_stack(env: "gym.Env", stack_size: int) -> "gym.Env":
     return _SimpleFrameStack(env, stack_size)
 
 
+class FusedPreprocessWrapper(gym.Wrapper):
+    """Combine grayscale (if needed), resize, float conversion, stacking and normalisation.
+
+    目的：减少多层 Python wrapper 调度开销，将一串逐帧变换融合。
+    仅在输入观测是图像 (H, W, C) 或 (C, H, W) 且后续需要同样处理时启用。
+    """
+
+    def __init__(self, env: "gym.Env", frame_stack: int = 4, size: Tuple[int, int] = (84, 84)) -> None:
+        super().__init__(env)
+        self.frame_stack = frame_stack
+        self.size = size
+        self._frames: deque[np.ndarray] = deque(maxlen=frame_stack)
+        # 推断输入空间
+        if not isinstance(env.observation_space, gym.spaces.Box):
+            raise TypeError("FusedPreprocessWrapper requires Box observation space")
+        obs_space: gym.spaces.Box = env.observation_space
+        self.input_low = obs_space.low
+        self.input_high = obs_space.high
+        self.channels_last = False
+        shape = obs_space.shape
+        if len(shape) == 3:
+            # (H,W,C) or (C,H,W) 判定：假设 C<=4 且 H,W>4 则 channels_last
+            if shape[2] <= 4 and shape[0] >= 16 and shape[1] >= 16:
+                self.channels_last = True
+        # 输出 shape: (frame_stack, 84, 84)
+        self.observation_space = gym.spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(frame_stack, self.size[0], self.size[1]),
+            dtype=np.float32,
+        )
+
+    def _process_frame(self, frame: np.ndarray) -> np.ndarray:
+        # 统一为 (H,W,C)
+        if frame.ndim == 2:
+            frame = frame[..., None]
+        if not self.channels_last:
+            # 假设输入为 (C,H,W)
+            frame = np.transpose(frame, (1, 2, 0))
+        # 灰度：若 C>1 则简单取均值 (避免再次调用外部灰度 wrapper)
+        if frame.shape[2] > 1:
+            frame = frame.mean(axis=2, keepdims=True)
+        # Resize 最近邻（依赖 PIL 或 cv2 可能引入额外依赖，此处使用简单缩放）
+        h, w = frame.shape[:2]
+        if (h, w) != self.size:
+            # 简单缩放：使用 numpy 索引插值（性能足够）
+            y_idx = (np.linspace(0, h - 1, self.size[0])).astype(np.int32)
+            x_idx = (np.linspace(0, w - 1, self.size[1])).astype(np.int32)
+            frame = frame[y_idx][:, x_idx]
+        # 归一化到 [0,1]
+        frame = frame.astype(np.float32) / 255.0
+        # 返回 (H,W) squeeze C
+        frame = np.squeeze(frame, axis=2)
+        return frame  # (H,W)
+
+    def _stack(self) -> np.ndarray:
+        # 输出 shape: (frame_stack, H, W)
+        return np.stack(list(self._frames), axis=0)
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):  # type: ignore[override]
+        obs, info = self.env.reset(seed=seed, options=options)
+        self._frames.clear()
+        processed = self._process_frame(obs)
+        # 预填充 (frame_stack-1) 个零帧 + 当前帧
+        zero_frame = np.zeros_like(processed)
+        for _ in range(self.frame_stack - 1):
+            self._frames.append(zero_frame)
+        self._frames.append(processed)
+        return self._stack(), info
+
+    def step(self, action):  # type: ignore[override]
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        processed = self._process_frame(obs)
+        self._frames.append(processed)
+        return self._stack(), reward, terminated, truncated, info
+
+
 def list_available_stages(max_world: int = 8, max_stage: int = 4) -> List[Tuple[int, int]]:
     """List all available world-stage combinations."""
 
@@ -557,18 +634,11 @@ def _make_single_env(
             _diag("reward_wrapper_done")
             env = gym.wrappers.FrameSkip(env, config.frame_skip)
             _diag("frameskip_done")
-            env = gym.wrappers.GrayScaleObservation(env, keep_dim=True)
-            _diag("grayscale_done")
-            env = gym.wrappers.ResizeObservation(env, (84, 84))
-            _diag("resize_done")
-            env = TransformObservation(env, lambda obs: obs.astype(np.float32))
-            _diag("transform_obs_dtype_done")
+            # 使用融合 wrapper 取代多层包装
+            env = FusedPreprocessWrapper(env, frame_stack=config.frame_stack, size=(84, 84))
+            _diag("fused_preprocess_done")
             env = TransformReward(env, float)
             _diag("transform_reward_done")
-            env = _apply_frame_stack(env, config.frame_stack)
-            _diag("framestack_done")
-            env = TransformObservation(env, _normalise_observation)
-            _diag("transform_obs_scale_done")
         if config.record_video:
             os.makedirs(config.video_dir, exist_ok=True)
             env = gym.wrappers.RecordVideo(
