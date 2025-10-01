@@ -164,6 +164,25 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=15.0,
         help="单次环境 step 超过该秒数将发出屏幕警告，<=0 表示关闭",
     )
+    # 进度细粒度控制
+    parser.add_argument(
+        "--rollout-progress-interval",
+        type=int,
+        default=8,
+        help="常规更新阶段 rollout 步进进度打印/心跳的步数间隔 (>=1)",
+    )
+    parser.add_argument(
+        "--rollout-progress-warmup-updates",
+        type=int,
+        default=2,
+        help="前多少个 update 使用 warmup 细粒度间隔 (>=0)",
+    )
+    parser.add_argument(
+        "--rollout-progress-warmup-interval",
+        type=int,
+        default=1,
+        help="warmup 阶段的步进进度间隔 (>=1)，默认每步打印", 
+    )
     return parser.parse_args(argv)
 
 
@@ -935,7 +954,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             self.rollout = None
             self.episode_returns = None
 
-    def _collect_rollout(buffer: RolloutBuffer, start_obs_cpu: torch.Tensor, start_hidden, start_cell, ep_returns: np.ndarray, update_idx_hint: int, progress_heartbeat: bool = False):
+    def _collect_rollout(buffer: RolloutBuffer, start_obs_cpu: torch.Tensor, start_hidden, start_cell, ep_returns: np.ndarray, update_idx_hint: int, progress_heartbeat: bool = False, step_interval: int = 8):
         local_hidden = start_hidden
         local_cell = start_cell
         obs_local_cpu = start_obs_cpu
@@ -987,7 +1006,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             else:
                 local_hidden = None
                 local_cell = None
-            if progress_heartbeat and (step + 1) % 8 == 0:
+            if progress_heartbeat and ((step + 1) % step_interval == 0 or step + 1 == cfg.rollout.num_steps):
                 heartbeat.notify(global_step=-1, phase="rollout", message=f"(bg) 采样 {step+1}/{cfg.rollout.num_steps}")
         buffer.set_next_obs(obs_local_cpu)
         return obs_local_cpu, local_hidden, local_cell, ep_returns
@@ -998,13 +1017,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     pending_thread = None
     pending_result = _CollectResult() if overlap_enabled else None
 
-    def _start_background_collection(start_obs_cpu, hidden_state, cell_state, ep_returns, next_update_idx):
+    def _start_background_collection(start_obs_cpu, hidden_state, cell_state, ep_returns, next_update_idx, step_interval: int):
         assert overlap_enabled and next_buffer is not None and pending_result is not None
         next_buffer.reset()
         pending_result.obs_cpu = None
         def _runner():
             try:
-                obs_cpu_final, h_final, c_final, ep_ret = _collect_rollout(next_buffer, start_obs_cpu, hidden_state, cell_state, ep_returns, next_update_idx, progress_heartbeat=False)
+                obs_cpu_final, h_final, c_final, ep_ret = _collect_rollout(next_buffer, start_obs_cpu, hidden_state, cell_state, ep_returns, next_update_idx, progress_heartbeat=False, step_interval=step_interval)
                 pending_result.obs_cpu = obs_cpu_final
                 pending_result.hidden = h_final
                 pending_result.cell = c_final
@@ -1015,6 +1034,11 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         t.start()
         return t
 
+    # 进度输出策略参数
+    base_interval = max(1, getattr(args, "rollout_progress_interval", 8))
+    warmup_updates = max(0, getattr(args, "rollout_progress_warmup_updates", 2))
+    warmup_interval = max(1, getattr(args, "rollout_progress_warmup_interval", 1))
+
     for update_idx in range(global_update, cfg.total_updates):
         update_wall_start = time.time()
         heartbeat.notify(
@@ -1023,6 +1047,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             phase="rollout",
             message=f"采集第{update_idx}轮数据",
         )
+        # 当前 update 使用的步进进度间隔（前 warmup_updates 个使用 warmup_interval）
+        current_interval = warmup_interval if (update_idx - global_update) < warmup_updates else base_interval
         if not overlap_enabled:
             # 原始同步采集逻辑保留
             rollout.reset()
@@ -1084,7 +1110,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 # 主动释放局部变量引用，帮助 Python 更快回收（避免长生存期列表）
                 del output, logits, values, dist, actions, log_probs
                 global_step += cfg.env.num_envs
-                if (step + 1) % 8 == 0 or step + 1 == cfg.rollout.num_steps:
+                if (step + 1) % current_interval == 0 or step + 1 == cfg.rollout.num_steps:
                     heartbeat.notify(global_step=global_step, phase="rollout", message=f"采样进度 {step + 1}/{cfg.rollout.num_steps}")
             rollout.set_next_obs(obs_cpu)
         else:
@@ -1092,7 +1118,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             if update_idx == global_update:
                 # 首次需要前台采集以获得初始缓冲
                 current_buffer.reset()
-                obs_cpu, hidden_state, cell_state, episode_returns = _collect_rollout(current_buffer, obs_cpu, hidden_state, cell_state, episode_returns, update_idx, progress_heartbeat=True)
+                obs_cpu, hidden_state, cell_state, episode_returns = _collect_rollout(current_buffer, obs_cpu, hidden_state, cell_state, episode_returns, update_idx, progress_heartbeat=True, step_interval=current_interval)
                 obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
             else:
                 # 等待后台线程完成上一个 next_buffer
@@ -1109,7 +1135,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     episode_returns = pending_result.episode_returns
             # 在学习阶段开始前启动下一次后台采集（除非最后一次）
             if update_idx + 1 < cfg.total_updates:
-                pending_thread = _start_background_collection(obs_cpu, hidden_state, cell_state, episode_returns, update_idx + 1)
+                pending_thread = _start_background_collection(obs_cpu, hidden_state, cell_state, episode_returns, update_idx + 1, step_interval=current_interval)
 
         rollout_duration = time.time() - update_wall_start
         heartbeat.notify(

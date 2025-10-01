@@ -59,6 +59,7 @@ show_help() {
   AUTO_MEM=0             # 1=开启自动显存降载重试
   MEM_TARGET_GB=1.0      # 预留给系统/碎片的安全余量 (估算用, 不做硬限制)
   MAX_RETRIES=4          # 自动降载最大尝试次数
+  AUTO_MEM_STREAM=1      # 1=降载重试阶段实时输出日志 (stream); 0=缓冲到结束再输出
 
 示例 / Example:
   NUM_ENVS=12 ROLLOUT=96 GRAD_ACCUM=1 PER_INTERVAL=2 bash scripts/run_2080ti_resume.sh
@@ -99,6 +100,7 @@ LOG_DIR=${LOG_DIR:-tensorboard/a3c_super_mario_bros}
 AUTO_MEM=${AUTO_MEM:-0}
 MEM_TARGET_GB=${MEM_TARGET_GB:-1.0}
 MAX_RETRIES=${MAX_RETRIES:-4}
+AUTO_MEM_STREAM=${AUTO_MEM_STREAM:-1}
 
 SAVE_DIR="${SAVE_ROOT}/${RUN_NAME}"
 mkdir -p "${SAVE_DIR}" || true
@@ -107,7 +109,8 @@ mkdir -p "${SAVE_DIR}" || true
 DEVICE=auto
 
 build_cmd() {
-  CMD=(python train.py \
+  # -u: 无缓冲标准输出，确保前几轮 rollout/日志即时可见
+  CMD=(python -u train.py \
   --world "${WORLD}" \
   --stage "${STAGE}" \
   --action-type "${ACTION_TYPE}" \
@@ -192,14 +195,34 @@ for tier in "${TIERS[@]}"; do
   NUM_ENVS=$T_NUM ROLLOUT=$T_ROLLOUT GRAD_ACCUM=$T_ACCUM build_cmd
   echo "[run_2080ti_resume][auto-mem] Attempt ${attempt} -> num_envs=${T_NUM} rollout=${T_ROLLOUT} grad_accum=${T_ACCUM}" 
   printf '  %q' "${CMD[@]}"; echo
-  # 运行并捕获 OOM 关键字
+  # 运行并捕获 OOM 关键字；支持流式或缓冲模式
   set +e
-  OUTPUT=$( "${CMD[@]}" 2>&1 )
-  CODE=$?
+  if (( AUTO_MEM_STREAM == 1 )); then
+  LOG_FILE=$(mktemp -t mario_auto_mem_${attempt}_XXXXXX.log 2>/dev/null || mktemp /tmp/mario_auto_mem_${attempt}_XXXXXX.log)
+  echo "[run_2080ti_resume][auto-mem] Streaming logs (attempt ${attempt}) -> ${LOG_FILE}" >&2
+    if command -v stdbuf >/dev/null 2>&1; then
+      stdbuf -oL -eL "${CMD[@]}" 2>&1 | tee "${LOG_FILE}"
+      CODE=${PIPESTATUS[0]}
+    else
+      "${CMD[@]}" 2>&1 | tee "${LOG_FILE}"
+      CODE=${PIPESTATUS[0]}
+    fi
+    # 仅保留最后 200 行用于错误分支输出
+    if [[ -f "${LOG_FILE}" ]]; then
+      OUTPUT=$(tail -n 200 "${LOG_FILE}" || true)
+    else
+      OUTPUT="(log file missing)"
+    fi
+  else
+    OUTPUT=$( "${CMD[@]}" 2>&1 )
+    CODE=$?
+  fi
   set -e
   if (( CODE == 0 )); then
     echo "[run_2080ti_resume][auto-mem] Training started successfully with tier ${attempt}." >&2
-    echo "$OUTPUT"
+    if (( AUTO_MEM_STREAM == 0 )); then
+      echo "$OUTPUT"
+    fi
     exit 0
   fi
   if echo "$OUTPUT" | grep -qi 'CUDA out of memory'; then
@@ -208,7 +231,15 @@ for tier in "${TIERS[@]}"; do
     continue
   else
     echo "[run_2080ti_resume][auto-mem] Non-OOM failure (exit $CODE). Printing output and aborting." >&2
-    echo "$OUTPUT"
+    if (( AUTO_MEM_STREAM == 1 )); then
+      echo "---- Tail (last 200 lines) ----" >&2
+      echo "$OUTPUT"
+      if [[ -f "${LOG_FILE}" ]]; then
+        echo "---- Full log file: ${LOG_FILE} ----" >&2
+      fi
+    else
+      echo "$OUTPUT"
+    fi
     exit $CODE
   fi
 done
