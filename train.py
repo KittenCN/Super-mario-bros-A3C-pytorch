@@ -641,45 +641,26 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     def _initialise_env(env_cfg: MarioVectorEnvConfig):
         timeout = getattr(env_cfg, "reset_timeout", 60.0)
         start_construct = time.time()
+        print(f"[train] Starting environment construction with timeout={timeout}s...")
         try:
-            # Protect the potentially blocking vector env construction itself
             env_instance = call_with_timeout(create_vector_env, timeout, env_cfg)
             construct_time = time.time() - start_construct
+            print(f"[train] Environment constructed in {construct_time:.2f}s")
         except TimeoutError:
             construct_time = time.time() - start_construct
-            if env_cfg.asynchronous:
-                print(f"[train] Async vector env construction timed out after {timeout}s; retrying with synchronous vector env.")
-                fallback_cfg = dataclasses.replace(env_cfg, asynchronous=False)
-                start_construct = time.time()
-                try:
-                    env_instance = call_with_timeout(create_vector_env, timeout, fallback_cfg)
-                    env_cfg = fallback_cfg
-                    construct_time = time.time() - start_construct
-                except TimeoutError:
-                    raise RuntimeError("Vector env construction timed out")
-            else:
-                raise RuntimeError("Vector env construction timed out")
+            print(f"[train][error] Environment construction timed out after {construct_time:.2f}s")
+            raise RuntimeError("Vector env construction timed out")
 
         start_reset = time.time()
+        print("[train] Resetting environment...")
         try:
             obs, info = call_with_timeout(env_instance.reset, timeout, seed=cfg.seed)
             reset_time = time.time() - start_reset
-            print(f"[train] env constructed in {construct_time:.2f}s and reset in {reset_time:.2f}s")
+            print(f"[train] Environment reset in {reset_time:.2f}s")
             return env_instance, obs, info, env_cfg
         except TimeoutError as err:
             reset_time = time.time() - start_reset
-            # If reset timed out, try fallback to synchronous env when async
-            try:
-                env_instance.close()
-            except Exception:
-                pass
-            if env_cfg.asynchronous:
-                print(f"[train] Async env reset timed out after {timeout}s; retrying with synchronous vector env.")
-                fallback_cfg = dataclasses.replace(env_cfg, asynchronous=False)
-                fallback_env = call_with_timeout(create_vector_env, timeout, fallback_cfg)
-                obs, info = call_with_timeout(fallback_env.reset, timeout, seed=cfg.seed)
-                print(f"[train] fallback env constructed in {construct_time:.2f}s and reset in {time.time()-start_reset:.2f}s")
-                return fallback_env, obs, info, fallback_cfg
+            print(f"[train][error] Environment reset timed out after {reset_time:.2f}s")
             raise RuntimeError("Vector env reset timed out") from err
 
     env, obs_np, _, effective_env_cfg = _initialise_env(cfg.env)
