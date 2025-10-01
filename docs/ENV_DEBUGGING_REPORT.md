@@ -4,7 +4,9 @@
 
 本文汇整在构建 `AsyncVectorEnv` 时遇到的阻塞、溢出等问题，以及针对 `nes_py` 的修复尝试、实验数据与后续建议，确保团队在仓库重置后也能快速上手。<br>This report captures the blocking and overflow issues observed while constructing `AsyncVectorEnv`, the runtime patches applied to `nes_py`, experiments that were run, and suggested next steps so the team can pick up the investigation after repository resets.
 
-## 最新变更摘要 | Latest Update (2025-09-30)
+## 最新变更摘要 | Latest Update (2025-10-01)
+- **修复同步环境构建挂起**：移除同步模式下 `call_with_timeout` 对 `create_vector_env` 的包装，避免 daemon 线程中原生库初始化导致的挂起。<br>**Fixed synchronous environment construction hang**: removed `call_with_timeout` wrapping of `create_vector_env` in synchronous mode to avoid native library initialization issues in daemon threads.
+- 同步环境（`SyncVectorEnv`）在主进程中直接构建，不需要超时包装；异步环境保持使用超时机制处理 worker 进程启动问题。<br>Synchronous environments (`SyncVectorEnv`) are now constructed directly in the main process without timeout wrapping; async environments continue using timeout mechanisms to handle worker process start-up issues.
 - 在 `create_vector_env` 中引入严格的按序启动：每个 worker 需等待前一个 NES 构建完成后再初始化，避免并发 `mario_make` 引发竞争。<br>Serialised worker start-up in `create_vector_env` so each worker waits for the previous NES construction to finish, preventing concurrent `mario_make` contention.
 - 将默认构建/重置超时设为 `max(180s, num_envs × 60s)`，兼顾大规模并发带来的累积等待。<br>Set the default construct/reset timeout to `max(180s, num_envs × 60s)` to accommodate accumulated waits in large asynchronous batches.
 - 保留文件锁与诊断日志机制，便于继续分析潜在的 NES 底层阻塞。<br>Retained the file-lock and diagnostic logging mechanisms to keep visibility into potential NES-level stalls.
@@ -13,6 +15,28 @@
 - 现象：父进程构建 `AsyncVectorEnv` 时偶发超时并回退到同步环境，同时输出 “Async vector env construction timed out…”。<br>Symptom: the parent process sporadically times out while building `AsyncVectorEnv`, prints “Async vector env construction timed out…”, and falls back to the synchronous env.
 - 额外现象：在 Python 3.12 + NumPy 2.x 下，单进程运行 `gym_super_mario_bros.make(...)` 会触发 `nes_py` 的 `OverflowError: Python integer 1024 out of bounds for uint8`。<br>Additional symptom: on Python 3.12 + NumPy 2.x, a single-process `gym_super_mario_bros.make(...)` call in `nes_py` raises `OverflowError: Python integer 1024 out of bounds for uint8`.
 - 诊断日志显示 worker 停在 `calling_mario_make` 处，有时崩溃（未打补丁），有时静默挂起（已打补丁），推测阻塞发生在 NES 原生初始化阶段。<br>Diagnostics show workers reaching `calling_mario_make` and then either crashing (without patches) or hanging silently (with patches), indicating the stall occurs during NES native initialisation.
+
+## 诊断入口 | Instrumentation
+
+### 2025-10-01 修复：同步环境构建超时 | 2025-10-01 Fix: Synchronous Environment Construction Timeout
+**问题**：使用默认同步模式（`async=False`）时，`train.py` 的 `_initialise_env` 函数对 `create_vector_env` 调用使用 `call_with_timeout` 包装，该函数在 daemon 线程中执行环境构建。当 `SyncVectorEnv` 初始化时会在主线程（实际上是 daemon 线程）中调用每个 `env_fn()`，这会触发原生库（`nes_py`、`gym_super_mario_bros`）的初始化，可能导致线程挂起。<br>**Problem**: When using the default synchronous mode (`async=False`), the `_initialise_env` function in `train.py` wrapped `create_vector_env` calls with `call_with_timeout`, which executes the environment construction in a daemon thread. When `SyncVectorEnv` initializes, it calls each `env_fn()` in the main thread (actually the daemon thread), triggering native library (`nes_py`, `gym_super_mario_bros`) initialization that can cause thread hangs.
+
+**修复**：在同步模式下直接调用 `create_vector_env`，不使用 `call_with_timeout` 包装。仅在异步模式下保留超时机制，因为异步模式的 worker 进程在独立进程中运行，超时检测更有意义。<br>**Fix**: In synchronous mode, call `create_vector_env` directly without `call_with_timeout` wrapping. Keep the timeout mechanism only for async mode, where worker processes run in separate processes and timeout detection is more meaningful.
+
+**代码变更**：<br>**Code change**:
+```python
+# train.py _initialise_env function
+if env_cfg.asynchronous:
+    # 异步模式：使用超时包装
+    env_instance = call_with_timeout(create_vector_env, timeout, env_cfg)
+else:
+    # 同步模式：直接调用，避免 daemon 线程问题
+    env_instance = create_vector_env(env_cfg)
+```
+
+**影响**：此修复解决了用户报告的"已连续 300s 无训练/评估进度"的挂起问题。<br>**Impact**: This fix resolves the reported "no progress for 300s" hang issue.
+
+---
 
 ## 诊断入口 | Instrumentation
 - `src/envs/mario.py`：<br>`src/envs/mario.py`:
