@@ -438,6 +438,50 @@ def find_matching_checkpoint(cfg: TrainingConfig) -> Optional[Tuple[Path, Dict[s
     return path, metadata
 
 
+def find_matching_checkpoint_recursive(base_dir: Path, cfg: TrainingConfig, limit: int = 10000) -> Optional[Tuple[Path, Dict[str, Any]]]:
+    """Recursively search under base_dir for the best matching checkpoint.
+
+    选择策略 | Selection strategy:
+    1. 仅考虑 metadata 完全匹配当前配置 (`_metadata_matches_config`).
+    2. 优先序号化 checkpoint (variant=checkpoint) 其次 latest (variant=latest)。
+    3. 在同一 variant 内按 global_update / global_step 最大优先。
+    4. 返回最佳 (Path, metadata)。
+
+    参数:
+        base_dir: 根目录（例如 trained_models）。
+        cfg: 当前训练配置。
+        limit: 最多扫描的 JSON 元数据文件数量，防止极端情况下遍历过慢。
+    """
+    if not base_dir.exists():
+        return None
+    matches: List[Tuple[int, int, int, Path, Dict[str, Any]]] = []
+    count = 0
+    for json_path in base_dir.rglob("a3c_world*_stage*.json"):
+        count += 1
+        if count > limit:
+            break
+        try:
+            metadata = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not _metadata_matches_config(metadata, cfg):
+            continue
+        ckpt_path = json_path.with_suffix(".pt")
+        if not ckpt_path.exists():
+            continue
+        save_state = metadata.get("save_state", {})
+        update_idx = int(save_state.get("global_update", 0))
+        global_step = int(save_state.get("global_step", 0))
+        variant = str(save_state.get("type", "checkpoint"))
+        priority = 1 if variant == "checkpoint" else 0
+        matches.append((update_idx, priority, global_step, ckpt_path, metadata))
+    if not matches:
+        return None
+    matches.sort(reverse=True)
+    _, _, _, path, metadata = matches[0]
+    return path, metadata
+
+
 def save_checkpoint(
     cfg: TrainingConfig,
     model: MarioActorCritic,
@@ -720,9 +764,38 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         if not _metadata_matches_config(resume_metadata, cfg):
             raise ValueError("Resume checkpoint metadata is incompatible with current configuration.")
     else:
+        # 自动探测逻辑：优先编号最高的序号化 checkpoint，其次 latest 快照
         found = find_matching_checkpoint(cfg)
         if found is not None:
             resume_path, resume_metadata = found
+            print(f"[train] auto-resume matched checkpoint: {resume_path.name}")
+        else:
+            # 尝试 latest 快照
+            latest = Path(cfg.save_dir) / f"{_checkpoint_stem(cfg)}_latest.pt"
+            meta = latest.with_suffix('.json')
+            if latest.exists() and meta.exists():
+                try:
+                    meta_obj = json.loads(meta.read_text(encoding='utf-8'))
+                    if _metadata_matches_config(meta_obj, cfg):
+                        resume_path = latest
+                        resume_metadata = meta_obj
+                        print(f"[train] auto-resume using latest snapshot: {latest.name}")
+                except Exception:
+                    pass
+        # 若仍未找到，扩展搜索整个 trained_models 根目录
+        if resume_path is None:
+            root_dir = Path('trained_models')
+            if root_dir.exists():
+                recursive = find_matching_checkpoint_recursive(root_dir, cfg)
+                if recursive is not None:
+                    resume_path, resume_metadata = recursive
+                    try:
+                        rel = resume_path.relative_to(root_dir)
+                        print(f"[train] recursive-resume found checkpoint under trained_models/: {rel}")
+                    except Exception:
+                        print(f"[train] recursive-resume found checkpoint: {resume_path}")
+        if resume_path is None:
+            print("[train] no matching checkpoint found (current save_dir & recursive search) – starting fresh training")
 
     writer, wandb_run, run_dir = create_logger(
         cfg.log_dir,
@@ -783,14 +856,31 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     last_log_update = global_update
 
     if resume_path is not None:
+        print(f"[train] Loading checkpoint for resume: {resume_path}")
         checkpoint = torch.load(resume_path, map_location=device)
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
-        scaler.load_state_dict(checkpoint["scaler"])
-        global_step = checkpoint.get("global_step", 0)
-        global_update = checkpoint.get("global_update", 0)
-        print(f"[train] Resuming training from {resume_path}")
+        missing_warn: List[str] = []
+        try:
+            model.load_state_dict(checkpoint["model"])
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model state_dict from {resume_path}: {e}")
+        for key, loader in (
+            ("optimizer", optimizer.load_state_dict),
+            ("scheduler", scheduler.load_state_dict),
+            ("scaler", scaler.load_state_dict),
+        ):
+            state_obj = checkpoint.get(key)
+            if state_obj is None:
+                missing_warn.append(key)
+                continue
+            try:
+                loader(state_obj)  # type: ignore[arg-type]
+            except Exception as e:  # noqa: BLE001
+                missing_warn.append(f"{key} (error: {e})")
+        global_step = int(checkpoint.get("global_step", 0))
+        global_update = int(checkpoint.get("global_update", 0))
+        if missing_warn:
+            print("[train][warn] Partial resume: missing/failed -> " + ", ".join(missing_warn))
+        print(f"[train] Resume state: update={global_update} step={global_step}")
         heartbeat.notify(phase="恢复", message=f"加载检查点 {resume_path.name}", progress=False)
 
     last_log_step = global_step

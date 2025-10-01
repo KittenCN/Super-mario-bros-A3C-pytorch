@@ -48,3 +48,14 @@
 - 进一步实验 `envpool` 或其他 C++ 向量环境方案，验证能否彻底替代 Python 进程池。<br>Experiment with `envpool` or other C++ vector-env solutions to assess whether they can replace the Python process pool entirely.
 - 维护 `docs/ENV_DEBUGGING_REPORT.md` 日志，记录每次新增实验的配置、结果及对稳定性的影响。<br>Keep this report updated with configuration details, results, and stability impact for every new experiment.
 - 若查明 NES 原生库瓶颈，考虑为 `nes_py` 提交补丁或构建本地替代实现。<br>If the NES native bottleneck is identified, consider upstreaming patches to `nes_py` or developing a local replacement implementation.
+
+## 增量更新 | Incremental Update (2025-10-01)
+**新增 per-env 构建进度日志**：同步模式下为每个子环境打印开始/耗时，精确定位卡点；8 环境 FC emulator 测试 ~0.11s 完成。<br>**Added per-env construction logs**: start/duration printed for each env in sync mode to isolate stalls; 8-env FC emulator test ~0.11s total.
+
+**动机 | Motivation**：之前仅有全局“Starting environment construction”，排障需要手动猜测。<br>Previously only a single global start message existed.
+
+**影响 | Impact**：只增日志，无功能或性能回退风险。<br>Logging only, no functional/performance regression.
+
+**验证 | Validation**：`PYTHONPATH=. python train.py --world 1 --stage 1 --num-envs 8 --total-updates 50000` 构建与训练均顺利，未再触发超时告警。<br>Run succeeded without timeout warnings.
+
+**后续 | Next**：考虑阶段级超时 & 可选容错跳过；聚合日志为 JSON 便于统计。<br>Plan stage-level timeouts & optional fault tolerance; aggregate logs into JSON.

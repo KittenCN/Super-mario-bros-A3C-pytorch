@@ -75,6 +75,31 @@ If the sidecar metadata JSON is missing, `test.py` will reconstruct it from the 
 - 可通过 `--sync-env` 或 `--force-sync` 暂时回退到同步向量环境以验证训练流程。<br>Temporarily fall back to synchronous vector envs using `--sync-env` or `--force-sync` to validate the training loop.
 - `--parent-prewarm`、`--parent-prewarm-all`、`--worker-start-delay` 有助于减少 NES 初始竞争。<br>`--parent-prewarm`, `--parent-prewarm-all`, and `--worker-start-delay` reduce NES initialisation contention.
 
+### 2025-10-01 环境构建卡住问题修复摘要 | 2025-10-01 Env Construction Stall Fix Summary
+近期在同步模式（`async=False`）下出现长时间 “已连续 XXXs 无训练进度” 告警，经排查是缺乏逐子环境构建可见性难以快速定位。此次更新：<br>Recently synchronous runs (`async=False`) emitted prolonged "no training progress" warnings, traced to missing per-env construction visibility. This update adds:
+
+1. `create_vector_env` 为每个子环境 thunk 包装计时与进度打印（`[env] constructing env i/N ...` & 完成耗时）。<br>Per-env timing logs around each thunk.
+2. 若停在某编号，可立即在诊断目录中查看对应 `env_init_idx{idx}_pid*.log` 获取阶段标记（`calling_mario_make`, `framestack_done` 等）。<br>Stalled index maps directly to its diagnostic log file.
+3. 无行为/性能副作用（日志开销微小），异步与同步模式均受益。<br>No behavioural impact; negligible overhead; works for async & sync.
+4. 验证：8 个 FC emulator 环境 ~0.11s 完成构建，reset 0.02s，训练恢复正常。<br>Validation: 8 FC emulator envs build in ~0.11s, reset 0.02s.
+
+快速诊断命令 | Quick diagnose:
+```bash
+PYTHONPATH=. python scripts/debug_env.py
+PYTHONPATH=. python train.py --world 1 --stage 1 --num-envs 8 --total-updates 50000 --force-sync
+```
+
+复现卡住时请提供：最后一条 constructing 行、对应 env_init 日志尾部、版本信息 (Python / CUDA / nes-py / gymnasium-super-mario-bros)。<br>If stalls reoccur, share: last constructing line, tail of env_init log, and version info (Python/CUDA/nes-py/gymnasium-super-mario-bros).
+
+后续潜在改进（未实施）：mario_make 硬超时 + 可跳过策略、结构化 JSON 诊断、`--env-progress-quiet` 静默开关。<br>Future (not implemented): hard timeout + skip policy, structured JSON diagnostics, `--env-progress-quiet` flag.
+
+## 文档与归档策略 | Documentation Policy
+完整规则见 `docs/DOCUMENTATION_POLICY.md`。核心要点：<br>See `docs/DOCUMENTATION_POLICY.md` for full rules. Summary:
+- 根目录只保留最新 `README.md` 与 `AGENTS.md`；其余文档放入 `docs/`。
+- 不在 `README.md` / `AGENTS.md` 内累积历史更新列表，重大变更写入 `docs/` 报告或未来的 `CHANGELOG.md`。
+- 训练恢复（自动加载最新匹配 checkpoint）说明集中在 README 与文档策略文件。
+
+
 ## 环境要求 | Requirements & Compatibility
 - 推荐 Python 3.10/3.11、PyTorch ≥ 2.1、CUDA 12（Dockerfile 提供基础镜像）。<br>Recommended Python 3.10/3.11, PyTorch ≥ 2.1, CUDA 12 (base image provided by the Dockerfile).
 - 依赖 `gymnasium-super-mario-bros>=0.8.0`（首选）或 `gym-super-mario-bros>=7.4.0`，并配合 `nes-py>=8.2`。<br>Requires `gymnasium-super-mario-bros>=0.8.0` (preferred) or `gym-super-mario-bros>=7.4.0` with `nes-py>=8.2`.
