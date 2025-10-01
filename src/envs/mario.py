@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import tempfile
+from collections import deque
 from pathlib import Path
 import time
 import os
@@ -64,11 +65,13 @@ try:
         SIMPLE_MOVEMENT,
         COMPLEX_MOVEMENT,
     )
+    from gymnasium_super_mario_bros._roms import rom_path as mario_rom_path  # type: ignore
     _MARIO_PACKAGE = "gymnasium-super-mario-bros"
 except ImportError:
     try:
         from gym_super_mario_bros import make as mario_make  # type: ignore
         from gym_super_mario_bros.actions import RIGHT_ONLY, SIMPLE_MOVEMENT, COMPLEX_MOVEMENT  # type: ignore
+        from gym_super_mario_bros._roms import rom_path as mario_rom_path  # type: ignore
         _MARIO_PACKAGE = "gym-super-mario-bros"
     except ImportError as err:  # pragma: no cover
         raise RuntimeError(
@@ -85,6 +88,18 @@ except Exception:
     # If nes_py not available, we'll fail later when creating envs; keep import
     # errors non-fatal at import time to allow parts of the package to be used
     JoypadSpace = None  # type: ignore
+
+try:  # Optional modern emulator toolkit
+    from fc_emulator.rl_env import NESGymEnv  # type: ignore
+    from fc_emulator.actions import DiscreteActionWrapper  # type: ignore
+    _HAS_FC_EMULATOR = True
+except Exception:  # pragma: no cover - optional dependency
+    NESGymEnv = None  # type: ignore
+    DiscreteActionWrapper = None  # type: ignore
+    _HAS_FC_EMULATOR = False
+
+_FC_BACKEND_LOGGED = False
+_FC_STAGE_WARNING_EMITTED = False
 
 
 def _patch_legacy_nes_py_uint8() -> None:
@@ -186,13 +201,12 @@ def _patch_nes_py_ram_dtype() -> None:
         return
 
     def _patched_ram_buffer(self):
-        # call original to get the uint8 memory view, then cast to int64
         arr = orig_ram_buffer(self)
+        if isinstance(arr, np.ndarray) and arr.dtype == np.uint8:
+            return arr
         try:
-            # Ensure we return a numpy array with a safe signed integer dtype
-            return arr.astype(np.int64)
+            return np.asarray(arr, dtype=np.uint8)
         except Exception:
-            # Fallback: return original array if astype fails
             return arr
 
     setattr(ne_env_cls, "_ram_buffer", _patched_ram_buffer)
@@ -255,10 +269,122 @@ def _select_actions(action_type: str) -> Sequence[Tuple[str, ...]]:
     return _ACTION_SPACES[action_type]
 
 
+def _fc_emulator_enabled() -> bool:
+    if not _HAS_FC_EMULATOR:
+        return False
+    setting = os.environ.get("MARIO_USE_FC_EMULATOR", "auto").lower()
+    if setting in {"0", "false", "off"}:
+        return False
+    if setting in {"1", "true", "on"}:
+        return True
+    return True
+
+
+def _convert_action_set(combos: Sequence[Sequence[str]]) -> tuple[tuple[str, ...], ...]:
+    converted: list[tuple[str, ...]] = []
+    for combo in combos:
+        fc_combo = tuple(button.upper() for button in combo if button.upper() != "NOOP")
+        converted.append(fc_combo)
+    return tuple(converted)
+
+
+def _normalise_observation(obs: np.ndarray) -> np.ndarray:
+    arr = np.asarray(obs, dtype=np.float32)
+    if arr.ndim >= 4 and arr.shape[-1] == 1:
+        arr = np.squeeze(arr, axis=-1)
+    return arr / 255.0
+
+
+class _SimpleFrameStack(gym.Wrapper):
+    """Minimal frame stack wrapper replicating legacy Gym behaviour."""
+
+    def __init__(self, env: "gym.Env", stack_size: int) -> None:
+        super().__init__(env)
+        if stack_size <= 0:
+            raise ValueError("stack_size must be positive")
+        if not isinstance(env.observation_space, gym.spaces.Box):
+            raise TypeError("Frame stacking requires Box observation spaces")
+        self.stack_size = int(stack_size)
+        self._frames: deque[np.ndarray] = deque(maxlen=self.stack_size)
+        obs_space: gym.spaces.Box = env.observation_space
+        low = np.repeat(obs_space.low[None, ...], self.stack_size, axis=0)
+        high = np.repeat(obs_space.high[None, ...], self.stack_size, axis=0)
+        self.observation_space = gym.spaces.Box(low=low, high=high, dtype=obs_space.dtype)
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):  # type: ignore[override]
+        obs, info = self.env.reset(seed=seed, options=options)
+        self._frames.clear()
+        zero_frame = np.zeros_like(obs)
+        for _ in range(self.stack_size - 1):
+            self._frames.append(zero_frame.copy())
+        self._frames.append(obs)
+        return self._stack(), info
+
+    def step(self, action):  # type: ignore[override]
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._frames.append(obs)
+        return self._stack(), reward, terminated, truncated, info
+
+    def _stack(self) -> np.ndarray:
+        return np.stack(list(self._frames), axis=0)
+
+
+def _apply_frame_stack(env: "gym.Env", stack_size: int) -> "gym.Env":
+    if stack_size <= 1:
+        return env
+    return _SimpleFrameStack(env, stack_size)
+
+
 def list_available_stages(max_world: int = 8, max_stage: int = 4) -> List[Tuple[int, int]]:
     """List all available world-stage combinations."""
 
     return [(world, stage) for world in range(1, max_world + 1) for stage in range(1, max_stage + 1)]
+
+
+def _make_fc_emulator_env(config: MarioEnvConfig) -> "gym.Env":
+    if NESGymEnv is None or DiscreteActionWrapper is None:
+        raise RuntimeError("fc_emulator backend requested but not available")
+
+    global _FC_BACKEND_LOGGED, _FC_STAGE_WARNING_EMITTED
+    if not _FC_BACKEND_LOGGED:
+        print("[env] fc_emulator backend active for Mario environments")
+        _FC_BACKEND_LOGGED = True
+
+    if (config.world, config.stage) != (1, 1) and not _FC_STAGE_WARNING_EMITTED:
+        print(
+            f"[env][warn] fc_emulator backend currently spawns at world 1-1; "
+            f"requested stage {config.world}-{config.stage} will start from 1-1"
+        )
+        _FC_STAGE_WARNING_EMITTED = True
+
+    combos = _convert_action_set(_select_actions(config.action_type))
+    rom_file = mario_rom_path(False, "vanilla")
+
+    base_env = NESGymEnv(
+        rom_file,
+        frame_skip=config.frame_skip,
+        observation_type="gray",
+        auto_start=True,
+        stagnation_max_frames=None,
+    )
+
+    env: "gym.Env" = DiscreteActionWrapper(base_env, action_set=combos)
+    env = ProgressInfoWrapper(env)
+    env = MarioRewardWrapper(env, config.reward_config)
+    env = gym.wrappers.ResizeObservation(env, (84, 84))
+
+    def _to_float(obs):
+        arr = obs.astype(np.float32)
+        if arr.ndim == 2:
+            arr = arr[..., None]
+        return arr
+
+    float_space = gym.spaces.Box(low=0.0, high=255.0, shape=(84, 84, 1), dtype=np.float32)
+    env = TransformObservation(env, _to_float)
+    env = TransformReward(env, float)
+    env = _apply_frame_stack(env, config.frame_stack)
+    env = TransformObservation(env, _normalise_observation)
+    return env
 
 
 def _make_single_env(
@@ -347,93 +473,102 @@ def _make_single_env(
             _diag("patch_done")
         except Exception:
             pass
-        # Eagerly import modules that may block during first-use and log timings
-        try:
-            _diag("import_start_gsm")
-            import importlib
-
-            importlib.import_module("gym_super_mario_bros")
-            _diag("import_done_gsm")
-        except Exception as e:
-            _diag(f"import_gsm_error:{repr(e)}")
-
-        lock_fd = None
-        try:
+        env: Optional["gym.Env"] = None
+        if _fc_emulator_enabled():
             try:
-                import fcntl
+                env = _make_fc_emulator_env(config)
+                _diag("fc_env_ready")
+            except Exception as exc:
+                _diag(f"fc_env_error:{repr(exc)}")
+                raise
+        else:
+            # Eagerly import modules that may block during first-use and log timings
+            try:
+                _diag("import_start_gsm")
+                import importlib
 
-                lock_path = Path(tempfile.gettempdir()) / "mario_make.lock"
-                lock_fd = open(lock_path, "w")
-                wait_time = 0.0
-                timeout = 120.0
-                acquired = False
-                while wait_time < timeout:
+                importlib.import_module("gym_super_mario_bros")
+                _diag("import_done_gsm")
+            except Exception as e:
+                _diag(f"import_gsm_error:{repr(e)}")
+
+            lock_fd = None
+            try:
+                try:
+                    import fcntl
+
+                    lock_path = Path(tempfile.gettempdir()) / "mario_make.lock"
+                    lock_fd = open(lock_path, "w")
+                    wait_time = 0.0
+                    timeout = 120.0
+                    acquired = False
+                    while wait_time < timeout:
+                        try:
+                            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            acquired = True
+                            break
+                        except BlockingIOError:
+                            time.sleep(0.1)
+                            wait_time += 0.1
+                    if acquired:
+                        _diag("lock_acquired")
+                    else:
+                        _diag(f"lock_timeout:{timeout}")
+                except Exception as lock_exc:
+                    lock_fd = None
+                    _diag(f"lock_unavailable:{repr(lock_exc)}")
+
+                _diag("calling_mario_make")
+                env = mario_make(
+                    config.env_id(),
+                    apply_api_compatibility=True,
+                    render_mode=config.render_mode,
+                )
+                _diag("mario_make_done")
+            except Exception as e:
+                import traceback
+
+                _diag(f"error:{repr(e)}")
+                try:
+                    if _diag_file is not None:
+                        with open(_diag_file, "a", encoding="utf-8") as f:
+                            f.write(traceback.format_exc())
+                except Exception:
+                    pass
+                raise
+            finally:
+                if lock_fd is not None:
                     try:
-                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        acquired = True
-                        break
-                    except BlockingIOError:
-                        time.sleep(0.1)
-                        wait_time += 0.1
-                if acquired:
-                    _diag("lock_acquired")
-                else:
-                    _diag(f"lock_timeout:{timeout}")
-            except Exception as lock_exc:
-                lock_fd = None
-                _diag(f"lock_unavailable:{repr(lock_exc)}")
+                        import fcntl as _fcntl
 
-            _diag("calling_mario_make")
-            env = mario_make(
-                config.env_id(),
-                apply_api_compatibility=True,
-                render_mode=config.render_mode,
-            )
-            _diag("mario_make_done")
-        except Exception as e:
-            import traceback
-
-            _diag(f"error:{repr(e)}")
-            try:
-                if _diag_file is not None:
-                    with open(_diag_file, "a", encoding="utf-8") as f:
-                        f.write(traceback.format_exc())
-            except Exception:
-                pass
-            raise
-        finally:
-            if lock_fd is not None:
-                try:
-                    import fcntl as _fcntl
-
-                    _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
-                except Exception:
-                    pass
-                try:
-                    lock_fd.close()
-                except Exception:
-                    pass
-                _diag("lock_released")
-        env = JoypadSpace(env, actions)
-        _diag("joypad_done")
-        env = ProgressInfoWrapper(env)
-        _diag("progress_wrapper_done")
-        env = MarioRewardWrapper(env, config.reward_config)
-        _diag("reward_wrapper_done")
-        env = gym.wrappers.FrameSkip(env, config.frame_skip)
-        _diag("frameskip_done")
-        env = gym.wrappers.GrayScaleObservation(env, keep_dim=True)
-        _diag("grayscale_done")
-        env = gym.wrappers.ResizeObservation(env, (84, 84))
-        _diag("resize_done")
-        env = TransformObservation(env, lambda obs: obs.astype(np.float32))
-        _diag("transform_obs_dtype_done")
-        env = TransformReward(env, float)
-        _diag("transform_reward_done")
-        env = gym.wrappers.FrameStack(env, config.frame_stack, new_axis=0)
-        _diag("framestack_done")
-        env = TransformObservation(env, lambda obs: np.asarray(obs, dtype=np.float32) / 255.0)
-        _diag("transform_obs_scale_done")
+                        _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+                    except Exception:
+                        pass
+                    try:
+                        lock_fd.close()
+                    except Exception:
+                        pass
+                    _diag("lock_released")
+            env = JoypadSpace(env, actions)
+            _diag("joypad_done")
+            env = ProgressInfoWrapper(env)
+            _diag("progress_wrapper_done")
+            env = MarioRewardWrapper(env, config.reward_config)
+            _diag("reward_wrapper_done")
+            env = gym.wrappers.FrameSkip(env, config.frame_skip)
+            _diag("frameskip_done")
+            env = gym.wrappers.GrayScaleObservation(env, keep_dim=True)
+            _diag("grayscale_done")
+            env = gym.wrappers.ResizeObservation(env, (84, 84))
+            _diag("resize_done")
+            env = TransformObservation(env, lambda obs: obs.astype(np.float32))
+            _diag("transform_obs_dtype_done")
+            env = TransformReward(env, float)
+            _diag("transform_reward_done")
+            env = _apply_frame_stack(env, config.frame_stack)
+            _diag("framestack_done")
+            env = TransformObservation(env, _normalise_observation)
+            _diag("transform_obs_scale_done")
         if config.record_video:
             os.makedirs(config.video_dir, exist_ok=True)
             env = gym.wrappers.RecordVideo(
@@ -508,6 +643,18 @@ def create_vector_env(config: MarioVectorEnvConfig):
             except Exception:
                 pass
 
+    # Helper: wrap each thunk to打印构建进度，便于定位耗时/卡点
+    def _with_progress(fn, i: int):  # type: ignore[override]
+        def _inner():
+            start = time.time()
+            try:
+                print(f"[env] constructing env {i + 1}/{config.num_envs} ...", flush=True)
+                return fn()
+            finally:
+                end = time.time()
+                print(f"[env] env {i + 1}/{config.num_envs} constructed in {end - start:.2f}s", flush=True)
+        return _inner
+
     for idx in range(config.num_envs):
         if config.random_start_stage:
             world, stage = random.choice(stage_list)
@@ -542,6 +689,9 @@ def create_vector_env(config: MarioVectorEnvConfig):
             env_fns.append(_thunk_with_delay)
         else:
             env_fns.append(thunk)
+
+        # 始终包一层进度打印（不改变原行为），方便在 SyncVectorEnv 下看到序列化构建过程
+        env_fns[-1] = _with_progress(env_fns[-1], idx)
 
     vector_cls = AsyncVectorEnv if config.asynchronous else SyncVectorEnv
     # Create a file to capture vector env construction timing / exceptions
