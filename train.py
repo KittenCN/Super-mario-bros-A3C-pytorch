@@ -641,15 +641,30 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     def _initialise_env(env_cfg: MarioVectorEnvConfig):
         timeout = getattr(env_cfg, "reset_timeout", 60.0)
         start_construct = time.time()
-        print(f"[train] Starting environment construction with timeout={timeout}s...")
-        try:
-            env_instance = call_with_timeout(create_vector_env, timeout, env_cfg)
-            construct_time = time.time() - start_construct
-            print(f"[train] Environment constructed in {construct_time:.2f}s")
-        except TimeoutError:
-            construct_time = time.time() - start_construct
-            print(f"[train][error] Environment construction timed out after {construct_time:.2f}s")
-            raise RuntimeError("Vector env construction timed out")
+        # For synchronous environments, construction happens in-process and doesn't
+        # benefit from timeout wrapping via daemon threads (which can cause issues
+        # with native library initialization). For async environments, workers are
+        # spawned in separate processes so timeout on construction is more useful.
+        if env_cfg.asynchronous:
+            print(f"[train] Starting async environment construction with timeout={timeout}s...")
+            try:
+                env_instance = call_with_timeout(create_vector_env, timeout, env_cfg)
+                construct_time = time.time() - start_construct
+                print(f"[train] Environment constructed in {construct_time:.2f}s")
+            except TimeoutError:
+                construct_time = time.time() - start_construct
+                print(f"[train][error] Environment construction timed out after {construct_time:.2f}s")
+                raise RuntimeError("Vector env construction timed out")
+        else:
+            print(f"[train] Starting synchronous environment construction...")
+            try:
+                env_instance = create_vector_env(env_cfg)
+                construct_time = time.time() - start_construct
+                print(f"[train] Environment constructed in {construct_time:.2f}s")
+            except Exception as e:
+                construct_time = time.time() - start_construct
+                print(f"[train][error] Environment construction failed after {construct_time:.2f}s: {e}")
+                raise
 
         start_reset = time.time()
         print("[train] Resetting environment...")
