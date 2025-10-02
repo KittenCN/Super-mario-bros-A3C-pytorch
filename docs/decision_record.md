@@ -20,6 +20,7 @@
 12. P1 指标扩展 (奖励分位数 / GPU 利用窗口 / 平均唯一率)
 13. 慢 step 窗口化堆栈追踪 (Slow step windowed tracing)
 14. Overlap 性能基准脚本 (benchmark_overlap.py)
+15. PER sample 语法错误修复与 FP16 标量存储确认
 
 ---
 ## 1. 环境构建可观测性增强
@@ -181,6 +182,31 @@
 - 实施 | Implementation: 新增 `scripts/benchmark_overlap.py`，参数：`--num-envs-list`, `--rollout-list`, `--warmup-frac`；运行单个 case 解析其 metrics.jsonl 计算稳定区间平均 `env_steps_per_sec`, `updates_per_sec`，附上 `gpu_util_mean_window`。
 - 验证 | Validation: 干运行单一组合成功生成 `bench_overlap_<ts>.csv`，列包含 `mode,num_envs,rollout,steps_per_sec_mean,updates_per_sec_mean,replay_fill_final,gpu_util_mean_window,duration_sec`。
 - 风险 | Risk: 多组合连续运行时间较长；建议初期限制组合数量或并行拆分；脚本目前串行保障资源一致性。
+
+## 15. PER sample 语法错误修复与 FP16 标量存储确认
+- 问题 | Problem: `src/utils/replay.py` 中 `sample` 函数的 `target_values` 与 `advantages` 两行缩进丢失，导致运行期 `IndentationError` 中止训练；同时需要确认 FP16 标量存储默认行为是否生效。
+- 发现 | Discovery: 启动脚本 `run_2080ti_resume.sh` 触发训练后立即报错，日志指向行 235 缩进异常。
+- 决策 | Decision: 立即修复缩进并添加注释说明；保持 FP16 (`MARIO_PER_FP16_SCALARS=1` 默认开启) 策略，采样时统一转回 float32。
+- 实施 | Implementation: 恢复两行缩进，新增注释 `# 修复：此前两行意外减少缩进导致函数体语法错误`；未改动 API。确认 `PrioritizedReplay.__init__` 中 `_fp16_scalars` 环境变量逻辑与 push/sample 路径类型转换正确。
+- 验证 | Validation: 静态语法检查通过（无 IndentationError）；本地 sample 路径 smoke（插入少量伪数据）返回张量 dtype 符合预期 (obs float32, actions long, target_values/advantages float32, weights float32)。
+- 风险 | Risk: FP16 存储可能引入极端大/小优势截断；后续需在高方差场景监控数值稳定性（可加入单元测试对比 FP32/FP16 KL）。
+- 后续 | Next: 计划添加自动化测试：填充随机数据后对比采样输出统计均值/方差在 FP32 与 FP16 模式差异阈值内 (<1e-3 相对误差)。
+
+## 16. 编译模型与 checkpoint 兼容性（延迟编译 + 灵活 state_dict 加载）
+- 问题 | Problem: 旧 checkpoint 在未编译模型下保存（键名无 `_orig_mod.` 前缀），而运行时若先执行 `torch.compile`，新模型的 `state_dict` 键空间包含 `_orig_mod.*`，直接 `load_state_dict` 会出现大量 Missing/Unexpected key 错误导致恢复失败。
+- 备选 | Alternatives:
+  - K1: 强制要求用户用一致版本（文档提示，不修改代码）。
+  - K2: 保存与加载时始终对键进行映射（可能引入额外拷贝开销）。
+  - K3: 延迟编译：恢复阶段先加载未编译模型再尝试编译；同时实现双向前缀自适应加载。
+- 决策 | Decision: 采用 K3，最小化对现有保存格式的破坏，并兼容历史文件。仅在加载成功后尝试 `torch.compile`，失败则降级继续。
+- 实施 | Implementation:
+  1. 新增 `_flex_load_state_dict()`：检测模型和 checkpoint 各自是否带 `_orig_mod.` 前缀，必要时添加或剥离后再以 `strict=False` 加载，收集 missing/unexpected 列表用于日志。
+  2. 新增 `_raw_module()`：保存 checkpoint 与 snapshot 时若模型已编译，取内部 `_orig_mod` 的 `state_dict()`，保证输出与历史未编译格式一致。
+  3. `prepare_model(..., compile_now=False)` 在构造阶段接受延迟编译标志；恢复完成后再尝试编译并打印成功/失败提示。
+  4. 更新 `save_checkpoint` / `save_model_snapshot` 使用 `_raw_module` 提取底层权重。
+- 验证 | Validation: 人工构造已编译与未编译两种运行模式，保存 checkpoint 后在另一模式下恢复：日志仅出现少量 `flexible load issues`（或无），训练继续；单元测试（replay 相关）通过。
+- 风险 | Risk: 后续若引入自定义包装器改变属性名（非 `_orig_mod`）需扩展映射；`strict=False` 可能掩盖真实结构性不兼容（通过日志截断提示缓解）。
+- 后续 | Next: 计划加入单元测试：构造一个模型 -> 保存 -> 模拟编译版本加载 / 去编译版本加载，断言参数 tensor 总数与哈希一致；并在 metrics 中记录 `model_compiled=0/1` 便于实验追踪。
 
 
 ---

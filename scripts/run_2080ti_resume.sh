@@ -13,6 +13,8 @@
 # 8. (新增) 自适应显存模式：AUTO_MEM=1 时按阶梯尝试多组 (NUM_ENVS,ROLLOUT,GRAD_ACCUM) 直到训练启动成功
 # 9. (新增) 细粒度采样进度参数：--rollout-progress-* 可控制前若干 update 的每步心跳打印与常规间隔
 # 10.(新增) 优化 PER 内存：支持 uint8 压缩与上限自适应 (MARIO_PER_MAX_MEM_GB / MARIO_PER_COMPRESS)，脚本提供便捷变量
+# 11.(新增) 可选关闭 torch.compile：通过 NO_COMPILE=1 或 COMPILE=0，便于调试 / 避免首次编译开销
+# 12.(新增) 可选关闭 overlap：DISABLE_OVERLAP=1 直接去掉 --overlap-collect
 #
 # 用法 / Usage:
 #   bash scripts/run_2080ti_resume.sh            # 直接启动
@@ -58,6 +60,8 @@ show_help() {
   PER_INTERVAL=4          # PER 抽样间隔
   SAVE_ROOT=trained_models # 根保存目录
   LOG_DIR=tensorboard/a3c_super_mario_bros
+  NO_COMPILE=0            # 1=传 --no-compile 禁用 torch.compile (或 COMPILE=0)
+  DISABLE_OVERLAP=0       # 1=不添加 --overlap-collect
   AUTO_MEM=0             # 1=开启自动显存降载重试
   MEM_TARGET_GB=1.0      # 预留给系统/碎片的安全余量 (估算用, 不做硬限制)
   MAX_RETRIES=4          # 自动降载最大尝试次数
@@ -111,6 +115,9 @@ AUTO_MEM=${AUTO_MEM:-0}
 MEM_TARGET_GB=${MEM_TARGET_GB:-1.0}
 MAX_RETRIES=${MAX_RETRIES:-4}
 AUTO_MEM_STREAM=${AUTO_MEM_STREAM:-1}
+NO_COMPILE=${NO_COMPILE:-0}
+COMPILE=${COMPILE:-1}
+DISABLE_OVERLAP=${DISABLE_OVERLAP:-0}
 
 # 细粒度进度相关（若未显式设定使用默认）
 ROLL_PROGRESS_INTERVAL=${ROLL_PROGRESS_INTERVAL:-8}
@@ -152,7 +159,7 @@ build_cmd() {
   --per-sample-interval "${PER_INTERVAL}" \
   --log-dir "${LOG_DIR}" \
   --save-dir "${SAVE_DIR}" \
-  --overlap-collect \
+  $( (( DISABLE_OVERLAP == 1 )) && echo "" || echo "--overlap-collect" ) \
   --parent-prewarm \
   --heartbeat-interval 30 \
   --heartbeat-timeout 300 \
@@ -163,6 +170,9 @@ build_cmd() {
   --device "${DEVICE}" \
   --project mario-a3c-2080ti \
   --enable-tensorboard)
+  if (( NO_COMPILE == 1 )) || (( COMPILE == 0 )); then
+    CMD+=(--no-compile)
+  fi
 }
 
 build_cmd
@@ -262,8 +272,10 @@ for tier in "${TIERS[@]}"; do
       if [[ -f "${LOG_FILE}" ]]; then
         echo "---- Full log file: ${LOG_FILE} ----" >&2
       fi
+      echo "[run_2080ti_resume][hint] 若为 state_dict 键不匹配，请检查 run 目录下的 state_dict_load_issues.log" >&2
     else
       echo "$OUTPUT"
+      echo "[run_2080ti_resume][hint] 查看 state_dict_load_issues.log 以获取加载差异详情 (如存在)" >&2
     fi
     exit $CODE
   fi

@@ -227,7 +227,20 @@ def load_model(checkpoint_path: Path, metadata: Dict, device: torch.device) -> M
             if key.startswith("_orig_mod.")
         }
     if isinstance(model_state, dict):
-        model.load_state_dict(model_state, strict=False)
+        # 灵活加载：如果目标模型键需要 _orig_mod 但 state 不含，则直接尝试；若 state 含 _orig_mod 已在上文剥离
+        missing, unexpected = model.load_state_dict(model_state, strict=False)
+        if missing or unexpected:
+            print(f"[eval][warn] load_state partial: missing={len(missing)} unexpected={len(unexpected)}")
+            try:
+                issues_path = checkpoint_path.parent / "eval_state_dict_load_issues.log"
+                with issues_path.open("a", encoding="utf-8") as fp:
+                    fp.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} checkpoint={checkpoint_path}\n")
+                    for m in missing:
+                        fp.write(f"missing:{m}\n")
+                    for u in unexpected:
+                        fp.write(f"unexpected:{u}\n")
+            except Exception:
+                pass
     model.eval()
     return model
 

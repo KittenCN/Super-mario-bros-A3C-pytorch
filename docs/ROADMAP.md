@@ -42,8 +42,10 @@
 1. (已完成) Overlap 性能基准：脚本 `scripts/benchmark_overlap.py`。
 2. (已完成) PER 指标扩展：加入 `avg_sample_unique_ratio`、`replay_push_total`。
 3. (已完成) 奖励分位数 & GPU 滑动窗口利用率。
-4. FP16 replay scalar 存储：`advantages`、`target_values` 改用半精度（采样时转回 float32）。
+4. (已完成) FP16 replay scalar 存储：`advantages`、`target_values` 改用半精度（采样时转回 float32）。
 5. Checkpoint 迁移工具集成 CI（手动触发）。
+6. (新增待办) 重放采样路径 GPU 端搬运预研 (建立最小原型)。
+ 6. 修复 PER sample 函数缩进错误（已于 2025-10-02 修复并验证）。
 
 ## 4. 中期 (T2, 1 个月)
 1. GPU 侧 PER：使用 torch scatter / segment ops 实现优先级数组与采样（或引入简化 segment tree）。
@@ -79,6 +81,8 @@
 5. (P1-3) Overlap 基准脚本
 6. (P2-2) FP16 scalar 存储
 7. (P2-1) Checkpoint 迁移工具（集成 test）
+ 8. (P2-3) GPU 端 PER 采样原型（最小 KL 验证）
+ 8. (P2-3) GPU PER 原型（验证优先级分布一致性 & 时间剖析）
 
 ## 9. 开发协作提示
 - 日志前缀规范：`[train]`, `[replay]`, `[benchmark]`, `[migrate]` 保持 grep 一致。
@@ -91,6 +95,15 @@
 - global_step 在 overlap 模式下缺失的累加修复
 - 自适应 AUTO_MEM 训练脚本 + 流式输出
 - 细粒度 rollout 进度心跳
+ - PER sample 缩进语法错误修复（2025-10-02）
+ - FP16 标量存储启用（默认，可通过 `MARIO_PER_FP16_SCALARS=0` 关闭）
+
+## 11. 新增下一步考量（2025-10-02 更新）
+1. 回放采样 GPU 化：评估使用前缀和 + 二分或 segment tree 在 CUDA 上实现的成本与收益；收集 CPU 采样时间基线。
+2. 指标持久化格式升级：从 JSONL 增加可选 Parquet 汇总 (`metrics/latest.parquet`) 以便下游分析。
+3. Checkpoint 原子写：采用临时文件 + fsync + rename 防止中断产生半文件。
+4. 训练恢复兼容性测试矩阵：针对不同 `torch` / `gymnasium` / `nes-py` 版本做最小 smoke（脚本化）。
+5. 异步模式进一步隔离验证：单独最小进程示例定位 `mario_make()` 阻塞调用栈（gdb / faulthandler）。
 
 ---
 如需我直接开始第 1 步“global_step 回填脚本”实现，请提出指令（例如：`实现回填脚本`）。

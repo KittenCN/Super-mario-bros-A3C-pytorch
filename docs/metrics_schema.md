@@ -8,5 +8,16 @@
 Replay (PER): replay_size, replay_capacity, replay_fill_rate, replay_last_unique_ratio, replay_avg_unique_ratio, replay_push_total
 资源: resource.* (GPU/CPU/Mem) + gpu_util_last, gpu_util_mean_window (最近100快照均值)
 
+新增/关联字段（2025-10-02 更新）:
+- per_sample_interval: 来自 checkpoint 元数据的抽样频率策略（非 metrics 行内字段，但分析时应读取 checkpoint JSON 以还原训练语义）。
+- replay_priority_mean/p50/p90/p99: 已在日志中输出，用于监控优先级分布是否塌缩。
+- replay_sample_time_ms: 单次 PER 采样耗时（毫秒，包含 CPU 采样与数据拷贝），用于评估 GPU 化潜在收益（2025-10-02 新增）。
+ - replay_sample_split_prior_ms / choice_ms / weight_ms / decode_ms / tensor_ms / total_ms: 采样细分阶段耗时（仅在触发抽样轮记录，其他轮默认为 0）。
+ - replay_per_sample_interval: 当前训练配置的 PER 抽样间隔（静态配置写入每条 metrics 方便外部解析）。
+ - model_compiled: 1 表示当前运行模型是 torch.compile 产物（含 `_orig_mod`），0 表示未编译或已 unwrap（2025-10-02 新增）。
+ - state_dict_load_issues.log: 若恢复时出现 missing/unexpected 键，会将完整列表追加写入该文件，仅在首次或有差异时更新；metrics 行内不重复膨胀内容。
+
+原子写保证: 自 2025-10-02 起 checkpoint `.pt` 与对应 `.json` 元数据使用临时文件 + `os.replace` 原子落盘，减少中断产生半文件风险。
+
 兼容: 新增字段向后兼容; 消费端使用 dict.get(key, default) 处理缺失。
 未来: TD 误差分布、episode length 分位数、成功率、阶段通关率。
