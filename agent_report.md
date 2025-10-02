@@ -9,11 +9,15 @@
 - 核心结论：同步向量化环境（synchronous）在当前运行环境中表现稳定；异步向量化环境在并发构造阶段存在显著不稳定（高失败率或阻塞），需要额外的父进程预热或结构性替代来获得稳定性。
 
 ## 关键修改与新增脚本
-- 新增 / 修改（工作区）
   - `scripts/run_sync_regression.py`：短的同步回归测验，默认将多次构造/reset/close 的结果追加到 `env_stability_report.jsonl`。
   - `scripts/async_trial_worker.py`：子进程 worker，用于单次异步试验（构造 AsyncVectorEnv、reset、close），把结果写到 stdout。
   - `scripts/run_async_regression.py`：父进程控制脚本，带超时保护、父进程预热参数 `--prewarm-count`、采集 worker stderr、并在失败时把 `/tmp/mario_env_diag_*` 诊断目录复制到 `reports/`。
   - `scripts/parse_env_report.py`：对 `env_stability_report.jsonl` 做简单汇总（已存在并用于报告统计）。
+### 2025-10-02 补充 (P0 完成)
+- 新增脚本: `scripts/backfill_global_step.py` 用于回填历史 global_step。
+- 更新: 历史 checkpoint JSON 写入 `reconstructed_step_source` 字段并计算真实步数。
+- 安全退出: 训练循环外层增加异常捕获并在中断时保存 latest（见 `decision_record.md` #10）。
+- 文档: `decision_record.md` 与 `ROADMAP.md` 标记 P0 任务完成。
 
 这些变更均已提交到当前工作区文件系统（未推送至远程仓库）。
 

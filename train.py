@@ -1042,7 +1042,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     warmup_updates = max(0, getattr(args, "rollout_progress_warmup_updates", 2))
     warmup_interval = max(1, getattr(args, "rollout_progress_warmup_interval", 1))
 
-    for update_idx in range(global_update, cfg.total_updates):
+    try:
+        for update_idx in range(global_update, cfg.total_updates):
         update_wall_start = time.time()
         heartbeat.notify(
             update_idx=update_idx,
@@ -1402,6 +1403,21 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             save_model_snapshot(cfg, model, global_step, update_idx)
             print("[train] latest snapshot refreshed")
             heartbeat.notify(phase="checkpoint", message="最新快照已更新", progress=False)
+    except KeyboardInterrupt:
+        print("[train][warn] interrupted by user, attempting graceful shutdown & latest snapshot save")
+        heartbeat.notify(phase="interrupt", message="收到中断信号，保存最新模型", progress=False)
+        try:
+            save_model_snapshot(cfg, model, global_step, update_idx)  # type: ignore[name-defined]
+        except Exception as exc:  # noqa: BLE001
+            print(f"[train][error] failed to save latest snapshot on interrupt: {exc}")
+    except Exception as exc:  # pragma: no cover - 异常捕获仅日志
+        print(f"[train][error] unexpected exception: {exc}")
+        heartbeat.notify(phase="error", message=str(exc), progress=False)
+        try:
+            save_model_snapshot(cfg, model, global_step, update_idx)  # type: ignore[name-defined]
+            print("[train][info] latest snapshot saved after exception")
+        except Exception as exc2:  # noqa: BLE001
+            print(f"[train][error] failed to save snapshot after exception: {exc2}")
 
     # Robust cleanup: ensure resources are closed even if some fail
     try:

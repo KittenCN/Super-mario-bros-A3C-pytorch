@@ -2,7 +2,7 @@
 
 > 目的：集中记录 2025-09-30 ~ 2025-10-01 期间针对稳定性、性能与可维护性所做的关键设计决策、备选方案、取舍与验证结果。<br>Purpose: Capture key design decisions, alternatives, trade-offs, and validation results for stability, performance, and maintainability changes between 2025-09-30 and 2025-10-01.
 
-更新时间 | Updated: 2025-10-01
+更新时间 | Updated: 2025-10-02
 
 ---
 ## 目录 | Index
@@ -14,6 +14,8 @@
 6. 双缓冲重叠采集 (Overlap rollout collection)
 7. 未来演进候选 (Future candidates)
 8. 自适应显存运行脚本 (Adaptive memory launcher)
+9. 历史 checkpoint global_step 回填 (Global step backfill)
+10. 训练安全退出与最新快照保障 (Safe shutdown & snapshot)
 
 ---
 ## 1. 环境构建可观测性增强
@@ -109,6 +111,37 @@
 | 监控节流 | 性能/可观测平衡 | 降低系统调用 | 低 | 调低间隔或关闭监控 |
 | 双缓冲 overlap | 性能 | 部分重叠采集/学习 | 中 (线程复杂度) | 去掉 flag 或代码块 |
 | 自适应显存脚本 AUTO_MEM | 易用性/稳定 | 启动期自动降载避免 OOM | 低 | 关闭 AUTO_MEM |
+| global_step 回填脚本 | 正确性/一致性 | 修复历史元数据使统计 & 调度准确 | 低 | 还原 .bak |
+| 安全退出 latest 落盘 | 稳定性 | 中断时保留最近进度 | 低 | 去除 try/finally |
+
+---
+## 9. 历史 checkpoint global_step 回填
+- 问题 | Problem: 早期 overlap 模式未累加 `global_step`，导致多个已保存 checkpoint JSON `global_step=0` 但 `global_update>0`。影响曲线、调度与分析。
+- 备选 | Alternatives:
+  - I1: 忽略（接受历史不一致）。
+  - I2: 仅在恢复时即时推断，不修改文件。（恢复路径重复计算）
+  - I3: 脚本离线回填并写入审计信息，幂等可回退。
+- 决策 | Decision: 采用 I3，提供脚本 `scripts/backfill_global_step.py`，默认生成 `.bak` 备份，写入 `reconstructed_step_source` 元数据。
+- 公式 | Formula: `global_step = global_update * num_envs * rollout_steps (assumed)`。
+- 参数 | Assumption: 旧 runs 使用 rollout_steps=64（可通过 `--assume-rollout-steps` 覆盖）。
+- 验证 | Validation: 对示例文件 `_0002000.json` 等执行 dry-run 输出预期 step 数；真实执行后 JSON 更新且含追踪字段。
+- 风险 | Risk: 若历史 rollout_steps 与假设不符将产生系统性偏移；在追踪字段中记录方便后续二次迁移；可通过 `.bak` 还原。
+
+## 10. 训练安全退出与最新快照保障
+- 问题 | Problem: 训练过程遇到 Ctrl+C / 异常 / 外部终止时，可能未保存最新模型或未停止监控线程，造成资源泄露或进度丢失。
+- 备选 | Alternatives:
+  - J1: 保持现有隐式清理（风险高）。
+  - J2: 在主循环外层添加 try/except 捕获 KeyboardInterrupt，显式保存 latest 并清理。
+  - J3: 细粒度在每个阶段插入保存点（复杂度上升）。
+- 决策 | Decision: 选择 J2 — 低侵入、显著提升鲁棒性。保留原末尾清理逻辑，在异常路径触发 `save_model_snapshot(..., variant='latest')`。
+- 实施 | Implementation: 包裹主 `for update_idx` 循环的逻辑（详见 `train.py`）外层 try/except；捕获异常后进行：
+  1. 打印 `[train][warn] interrupted`；
+  2. 若本轮已产生新梯度或步数，立即调用 snapshot；
+  3. 心跳告知阶段 `interrupt`；
+  4. 继续执行统一清理段。
+- 验证 | Validation: 人为发送 KeyboardInterrupt，日志出现警告 & latest JSON/PT 文件时间戳更新；后续通过 `--resume latest` 成功恢复。
+- 风险 | Risk: 异常发生于 checkpoint 写入中途可能产生不完整文件；建议后续引入原子写（先写临时文件再 rename）。
+
 
 ---
 ## 验证与状态 | Validation & Status
