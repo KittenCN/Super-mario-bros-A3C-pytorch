@@ -1,1 +1,0 @@
-{"timestamp": 1759380789.4403694, "monitor": {"gpu_count": 1, "gpu_0_mem_alloc_bytes": 0.0, "gpu_0_mem_reserved_bytes": 0.0, "gpu_0_util_pct": 0.0, "gpu_0_mem_used_mb": 3.0, "gpu_0_mem_total_mb": 11264.0, "proc_cpu_percent": 0.0, "proc_mem_rss_bytes": 695578624.0, "system_cpu_percent": 0.0, "system_mem_percent": 8.0}}
