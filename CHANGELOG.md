@@ -14,6 +14,7 @@ The format roughly follows Keep a Changelog and SemVer (future releases). Date f
 ### Changed
 - `scripts/run_2080ti_resume.sh` 支持 `LOG_INTERVAL` 环境变量，利于高频 metrics 输出与测试。
 - `metrics_schema.md` 增加 smoke 测试自动化验证段落。
+- `train.py` 新增自动前进回退机制（`--auto-bootstrap-*`），`scripts/run_2080ti_resume.sh`/`auto_phase_training.sh` 默认注入更强冷启动参数，处理距离增量始终为 0 的场景。
 
 ### Fixed
 - 抑制与项目逻辑无关之 `pkg_resources` / `declare_namespace` DeprecationWarning（`pytest.ini`）。

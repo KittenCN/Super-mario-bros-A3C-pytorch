@@ -39,7 +39,8 @@
 2. (已完成) 修复 PER 间隔推送缺陷：`_per_step_update` 独立处理 push 与 sample，并新增单测覆盖 `per_sample_interval>1`。
 3. (已完成) GPU 可用性告警：`--device auto` 无 CUDA 时阻断启动（或设置 `MARIO_ALLOW_CPU_AUTO=1` 后警告继续）。
 4. (验证中) metrics JSONL + TensorBoard：抽样检查 `tensorboard/a3c_super_mario_bros/20251002-110631/metrics.jsonl`，确认包含 `replay_per_sample_interval`、`replay_sample_time_ms`、`gpu_util_mean_window` 等字段；仍需在最新训练跑中观察空目录场景。
-5. (已完成) 训练主循环异常安全：异常中断保存 latest + 清理资源。
+5. (新增) 自动前进回退：`--auto-bootstrap-threshold/frames` 现已默认由脚本注入，可在距离依旧为 0 时自动强制前进。
+6. (已完成) 训练主循环异常安全：异常中断保存 latest + 清理资源。
 
 ## 3. 短期 (T1, 下 1–2 周)
 1. (已完成) Overlap 性能基准：脚本 `scripts/benchmark_overlap.py`。

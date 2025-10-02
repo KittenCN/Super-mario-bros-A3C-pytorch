@@ -20,6 +20,7 @@
 #     SCRIPTED_SEQUENCE='START:8,RIGHT+B:120' 或 SCRIPTED_FORWARD_FRAMES / FORWARD_ACTION_ID / PROBE_FORWARD
 #     ENABLE_RAM_X_PARSE=1 启用 RAM 回退解析（fc_emulator 缺失 x_pos 时）
 # 14.(新增 2025-10-02) BOOTSTRAP=1 启动“冷启动推进”模式：若未显式指定相关参数则自动注入一组更激进的
+# 15.(新增 2025-10-03) AUTO_BOOTSTRAP_* 参数可在训练过程中检测到距离停滞时自动触发强制前进动作
 #     初期位移与奖励塑形默认（distance_weight=0.08 + scripted START / RIGHT+B 序列 + RAM 解析），
 #     用于 distance/shaping 长期为 0 的场景，减少手动调参往返。
 #
@@ -87,6 +88,9 @@ show_help() {
   MEM_TARGET_GB=1.0      # 预留给系统/碎片的安全余量 (估算用, 不做硬限制)
   MAX_RETRIES=4          # 自动降载最大尝试次数
   AUTO_MEM_STREAM=1      # 自适应模式流式输出日志 (1=是 0=否)
+  AUTO_BOOTSTRAP_THRESHOLD=0  # >0 时在指定 update 前无距离增量则触发自动前进
+  AUTO_BOOTSTRAP_FRAMES=0     # 自动前进持续的 env 步数（乘以 num_envs）
+  AUTO_BOOTSTRAP_ACTION_ID=   # 指定自动前进使用的动作 id（可留空由脚本推断）
   # ---- 进度打印粒度 (对应 train.py 新增 CLI) ----
   ROLL_PROGRESS_INTERVAL=8          # 常规阶段步进间隔
   ROLL_PROGRESS_WARMUP_UPDATES=2    # 前多少个 update 使用 warmup 间隔
@@ -141,6 +145,9 @@ NO_COMPILE=${NO_COMPILE:-0}
 COMPILE=${COMPILE:-1}
 DISABLE_OVERLAP=${DISABLE_OVERLAP:-0}
 BOOTSTRAP=${BOOTSTRAP:-0}
+AUTO_BOOTSTRAP_THRESHOLD=${AUTO_BOOTSTRAP_THRESHOLD:-0}
+AUTO_BOOTSTRAP_FRAMES=${AUTO_BOOTSTRAP_FRAMES:-0}
+AUTO_BOOTSTRAP_ACTION_ID=${AUTO_BOOTSTRAP_ACTION_ID:-}
 
 # 奖励 / 脚本化 / 探测相关可选值读取（若未提供则保持缺省或空）
 REWARD_DISTANCE_WEIGHT=${REWARD_DISTANCE_WEIGHT:-}
@@ -165,6 +172,8 @@ if [[ "$BOOTSTRAP" == "1" ]]; then
   # 若用户未提供脚本化动作 & 未指定脚本化帧数，则注入一段更长的前进，引导产生稳定的正向位移
   if [[ -z "${SCRIPTED_SEQUENCE}" && -z "${SCRIPTED_FORWARD_FRAMES}" ]]; then SCRIPTED_SEQUENCE='START:12,RIGHT+B:240,RIGHT+A+B:60'; fi
   if [[ -z "${PROBE_FORWARD}" ]]; then PROBE_FORWARD=24; fi
+  if [[ "${AUTO_BOOTSTRAP_THRESHOLD}" == "0" ]]; then AUTO_BOOTSTRAP_THRESHOLD=120; fi
+  if [[ "${AUTO_BOOTSTRAP_FRAMES}" == "0" ]]; then AUTO_BOOTSTRAP_FRAMES=1024; fi
   # 强制确保 RAM 解析开启
   ENABLE_RAM_X_PARSE=1
 fi
@@ -229,6 +238,9 @@ build_cmd() {
   if [[ -n "$REWARD_SCALE_START" ]]; then CMD+=(--reward-scale-start "$REWARD_SCALE_START"); fi
   if [[ -n "$REWARD_SCALE_FINAL" ]]; then CMD+=(--reward-scale-final "$REWARD_SCALE_FINAL"); fi
   if [[ -n "$REWARD_SCALE_ANNEAL_STEPS" ]]; then CMD+=(--reward-scale-anneal-steps "$REWARD_SCALE_ANNEAL_STEPS"); fi
+  if [[ -n "$AUTO_BOOTSTRAP_THRESHOLD" && "$AUTO_BOOTSTRAP_THRESHOLD" != "0" ]]; then CMD+=(--auto-bootstrap-threshold "$AUTO_BOOTSTRAP_THRESHOLD"); fi
+  if [[ -n "$AUTO_BOOTSTRAP_FRAMES" && "$AUTO_BOOTSTRAP_FRAMES" != "0" ]]; then CMD+=(--auto-bootstrap-frames "$AUTO_BOOTSTRAP_FRAMES"); fi
+  if [[ -n "$AUTO_BOOTSTRAP_ACTION_ID" ]]; then CMD+=(--auto-bootstrap-action-id "$AUTO_BOOTSTRAP_ACTION_ID"); fi
   # 脚本化前进 / 探测 / RAM 解析
   if [[ -n "$SCRIPTED_SEQUENCE" ]]; then CMD+=(--scripted-sequence "$SCRIPTED_SEQUENCE"); fi
   if [[ -n "$SCRIPTED_FORWARD_FRAMES" && "$SCRIPTED_FORWARD_FRAMES" != "0" ]]; then CMD+=(--scripted-forward-frames "$SCRIPTED_FORWARD_FRAMES"); fi

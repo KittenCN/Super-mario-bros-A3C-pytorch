@@ -196,6 +196,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--ram-x-high-addr", type=lambda x: int(x,0), default=0x006D, help="水平位置高字节 RAM 地址 (hex 或十进制)")
     parser.add_argument("--ram-x-low-addr", type=lambda x: int(x,0), default=0x0086, help="水平位置低字节 RAM 地址 (hex 或十进制)")
     parser.add_argument("--scripted-sequence", type=str, default=None, help="动作脚本: 逗号分隔 'NAME[:frames]'，NAME 为组合别名 (START,RIGHT,RIGHT+B,RIGHT+A,RIGHT+A+B,START+RIGHT,START+RIGHT+B)。未指定 frames 默认1")
+    parser.add_argument("--auto-bootstrap-threshold", type=int, default=0, help="若 >0 且在该 update 前距离增量始终为 0，则自动触发前进动作注入")
+    parser.add_argument("--auto-bootstrap-frames", type=int, default=0, help="自动前进触发后强制执行的总帧数 (按 env step)，需与阈值搭配使用")
+    parser.add_argument("--auto-bootstrap-action-id", type=int, default=None, help="自动前进阶段使用的动作 id，如未指定则尽量推断包含 RIGHT 的动作")
     return parser.parse_args(argv)
 
 
@@ -829,6 +832,17 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     heartbeat.start()
     heartbeat.notify(phase="初始化", message="配置随机种子", progress=False)
 
+    auto_bootstrap_threshold = max(0, int(getattr(args, "auto_bootstrap_threshold", 0) or 0))
+    auto_bootstrap_frames = max(0, int(getattr(args, "auto_bootstrap_frames", 0) or 0))
+    auto_bootstrap_action_override = getattr(args, "auto_bootstrap_action_id", None)
+    auto_bootstrap_state = {
+        "remaining": 0,
+        "triggered": False,
+        "action_id": int(auto_bootstrap_action_override) if auto_bootstrap_action_override is not None else None,
+        "announced_done": False,
+        "announced_start": False,
+    }
+
     # Repro/threads
     torch.manual_seed(cfg.seed)
     # Silence known lr_scheduler ordering warning emitted in some PyTorch builds
@@ -1053,6 +1067,35 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         print(f"[train][probe] 自动选择 forward_action_id={best[0]} (Δx={best[1]})")
         except Exception as _exc:
             print(f"[train][probe][warn] 动作探测失败: {_exc}")
+
+    def _resolve_forward_action_id() -> int:
+        if getattr(args, "forward_action_id", None) is not None:
+            return int(args.forward_action_id)
+        if hasattr(run_training, "_forward_action_id") and getattr(run_training, "_forward_action_id") is not None:  # type: ignore[attr-defined]
+            return int(getattr(run_training, "_forward_action_id"))  # type: ignore[attr-defined]
+        candidates = [1, 2, 3, 4, 0]
+        space_n = env.action_space.n if hasattr(env.action_space, 'n') else max(candidates) + 1
+        fid = next((c for c in candidates if c < space_n), 0)
+        setattr(run_training, "_forward_action_id", fid)  # type: ignore[attr-defined]
+        return fid
+
+    def _apply_auto_bootstrap_actions(actions_tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal auto_bootstrap_state
+        remaining = auto_bootstrap_state["remaining"]
+        if remaining <= 0:
+            return actions_tensor
+        action_id = auto_bootstrap_state["action_id"]
+        if action_id is None:
+            try:
+                action_id = _resolve_forward_action_id()
+            except Exception:
+                action_id = 0
+            auto_bootstrap_state["action_id"] = action_id
+        auto_bootstrap_state["remaining"] = max(0, remaining - actions_tensor.numel())
+        if auto_bootstrap_state["remaining"] <= 0 and not auto_bootstrap_state.get("announced_done", False):
+            print("[train][auto-bootstrap] 自动前进阶段结束，恢复策略动作。")
+            auto_bootstrap_state["announced_done"] = True
+        return torch.full_like(actions_tensor, int(action_id))
 
     model = prepare_model(cfg, action_space, device, compile_now=False)
     # Single-GPU / CPU path: model is already moved to device in prepare_model
@@ -1328,6 +1371,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         out = model(obs_local_cpu.to(device, non_blocking=(device.type == "cuda")), local_hidden, local_cell)
             dist = Categorical(logits=out.logits)
             actions = dist.sample()
+            if auto_bootstrap_state["remaining"] > 0:
+                actions = _apply_auto_bootstrap_actions(actions)
             log_probs = dist.log_prob(actions)
             values = out.value
             actions_cpu = actions.detach().cpu()
@@ -1494,6 +1539,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                 cur[1] -= 1
                                 if cur[1] <= 0:
                                     seq.pop(0)
+                    if auto_bootstrap_state["remaining"] > 0:
+                        actions = _apply_auto_bootstrap_actions(actions)
                     log_probs = dist.log_prob(actions)
                     actions_cpu = actions.detach().cpu()
                     # 动作频次统计
@@ -2076,6 +2123,22 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                             writer.add_scalar("Resource/gpu_util_mean_window", float(np.mean(gpu_hist)), global_step)
                         except Exception:
                             pass
+
+                if (
+                    not auto_bootstrap_state["triggered"]
+                    and auto_bootstrap_threshold > 0
+                    and auto_bootstrap_frames > 0
+                    and update_idx >= auto_bootstrap_threshold
+                    and int(metrics_entry.get("env_distance_delta_sum", 0) or 0) <= 0
+                ):
+                    auto_bootstrap_state["remaining"] = auto_bootstrap_frames * cfg.env.num_envs
+                    auto_bootstrap_state["triggered"] = True
+                    auto_bootstrap_state["announced_done"] = False
+                    if not auto_bootstrap_state.get("announced_start", False):
+                        print(
+                            "[train][auto-bootstrap] 距离增量为 0，自动注入前进动作以帮助突破冷启动。"
+                        )
+                        auto_bootstrap_state["announced_start"] = True
 
                 try:
                     _maybe_print_training_hints(update_idx, metrics_entry)

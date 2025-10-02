@@ -29,6 +29,7 @@
 21. PER 间隔推送缺陷诊断 (PER interval push regression)
 22. GPU 自动降级守卫 (Device auto guard)
 23. 训练提示输出 (Training hints emission)
+24. 自动前进回退 (Auto bootstrap fallback)
 
 ---
 ## 1. 环境构建可观测性增强
@@ -270,6 +271,13 @@
 - 实施 | Implementation: 新增 `_maybe_print_training_hints()`，根据 update 分桶避免刷屏，并在 `run_training` 写 metrics 前调用；仅当满足阈值时打印 `[train][hint] update=...` 的建议。
 - 验证 | Validation: 本地短跑触发 distance_delta=0、replay_fill_rate<5% 等场景时出现提示；正常训练未触发条件时无多余输出。
 - 风险 | Risk: 提示基于启发式规则，可能不适用于所有配置；后续可根据真实训练数据迭代阈值或允许用户关闭。
+
+## 24. 自动前进回退 (Auto bootstrap fallback)
+- 问题 | Problem: 即便使用脚本化或高距离权重，训练仍可能在冷启动阶段停滞（`env_distance_delta_sum=0`）。
+- 决策 | Decision: 在训练体内增加自动前进回退逻辑，根据 `--auto-bootstrap-threshold/frames` 配置，在检测到距离停滞时临时强制执行前进动作，保障出现正向位移。
+- 实施 | Implementation: 新增 CLI `--auto-bootstrap-*`；在 metrics 日志阶段检测条件后设置内部状态，在 rollout 时覆盖动作（优先沿用探测出的 forward_action_id）；触发与结束均打印提示。
+- 验证 | Validation: 本地模拟零距离场景触发自动注入；`BOOTSTRAP=1` 时底层脚本默认提供 threshold=120、frames=1024；恢复后动作返回策略输出。
+- 风险 | Risk: 强制动作可能影响策略多样性；如阈值过低会频繁干预，可通过 CLI 调整或设置为 0 禁用。
 
 
 ---
