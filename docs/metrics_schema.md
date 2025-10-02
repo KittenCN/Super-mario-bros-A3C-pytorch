@@ -40,6 +40,11 @@ Replay (PER): replay_size, replay_capacity, replay_fill_rate, replay_last_unique
 
 调参与建议: distance_weight 建议初期设为 0.05~0.1 以确保 raw 产生非零；scale_start/scale_final 控制整体 reward 能量，过低会导致 shaping_scaled_sum 难以显著；观察 env_distance_delta_sum 与 scaled_sum 比值评估 reward 归一化是否合理。
 
+自动化验证: `tests/test_shaping_smoke.py` 在 CI / 本地执行中：
+1. 启动单环境短程训练 (BOOTSTRAP+脚本化前进)。
+2. 捕获 stdout 中的首次正位移 `[reward][dx] first_positive_dx` 或 metrics 中的非零 `env_distance_delta_sum`。
+3. 作为回归守护防止后续改动导致 shaping 失效（例如 wrapper 顺序或 info 字段覆盖）。
+
 脚本化前进与探测辅助诊断：
 - 若使用 `--probe-forward-actions`，在训练 stdout 日志中应出现每个动作的 dx 结果；选择的 forward_action_id 之后应使 `env_distance_delta_sum` 与 `env_shaping_raw_sum` 上升。
 - 若启用 `--scripted-sequence` 但 raw_sum 仍为 0，检查：脚本动作是否匹配扩展动作集合；RAM 解析是否启用；是否在脚本阶段之前 episode 已重置。

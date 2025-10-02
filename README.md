@@ -36,6 +36,9 @@ python scripts/inspect_checkpoint.py --ckpt trained_models/run01/a3c_world1_stag
 
 # 关闭 torch.compile 与 overlap（调试/基线）
 DISABLE_OVERLAP=1 NO_COMPILE=1 bash scripts/run_2080ti_resume.sh --dry-run
+
+# 运行奖励塑形烟雾测试 (确保距离/塑形指标可产生非零)
+pytest -k test_shaping_smoke -q
 ```
 
 > **提示 | Tip**：默认依赖 `torch>=2.1`。如改用 `gymnasium-super-mario-bros`，请同步调整 `requirements.txt`。<br>Default dependency targets `torch>=2.1`. If you switch to `gymnasium-super-mario-bros`, update `requirements.txt` accordingly.
@@ -117,6 +120,8 @@ If the sidecar metadata JSON is missing, `test.py` will reconstruct it from the 
  - PER 回放：默认启用观测 uint8 压缩；`advantages`/`target_values` 使用 FP16 存储并在采样时转回 float32，若需关闭设 `MARIO_PER_FP16_SCALARS=0`。
  - 2025-10-02 修复：`PrioritizedReplay.sample` 缩进错误导致的启动中止已修正，若你在此日期前拉取代码遇到 `IndentationError` 请更新到最新版本。
  - Checkpoint 元数据现包含 `replay.per_sample_interval`，用于恢复时对齐 PER 抽样策略；所有 `.pt/.json` 采用原子写入减少半写风险。
+ - 已添加 `pytest.ini` 屏蔽与项目无关的 `pkg_resources` DeprecationWarning，保持测试输出聚焦功能性失败。
+ - `tests/test_shaping_smoke.py` 验证奖励塑形与距离增量管线：若 stdout 出现 `[reward][dx] first_positive_dx` 即视为最小可行；若未来需要更严格判定可改为断言 `env_shaping_raw_sum>0`。
 
 ### 2025-10-01 环境构建卡住问题修复摘要 | 2025-10-01 Env Construction Stall Fix Summary
 近期在同步模式（`async=False`）下出现长时间 “已连续 XXXs 无训练进度” 告警，经排查是缺乏逐子环境构建可见性难以快速定位。此次更新：<br>Recently synchronous runs (`async=False`) emitted prolonged "no training progress" warnings, traced to missing per-env construction visibility. This update adds:
