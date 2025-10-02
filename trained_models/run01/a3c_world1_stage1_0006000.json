@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "timestamp": "2025-10-01T21:31:20.693479Z",
+  "world": 1,
+  "stage": 1,
+  "action_type": "complex",
+  "frame_skip": 4,
+  "frame_stack": 4,
+  "video_dir": "output/videos",
+  "record_video": false,
+  "vector_env": {
+    "num_envs": 10,
+    "asynchronous": false,
+    "stage_schedule": [
+      [
+        1,
+        1
+      ],
+      [
+        1,
+        2
+      ],
+      [
+        1,
+        3
+      ],
+      [
+        1,
+        4
+      ]
+    ],
+    "random_start_stage": false,
+    "base_seed": 42
+  },
+  "model": {
+    "input_channels": 4,
+    "action_space": 12,
+    "base_channels": 32,
+    "hidden_size": 512,
+    "num_res_blocks": 3,
+    "recurrent_type": "gru",
+    "transformer_layers": 2,
+    "transformer_heads": 4,
+    "dropout": 0.1,
+    "use_noisy_linear": false
+  },
+  "save_state": {
+    "global_step": 3840000,
+    "global_update": 6000,
+    "type": "checkpoint"
+  },
+  "reconstructed_step_source": {
+    "method": "assumed_rollout_steps",
+    "rollout_steps": 64,
+    "formula": "global_update * num_envs * rollout_steps",
+    "computed_at": "2025-10-02T00:00:00Z"
+  }
+}
