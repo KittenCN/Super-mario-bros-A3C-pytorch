@@ -374,6 +374,68 @@ def compute_returns(
     return vs, advantages
 
 
+def _per_step_update(
+    per_buffer: Optional[PrioritizedReplay],
+    model: MarioActorCritic,
+    sequences: Dict[str, torch.Tensor],
+    vs: torch.Tensor,
+    advantages: torch.Tensor,
+    cfg: TrainingConfig,
+    device: torch.device,
+    update_idx: int,
+    *,
+    mixed_precision: bool,
+    batch_size: int,
+) -> tuple[torch.Tensor, Dict[str, Any]]:
+    """Handle PER push + optional sample/update for一个训练 step."""
+
+    metrics: Dict[str, Any] = {"sampled": False, "sample_time_ms": 0.0, "timings": {}}
+    per_loss = torch.tensor(0.0, device=device)
+
+    if per_buffer is None:
+        return per_loss, metrics
+
+    obs = sequences.get("obs")
+    actions = sequences.get("actions")
+    if obs is None or actions is None:
+        return per_loss, metrics
+
+    obs_flat = obs.reshape(-1, *obs.shape[2:])
+    actions_flat = actions.reshape(-1)
+    vs_flat = vs.detach().reshape(-1, 1)
+    adv_flat = advantages.detach().reshape(-1, 1)
+
+    per_buffer.push(obs_flat, actions_flat, vs_flat, adv_flat)
+
+    interval = max(1, int(getattr(cfg.replay, "per_sample_interval", 1)))
+    if update_idx % interval != 0:
+        return per_loss, metrics
+
+    per_sample_start = time.time()
+    per_sample, per_timings = per_buffer.sample_detailed(batch_size)
+    metrics["sample_time_ms"] = (time.time() - per_sample_start) * 1000.0
+    metrics["timings"] = dict(per_timings)
+
+    if per_sample is None:
+        return per_loss, metrics
+
+    metrics["sampled"] = True
+
+    with torch.amp.autocast(device_type=device.type, enabled=mixed_precision):
+        per_output = model(per_sample.observations, None, None)
+        per_dist = Categorical(logits=per_output.logits)
+        per_values = per_output.value.squeeze(-1)
+
+    per_log_probs = per_dist.log_prob(per_sample.actions)
+    per_policy_loss = -(per_log_probs * per_sample.advantages.detach() * per_sample.weights).mean()
+    td_error_raw = per_sample.target_values - per_values
+    per_value_loss = (td_error_raw.pow(2) * per_sample.weights).mean()
+    per_loss = per_policy_loss + cfg.optimizer.value_loss_coef * per_value_loss
+    per_buffer.update_priorities(per_sample.indices, td_error_raw.detach().abs())
+
+    return per_loss, metrics
+
+
 def _checkpoint_stem(cfg: TrainingConfig) -> str:
     env_cfg = cfg.env.env
     return f"a3c_world{env_cfg.world}_stage{env_cfg.stage}"
@@ -1638,27 +1700,22 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 dones=sequences["dones"],
             )
 
-            per_loss = torch.tensor(0.0, device=device)
-            if per_buffer is not None and (update_idx % cfg.replay.per_sample_interval == 0):
-                obs_flat = sequences["obs"].reshape(-1, *sequences["obs"].shape[2:])
-                actions_flat = sequences["actions"].reshape(-1)
-                vs_flat = vs.detach().reshape(-1, 1)
-                adv_flat = advantages.detach().reshape(-1, 1)
-                per_buffer.push(obs_flat, actions_flat, vs_flat, adv_flat)
-                per_sample_start = time.time()
-                per_sample, per_timings = per_buffer.sample_detailed(cfg.rollout.batch_size)
-                per_sample_duration = (time.time() - per_sample_start) * 1000.0  # ms (总耗时，保持向后兼容)
-                if per_sample is not None:
-                    with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
-                        per_output = model(per_sample.observations, None, None)
-                        per_dist = Categorical(logits=per_output.logits)
-                        per_values = per_output.value.squeeze(-1)
-                    per_log_probs = per_dist.log_prob(per_sample.actions)
-                    per_policy_loss = -(per_log_probs * per_sample.advantages.detach() * per_sample.weights).mean()
-                    td_error_raw = per_sample.target_values - per_values
-                    per_value_loss = (td_error_raw.pow(2) * per_sample.weights).mean()
-                    per_loss = per_policy_loss + cfg.optimizer.value_loss_coef * per_value_loss
-                    per_buffer.update_priorities(per_sample.indices, td_error_raw.detach().abs())
+            if per_buffer is not None:
+                per_loss, per_metrics = _per_step_update(
+                    per_buffer=per_buffer,
+                    model=model,
+                    sequences=sequences,
+                    vs=vs,
+                    advantages=advantages,
+                    cfg=cfg,
+                    device=device,
+                    update_idx=update_idx,
+                    mixed_precision=cfg.mixed_precision,
+                    batch_size=cfg.rollout.batch_size,
+                )
+            else:
+                per_loss = torch.tensor(0.0, device=device)
+                per_metrics = {"sampled": False, "sample_time_ms": 0.0, "timings": {}}
 
             policy_loss = -(advantages.detach() * target_log_probs).mean()
             value_loss = F.mse_loss(target_values, vs.detach())
@@ -1808,13 +1865,12 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     pass
                 # 如果当前轮进行了 PER 抽样，添加采样耗时指标
                 if per_buffer is not None:
-                    if update_idx % cfg.replay.per_sample_interval == 0:
-                        metrics_entry["replay_sample_time_ms"] = float(locals().get("per_sample_duration", 0.0))
-                        # 细分采样阶段耗时（只有触发抽样时才有实际值）
-                        for k in ("prior","choice","weight","decode","tensor","total"):
-                            metrics_entry[f"replay_sample_split_{k}_ms"] = float(per_timings.get(k, 0.0))
-                    else:
-                        metrics_entry["replay_sample_time_ms"] = 0.0
+                    sampled = bool(per_metrics.get("sampled"))
+                    sample_time = float(per_metrics.get("sample_time_ms", 0.0)) if sampled else 0.0
+                    metrics_entry["replay_sample_time_ms"] = sample_time
+                    timings = per_metrics.get("timings", {}) if sampled else {}
+                    for k in ("prior", "choice", "weight", "decode", "tensor", "total"):
+                        metrics_entry[f"replay_sample_split_{k}_ms"] = float(timings.get(k, 0.0)) if sampled else 0.0
                 # 静态配置：per_sample_interval 直接写入，便于外部解析
                 metrics_entry["replay_per_sample_interval"] = int(cfg.replay.per_sample_interval) if per_buffer is not None else 0
 

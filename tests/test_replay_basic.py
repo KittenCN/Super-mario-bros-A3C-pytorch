@@ -1,12 +1,18 @@
 import os
-import torch
+import sys
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.append(os.getcwd())
+
+import torch
+import torch.nn as nn
 
 from src.utils.replay import PrioritizedReplay
 from src.config import TrainingConfig
-from train import _build_checkpoint_metadata, _write_metadata
+from train import _build_checkpoint_metadata, _write_metadata, _per_step_update
 
 
 def test_prioritized_replay_push_sample():
@@ -70,3 +76,62 @@ def test_sample_detailed_timings():
     for key in ["prior","choice","weight","decode","tensor","total"]:
         assert key in timings
         assert timings[key] >= 0.0
+
+
+class _DummyModel(nn.Module):
+    def __init__(self, action_dim: int, input_channels: int, height: int, width: int):
+        super().__init__()
+        flat = input_channels * height * width
+        self.policy = nn.Linear(flat, action_dim)
+        self.value_head = nn.Linear(flat, 1)
+
+    def forward(self, obs, hidden=None, cell=None):
+        flat = obs.reshape(obs.shape[0], -1)
+        logits = self.policy(flat)
+        value = self.value_head(flat)
+        return SimpleNamespace(logits=logits, value=value, hidden_state=None, cell_state=None)
+
+
+def test_per_interval_pushes_every_update():
+    device = torch.device('cpu')
+    cfg = TrainingConfig()
+    cfg.replay.enable = True
+    cfg.replay.per_sample_interval = 3
+    cfg.rollout.num_steps = 2
+    cfg.env.num_envs = 3
+    cfg.rollout.batch_size = cfg.rollout.num_steps * cfg.env.num_envs
+
+    channels, height, width = 2, 4, 4
+    action_space = 5
+    dummy_model = _DummyModel(action_space, channels, height, width)
+
+    per = PrioritizedReplay(capacity=256, alpha=0.6, beta_start=0.4, beta_final=1.0, beta_steps=1000, device=device)
+
+    obs = torch.rand(cfg.rollout.num_steps, cfg.env.num_envs, channels, height, width)
+    actions = torch.randint(0, action_space, (cfg.rollout.num_steps, cfg.env.num_envs))
+    vs = torch.rand(cfg.rollout.num_steps, cfg.env.num_envs, 1)
+    advantages = torch.rand(cfg.rollout.num_steps, cfg.env.num_envs, 1)
+
+    sequences = {"obs": obs, "actions": actions}
+
+    total_updates = 5
+    for update_idx in range(total_updates):
+        per_loss, per_metrics = _per_step_update(
+            per_buffer=per,
+            model=dummy_model,
+            sequences=sequences,
+            vs=vs,
+            advantages=advantages,
+            cfg=cfg,
+            device=device,
+            update_idx=update_idx,
+            mixed_precision=False,
+            batch_size=cfg.rollout.batch_size,
+        )
+        assert torch.is_tensor(per_loss)
+        assert per_loss.device.type == 'cpu'
+        assert isinstance(per_metrics, dict)
+
+    expected_push = total_updates * cfg.rollout.num_steps * cfg.env.num_envs
+    assert per.push_total == expected_push
+    assert per.size == expected_push

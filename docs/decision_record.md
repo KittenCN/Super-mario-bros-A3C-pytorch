@@ -249,6 +249,8 @@
 - 证据 | Evidence: `train.py` 第 1610 行起仅在 `update_idx % interval == 0` 分支 push；`tensorboard/a3c_super_mario_bros/20251002-125353/metrics.jsonl` 中 `replay_push_total` 始终等于单批 640；`trained_models/run_balanced` checkpoint 元数据展示 `replay_size` 长期停留在 640。
 - 影响 | Impact: 优先级分布高度稀疏，`replay_fill_rate` 停滞，TD 误差更新失真，训练长时间维持 avg_return=0，SPS 也因 CPU 回放而波动。
 - 决策 | Decision: 拆分 push 与 sample，确保每次 update 都写入 PER；仅在满足间隔条件时执行采样与 priority 更新；同步补充单元测试覆盖 `per_sample_interval>1`。
+- 实施 | Implementation: 新增 `_per_step_update` 辅助函数集中处理 push + sample + priority 更新；日志按采样结果输出 `replay_sample_time_ms` 与细分耗时；更新 `tests/test_replay_basic.py`，通过 `_DummyModel` 验证 `per_sample_interval=3` 时 `push_total == updates * num_steps * num_envs`。
+- 验证 | Validation: `pytest tests/test_replay_basic.py` 通过；`replay_push_total` 随更新累积，非抽样轮 `replay_sample_time_ms` 自动填 0。
 - 后续 | Next: 修复后回归 `metrics_summary.py` 输出，观测 `replay_push_total` 与 `global_step` 同步增长；文档强调 interval 仅控制抽样频率而非写入频次。
 
 

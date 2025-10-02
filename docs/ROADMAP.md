@@ -15,7 +15,7 @@
 |------|------|------|-----------|--------|----------|
 | P0-1 | 历史 checkpoint global_step=0 回填 | 旧 overlap 期间保存的 ckpt 步数缺失，影响统计/调度 | 学习率调度、曲线对齐失真 | P0 | 部分完成（run01 已回填，其余待批量执行） |
 | P0-2 | 训练中断安全退出一致性 | Ctrl+C 或 OOM 后是否完整 flush / 关闭 monitor / 保存 latest | 可能丢失进度 / 文件句柄未关 | P0 | 已完成 |
-| P0-3 | PER 间隔推送缺陷 | `per_sample_interval>1` 时仅在抽样轮 push，导致大量经验未入库 | 优先级样本分布失真、训练收敛失败 | P0 | 新发现，需立即修复 |
+| P0-3 | PER 间隔推送缺陷 | `per_sample_interval>1` 时仅在抽样轮 push，导致大量经验未入库 | 优先级样本分布失真、训练收敛失败 | P0 | 已完成（2025-10-02 拆分 push/sample 逻辑并补单测） |
 | P1-1 | metrics JSONL 结构化输出 | 当前依赖 stdout + (TB 目录为空问题)，缺少稳健数值日志 | 难以离线分析 | P1 | 已完成 |
 | P1-2 | TensorBoard 事件空目录调查 | 事件文件未生成 / writer 初始化逻辑验证 | 可视化受阻 | P1 | 已完成 (init 标记 + log_dir 输出) |
 | P1-3 | Overlap 模式性能基线基准 | 对比 overlap=on/off steps/s、GPU 利用率 | 不知真实收益 | P1 | 已完成 (脚本) |
@@ -36,7 +36,7 @@
 
 ## 2. 立即执行 (T0, 本周内)
 1. (进行中) global_step 回填脚本批量执行：`run01/` 已回填并带审计字段，其余 (`run_balanced/`, `run_tput/`, `exp_shaping1/`) 仍保留旧值，需要一次性跑 `scripts/backfill_global_step.py` 并抽查 JSON。
-2. (待开发) 修复 PER 间隔推送缺陷：拆分 push / sample 条件并补充单元测试，确保 `per_sample_interval>1` 不会跳过经验写入。
+2. (已完成) 修复 PER 间隔推送缺陷：`_per_step_update` 独立处理 push 与 sample，并新增单测覆盖 `per_sample_interval>1`。
 3. (新增) GPU 可用性告警：当 `--device auto` 但 `torch.cuda.is_available()==False` 时给出显式警告或自动降级策略（当前运行会静默改用 CPU，SPS ≈0.15）。
 4. (验证中) metrics JSONL + TensorBoard：监控线程与训练线程并发写入已工作，但需补充 GPU util 缺失原因定位，并确认空目录告警在无 TB 写权限情况下的表现。
 5. (已完成) 训练主循环异常安全：异常中断保存 latest + 清理资源。
@@ -77,13 +77,12 @@
 - PER 填充率：日志出现 `[replay][stat] fill=XX.X% unique=YY.Y% avg_unique=ZZ.Z%`。
 
 ## 8. 近期执行顺序建议
-1. (P0-3) 修复 PER 间隔推送缺陷，补测 `per_sample_interval` 场景。
-2. (P0-1) 对剩余 checkpoint 执行 global_step 回填并写入审计字段。
-3. (P1-7) 补充 GPU 可用性告警 / 自动降级策略。
-4. (P1-1/P1-2) metrics JSONL + TensorBoard 联合验证，确认 monitor 线程与训练线程并发写入稳定。
-5. (P1-4) PER 指标记录回归，确保修复后统计仍可用。
-6. (P2-1) backfill 工具纳入 CI / 批处理脚本。
-7. (P2-3) GPU 端 PER 采样原型（含 KL 验证和耗时剖析）。
+1. (P0-1) 对剩余 checkpoint 执行 global_step 回填并写入审计字段。
+2. (P1-7) 补充 GPU 可用性告警 / 自动降级策略。
+3. (P1-1/P1-2) metrics JSONL + TensorBoard 联合验证，确认 monitor 线程与训练线程并发写入稳定。
+4. (P1-4) PER 指标记录回归，确保修复后统计仍可用。
+5. (P2-1) backfill 工具纳入 CI / 批处理脚本。
+6. (P2-3) GPU 端 PER 采样原型（含 KL 验证和耗时剖析）。
 
 ## 9. 开发协作提示
 - 日志前缀规范：`[train]`, `[replay]`, `[benchmark]`, `[migrate]` 保持 grep 一致。
@@ -92,7 +91,7 @@
 
 ## 10. 已完成（近期）
 - overlap 采集线程模型 + compiled unwrap
-- 内存压缩/容量自适应（PER 间隔推送逻辑待返工）
+- 内存压缩/容量自适应 + PER push 拆分（2025-10-02 修复）
 - global_step 在 overlap 模式下缺失的累加修复
 - 自适应 AUTO_MEM 训练脚本 + 流式输出
 - 细粒度 rollout 进度心跳
