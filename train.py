@@ -944,7 +944,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
     # 用于存放后台线程结果
     class _CollectResult:
-        __slots__ = ("obs_cpu", "obs_gpu", "hidden", "cell", "rollout", "episode_returns")
+        __slots__ = ("obs_cpu", "obs_gpu", "hidden", "cell", "rollout", "episode_returns", "steps")
 
         def __init__(self):
             self.obs_cpu = None
@@ -953,6 +953,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             self.cell = None
             self.rollout = None
             self.episode_returns = None
+            self.steps = 0  # 该批实际采集的环境步数 (= num_envs * rollout_steps)
 
     def _collect_rollout(buffer: RolloutBuffer, start_obs_cpu: torch.Tensor, start_hidden, start_cell, ep_returns: np.ndarray, update_idx_hint: int, progress_heartbeat: bool = False, step_interval: int = 8):
         local_hidden = start_hidden
@@ -1009,7 +1010,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             if progress_heartbeat and ((step + 1) % step_interval == 0 or step + 1 == cfg.rollout.num_steps):
                 heartbeat.notify(global_step=-1, phase="rollout", message=f"(bg) 采样 {step+1}/{cfg.rollout.num_steps}")
         buffer.set_next_obs(obs_local_cpu)
-        return obs_local_cpu, local_hidden, local_cell, ep_returns
+        steps_collected = cfg.rollout.num_steps * cfg.env.num_envs
+        return obs_local_cpu, local_hidden, local_cell, ep_returns, steps_collected
 
     # 双缓冲：当前 buffer / 下一个 buffer
     current_buffer = rollout
@@ -1023,11 +1025,12 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         pending_result.obs_cpu = None
         def _runner():
             try:
-                obs_cpu_final, h_final, c_final, ep_ret = _collect_rollout(next_buffer, start_obs_cpu, hidden_state, cell_state, ep_returns, next_update_idx, progress_heartbeat=False, step_interval=step_interval)
+                obs_cpu_final, h_final, c_final, ep_ret, steps_collected = _collect_rollout(next_buffer, start_obs_cpu, hidden_state, cell_state, ep_returns, next_update_idx, progress_heartbeat=False, step_interval=step_interval)
                 pending_result.obs_cpu = obs_cpu_final
                 pending_result.hidden = h_final
                 pending_result.cell = c_final
                 pending_result.episode_returns = ep_ret
+                pending_result.steps = steps_collected
             except Exception as e:  # pragma: no cover - 仅日志
                 print(f"[train][warn] background collection failed: {e}")
         t = threading.Thread(target=_runner, daemon=True)
@@ -1118,8 +1121,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             if update_idx == global_update:
                 # 首次需要前台采集以获得初始缓冲
                 current_buffer.reset()
-                obs_cpu, hidden_state, cell_state, episode_returns = _collect_rollout(current_buffer, obs_cpu, hidden_state, cell_state, episode_returns, update_idx, progress_heartbeat=True, step_interval=current_interval)
+                obs_cpu, hidden_state, cell_state, episode_returns, steps_collected = _collect_rollout(current_buffer, obs_cpu, hidden_state, cell_state, episode_returns, update_idx, progress_heartbeat=True, step_interval=current_interval)
                 obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
+                global_step += steps_collected  # 首次采集完成后累加步数
             else:
                 # 等待后台线程完成上一个 next_buffer
                 if pending_thread is not None:
@@ -1133,6 +1137,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 cell_state = pending_result.cell
                 if pending_result.episode_returns is not None:
                     episode_returns = pending_result.episode_returns
+                # 累计后台线程采集的步数
+                global_step += getattr(pending_result, "steps", cfg.rollout.num_steps * cfg.env.num_envs)
             # 在学习阶段开始前启动下一次后台采集（除非最后一次）
             if update_idx + 1 < cfg.total_updates:
                 pending_thread = _start_background_collection(obs_cpu, hidden_state, cell_state, episode_returns, update_idx + 1, step_interval=current_interval)
