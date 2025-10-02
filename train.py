@@ -1264,8 +1264,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 adv_flat = advantages.detach().reshape(-1, 1)
                 per_buffer.push(obs_flat, actions_flat, vs_flat, adv_flat)
                 per_sample_start = time.time()
-                per_sample = per_buffer.sample(cfg.rollout.batch_size)
-                per_sample_duration = (time.time() - per_sample_start) * 1000.0  # ms
+                per_sample, per_timings = per_buffer.sample_detailed(cfg.rollout.batch_size)
+                per_sample_duration = (time.time() - per_sample_start) * 1000.0  # ms (总耗时，保持向后兼容)
                 if per_sample is not None:
                     with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
                         per_output = model(per_sample.observations, None, None)
@@ -1385,9 +1385,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 if per_buffer is not None:
                     if update_idx % cfg.replay.per_sample_interval == 0:
                         metrics_entry["replay_sample_time_ms"] = float(locals().get("per_sample_duration", 0.0))
+                        # 细分采样阶段耗时（只有触发抽样时才有实际值）
+                        for k in ("prior","choice","weight","decode","tensor","total"):
+                            metrics_entry[f"replay_sample_split_{k}_ms"] = float(per_timings.get(k, 0.0))
                     else:
-                        # 保持时间序列稠密：未触发采样轮填 0
                         metrics_entry["replay_sample_time_ms"] = 0.0
+                # 静态配置：per_sample_interval 直接写入，便于外部解析
+                metrics_entry["replay_per_sample_interval"] = int(cfg.replay.per_sample_interval) if per_buffer is not None else 0
 
                 # PER stats (if enabled)
                 if per_buffer is not None:

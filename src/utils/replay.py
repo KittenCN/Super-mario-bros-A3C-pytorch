@@ -215,7 +215,6 @@ class PrioritizedReplay:
         scaled = priorities ** self.alpha
         denom = scaled.sum()
         if denom <= 0:
-            # 所有优先级为 0：退化为均匀分布
             probs = np.full(valid, 1.0 / valid, dtype=np.float32)
         else:
             probs = scaled / denom
@@ -223,25 +222,79 @@ class PrioritizedReplay:
         beta = self.beta()
         weights = (valid * probs[indices]) ** (-beta)
         weights = weights / weights.max()
-        # 取出 & 解压缩
         obs_raw = self.obs_storage[indices]  # type: ignore[index]
         if self._compress:
             obs = obs_raw.float().div_(255.0).to(self.device)
         else:
             obs = obs_raw.to(self.device)
         actions = self.actions[indices].to(self.device)  # type: ignore[index]
-        # 修复：此前两行意外减少缩进导致函数体语法错误（IndentationError）
         target_values = self.target_values[indices].to(self.device).to(torch.float32)  # type: ignore[index]
         advantages = self.advantages[indices].to(self.device).to(torch.float32)  # type: ignore[index]
         weights_t = torch.tensor(weights, device=self.device, dtype=torch.float32)
         self.step += 1
-        # 更新唯一索引比例
         unique = len(set(int(x) for x in indices.tolist()))
         self.sample_calls += 1
         self.sample_size_accum += batch_size
         self.last_sample_unique_ratio = unique / float(batch_size)
         self.unique_ratio_accum += self.last_sample_unique_ratio
         return ReplaySample(obs, actions, target_values, advantages, weights_t, indices)
+
+    def sample_detailed(self, batch_size: int) -> tuple[Optional[ReplaySample], dict[str, float]]:
+        """与 sample 类似，但返回细分阶段耗时 (ms)。
+
+        分段说明:
+        - prior: 计算 scaled priorities / 概率分布
+        - choice: 执行 np.random.choice 抽样
+        - weight: 计算重要性权重并归一化
+        - decode: 取出原始观测并解压缩/搬运到目标设备
+        - tensor: 构造 actions/values/advantages/weights 张量
+        """
+        timings: dict[str, float] = {}
+        if self.size < batch_size or self.obs_storage is None:
+            return None, timings
+        import time as _time
+        t0 = _time.time()
+        valid = self.size
+        p_start = _time.time()
+        priorities = self.priorities[:valid]
+        scaled = priorities ** self.alpha
+        denom = scaled.sum()
+        if denom <= 0:
+            probs = np.full(valid, 1.0 / valid, dtype=np.float32)
+        else:
+            probs = scaled / denom
+        timings["prior"] = (_time.time() - p_start) * 1000.0
+        c_start = _time.time()
+        indices = np.random.choice(valid, batch_size, p=probs)
+        timings["choice"] = (_time.time() - c_start) * 1000.0
+        w_start = _time.time()
+        beta = self.beta()
+        weights = (valid * probs[indices]) ** (-beta)
+        weights = weights / weights.max()
+        timings["weight"] = (_time.time() - w_start) * 1000.0
+        d_start = _time.time()
+        obs_raw = self.obs_storage[indices]  # type: ignore[index]
+        if self._compress:
+            obs = obs_raw.float().div_(255.0).to(self.device)
+        else:
+            obs = obs_raw.to(self.device)
+        timings["decode"] = (_time.time() - d_start) * 1000.0
+        t_start = _time.time()
+        actions = self.actions[indices].to(self.device)  # type: ignore[index]
+        target_values = self.target_values[indices].to(self.device).to(torch.float32)  # type: ignore[index]
+        advantages = self.advantages[indices].to(self.device).to(torch.float32)  # type: ignore[index]
+        weights_t = torch.tensor(weights, device=self.device, dtype=torch.float32)
+        timings["tensor"] = (_time.time() - t_start) * 1000.0
+        timings["total"] = (_time.time() - t0) * 1000.0
+        # 统计更新（与 sample 一致）
+        self.step += 1
+        unique = len(set(int(x) for x in indices.tolist()))
+        self.sample_calls += 1
+        self.sample_size_accum += batch_size
+        self.last_sample_unique_ratio = unique / float(batch_size)
+        self.unique_ratio_accum += self.last_sample_unique_ratio
+        sample = ReplaySample(obs, actions, target_values, advantages, weights_t, indices)
+        return sample, timings
 
     def update_priorities(self, indices: np.ndarray, priorities: torch.Tensor):
         np_prior = priorities.detach().cpu().numpy().flatten()

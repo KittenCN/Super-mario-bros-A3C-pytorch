@@ -56,3 +56,17 @@ def test_per_sample_time_positive():
     t1 = time.time()
     assert smp is not None
     assert (t1 - t0) * 1000.0 >= 0.0  # 只要能执行即视为成功
+
+
+def test_sample_detailed_timings():
+    per = PrioritizedReplay(capacity=128, alpha=0.6, beta_start=0.4, beta_final=1.0, beta_steps=1000, device=torch.device('cpu'))
+    obs = torch.rand(64,4,84,84)
+    actions = torch.randint(0,6,(64,))
+    vals = torch.randn(64)
+    adv = torch.randn(64)
+    per.push(obs, actions, vals, adv)
+    sample, timings = per.sample_detailed(32)
+    assert sample is not None
+    for key in ["prior","choice","weight","decode","tensor","total"]:
+        assert key in timings
+        assert timings[key] >= 0.0
