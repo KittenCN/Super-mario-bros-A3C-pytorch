@@ -374,6 +374,54 @@ def compute_returns(
     return vs, advantages
 
 
+def _maybe_print_training_hints(update_idx: int, metrics: Dict[str, Any]) -> None:
+    """Emit human-friendly training hints based on logged metrics."""
+
+    if update_idx < 0:
+        return
+
+    bucket = max(0, update_idx // 50)
+    hint_history = getattr(run_training, "_hint_history", None)  # type: ignore[attr-defined]
+    if hint_history is None:
+        hint_history = set()
+        setattr(run_training, "_hint_history", hint_history)  # type: ignore[attr-defined]
+
+    hints: list[str] = []
+    avg_return = float(metrics.get("avg_return", 0.0) or 0.0)
+    distance_delta = float(metrics.get("env_distance_delta_sum", 0) or 0)
+    shaping_raw = float(metrics.get("env_shaping_raw_sum", 0.0) or 0.0)
+    replay_fill = float(metrics.get("replay_fill_rate", 0.0) or 0.0)
+    gpu_util = float(metrics.get("gpu_util_mean_window", -1.0) or -1.0)
+    loss_total = float(metrics.get("loss_total", 0.0) or 0.0)
+    global_step_value = int(metrics.get("global_step", 0) or 0)
+
+    if distance_delta == 0 and shaping_raw == 0 and global_step_value > 0:
+        hints.append("距离增量为 0，考虑提高 reward_distance_weight 或启用 scripted-forward。")
+
+    if avg_return <= 0.0 and update_idx >= 200:
+        hints.append("avg_return 长期为 0，可检查奖励塑形或动作脚本是否生效。")
+
+    if replay_fill < 0.05 and update_idx >= 100:
+        hints.append("经验回放填充率 <5%，建议延长预热或提高 per_sample_interval 以外的 push 频率。")
+
+    if gpu_util >= 0 and gpu_util < 5.0 and update_idx >= 200:
+        hints.append("GPU 利用率极低，确认是否使用 GPU 设备或提高并行度/rollout。")
+
+    if loss_total > 2.5 and update_idx >= 50:
+        hints.append("loss_total 偏高，可检查学习率或梯度截断设置。")
+
+    if not hints:
+        return
+
+    hint_key = (bucket, tuple(hints))
+    if hint_key in hint_history:
+        return
+    hint_history.add(hint_key)
+
+    joined = " | ".join(hints)
+    print(f"[train][hint] update={update_idx} {joined}")
+
+
 def _per_step_update(
     per_buffer: Optional[PrioritizedReplay],
     model: MarioActorCritic,
@@ -2028,6 +2076,11 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                             writer.add_scalar("Resource/gpu_util_mean_window", float(np.mean(gpu_hist)), global_step)
                         except Exception:
                             pass
+
+                try:
+                    _maybe_print_training_hints(update_idx, metrics_entry)
+                except Exception:
+                    pass
 
                 try:
                     with metrics_file.open("a", encoding="utf-8") as fp:

@@ -28,6 +28,7 @@
 20. 运行脚本参数扩展与原子写 (Launcher extension & atomic writes)
 21. PER 间隔推送缺陷诊断 (PER interval push regression)
 22. GPU 自动降级守卫 (Device auto guard)
+23. 训练提示输出 (Training hints emission)
 
 ---
 ## 1. 环境构建可观测性增强
@@ -261,6 +262,13 @@
 - 实施 | Implementation: 在 `run_training` 中新增守卫；若 `MARIO_ALLOW_CPU_AUTO` 未开启且 `torch.cuda.is_available()==False`，抛出 `[train][error]` 提示；若设置允许，则打印警告后继续使用 CPU。
 - 验证 | Validation: 单元测试 `tests/test_replay_basic.py` 仍通过（显式设置 `--device cpu` 场景不受影响）；本地执行 `pytest` 表明守卫未破坏现有流程。
 - 后续 | Next: 需要在 README / 启动指南中提示新增环境变量；CI / 脚本应视部署环境决定是否设置 `MARIO_ALLOW_CPU_AUTO=1`。
+
+## 23. 训练提示输出 (Training hints emission)
+- 问题 | Problem: 日志虽包含指标，但缺少基于指标的即时建议，新手难以及时发现策略停滞、回放未填充等问题。
+- 决策 | Decision: 在 log_interval 分支中根据关键指标输出人性化提示，如距离增量为 0、avg_return 长期为 0、回放填充率过低、GPU 利用率过低、loss 异常等。
+- 实施 | Implementation: 新增 `_maybe_print_training_hints()`，根据 update 分桶避免刷屏，并在 `run_training` 写 metrics 前调用；仅当满足阈值时打印 `[train][hint] update=...` 的建议。
+- 验证 | Validation: 本地短跑触发 distance_delta=0、replay_fill_rate<5% 等场景时出现提示；正常训练未触发条件时无多余输出。
+- 风险 | Risk: 提示基于启发式规则，可能不适用于所有配置；后续可根据真实训练数据迭代阈值或允许用户关闭。
 
 
 ---
