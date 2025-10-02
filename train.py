@@ -17,12 +17,9 @@ try:
                 print(f"[train] multiprocessing start method set to {_method}")
                 break
             except (RuntimeError, ValueError):
-                # method not available or already initialised; try next
                 continue
-except Exception:
-    # Best-effort: if we cannot query/set the start method, continue with
-    # whatever the runtime default provides.
-    pass
+except Exception as e:
+    print(f"[train][start-method][warn] failed to set start method: {e}")
 
 # Suppress the legacy Gym startup notice that prints to stderr when gym is
 # installed alongside gymnasium. We temporarily replace sys.stderr around the
@@ -95,7 +92,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a Mario agent with modernised A3C")
     parser.add_argument("--world", type=int, default=1)
     parser.add_argument("--stage", type=int, default=1)
-    parser.add_argument("--action-type", type=str, default="complex", choices=["right", "simple", "complex"])
+    parser.add_argument("--action-type", type=str, default="complex", choices=["right", "simple", "complex", "extended"])
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--frame-skip", type=int, default=4)
     parser.add_argument("--frame-stack", type=int, default=4)
@@ -185,6 +182,20 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--slow-step-trace-threshold", type=int, default=5, help="在窗口内累计达到该慢 step 次数触发栈追踪")
     parser.add_argument("--slow-step-trace-window", type=float, default=120.0, help="慢 step 统计时间窗口 (秒)")
+    # Reward shaping / environment control
+    parser.add_argument("--reward-distance-weight", type=float, default=1.0/80.0, help="位移奖励权重")
+    parser.add_argument("--reward-scale-start", type=float, default=0.2, help="动态缩放起始值")
+    parser.add_argument("--reward-scale-final", type=float, default=0.1, help="动态缩放最终值")
+    parser.add_argument("--reward-scale-anneal-steps", type=int, default=50_000, help="缩放线性退火步数 (env steps)")
+    parser.add_argument("--auto-start-frames", type=int, default=0, help="开局自动发送 START(+RIGHT) 的帧数，0 禁用")
+    parser.add_argument("--stagnation-warn-updates", type=int, default=20, help="连续若干 update 无 max_x 提升触发警告，<=0 关闭")
+    parser.add_argument("--scripted-forward-frames", type=int, default=0, help="训练起始阶段前 N*env_num 帧强制使用前进动作 (RIGHT 或 RIGHT+B)，用于 warmup 推进，0 表示关闭")
+    parser.add_argument("--forward-action-id", type=int, default=None, help="显式指定用于 scripted-forward 的离散动作 id；不指定则自动猜测 (优先含 RIGHT)" )
+    parser.add_argument("--probe-forward-actions", type=int, default=0, help=">0 时训练前对每个动作连续执行指定步数以探测前进效果")
+    parser.add_argument("--enable-ram-x-parse", action="store_true", help="启用 RAM 解析 x_pos 回退 (MarioRewardWrapper)")
+    parser.add_argument("--ram-x-high-addr", type=lambda x: int(x,0), default=0x006D, help="水平位置高字节 RAM 地址 (hex 或十进制)")
+    parser.add_argument("--ram-x-low-addr", type=lambda x: int(x,0), default=0x0086, help="水平位置低字节 RAM 地址 (hex 或十进制)")
+    parser.add_argument("--scripted-sequence", type=str, default=None, help="动作脚本: 逗号分隔 'NAME[:frames]'，NAME 为组合别名 (START,RIGHT,RIGHT+B,RIGHT+A,RIGHT+A+B,START+RIGHT,START+RIGHT+B)。未指定 frames 默认1")
     return parser.parse_args(argv)
 
 
@@ -197,6 +208,16 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
         frame_skip=args.frame_skip,
         frame_stack=args.frame_stack,
     )
+    # 注入奖励配置
+    try:
+        env_cfg.reward_config.distance_weight = float(args.reward_distance_weight)
+        env_cfg.reward_config.scale_start = float(args.reward_scale_start)
+        env_cfg.reward_config.scale_final = float(args.reward_scale_final)
+        env_cfg.reward_config.scale_anneal_steps = int(args.reward_scale_anneal_steps)
+    except Exception:
+        pass
+    # 记录 auto-start 配置（扩展字段）
+    setattr(env_cfg, "auto_start_frames", max(0, int(getattr(args, "auto_start_frames", 0))))
     # Default to synchronous vector env unless the user explicitly requests async
     # and confirms they accept the instability risk. Priority:
     # force_sync -> explicit async flag + confirmation/env -> sync flag -> default sync
@@ -394,6 +415,8 @@ def _build_checkpoint_metadata(
             "global_step": int(global_step),
             "global_update": int(update_idx),
             "type": variant,
+            # reason 字段可在异常/中断补写或保留默认 normal
+            "reason": "normal",
         },
     }
     return metadata
@@ -856,6 +879,61 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
     action_space = env.single_action_space.n
     cfg.model = dataclasses.replace(cfg.model, action_space=action_space, input_channels=env.single_observation_space.shape[0])
+
+    # 前进动作自动探测（仅在用户指定 probe-forward-actions >0 时执行）
+    forward_probe_result = None
+    if getattr(args, "probe_forward_actions", 0) > 0:
+        try:
+            single = None
+            if hasattr(env, 'envs') and isinstance(env.envs, (list, tuple)) and env.envs:
+                single = env.envs[0]
+            if single is not None:
+                n_actions = int(getattr(single.action_space, 'n', 0))
+                per = max(1, int(args.probe_forward_actions))
+                distances = []
+                import numpy as _np
+                def _extract_x(inf: dict):
+                    if not isinstance(inf, dict):
+                        return 0
+                    x = inf.get('x_pos') or inf.get('progress')
+                    metrics = inf.get('metrics') if isinstance(inf, dict) else None
+                    if x is None and isinstance(metrics, dict):
+                        xv = metrics.get('mario_x') or metrics.get('x_pos')
+                        if xv is not None:
+                            try:
+                                if hasattr(xv,'item'): xv = xv.item()
+                                elif hasattr(xv,'__len__') and len(xv)>0: xv = xv[0]
+                                x = int(xv)
+                            except Exception:
+                                x = None
+                    try:
+                        return int(x) if x is not None else 0
+                    except Exception:
+                        return 0
+                # reset 基准
+                single.reset()
+                for aid in range(n_actions):
+                    single.reset()
+                    start_obs, start_info = single.reset()
+                    start_x = _extract_x(start_info)
+                    last_x = start_x
+                    for _ in range(per):
+                        ob2, r2, term2, trunc2, inf2 = single.step(aid)
+                        last_x = _extract_x(inf2)
+                        if term2 or trunc2:
+                            break
+                    distances.append((aid, max(0, last_x - start_x), last_x))
+                distances.sort(key=lambda t: t[1], reverse=True)
+                if distances:
+                    forward_probe_result = distances
+                    print(f"[train][probe] 动作探测结果 top: {distances[:min(8,len(distances))]}")
+                    best = distances[0]
+                    if best[1] > 0 and getattr(args, 'forward_action_id', None) is None:
+                        setattr(args, 'forward_action_id', best[0])
+                        print(f"[train][probe] 自动选择 forward_action_id={best[0]} (Δx={best[1]})")
+        except Exception as _exc:
+            print(f"[train][probe][warn] 动作探测失败: {_exc}")
+
     model = prepare_model(cfg, action_space, device, compile_now=False)
     # Single-GPU / CPU path: model is already moved to device in prepare_model
     model.train()
@@ -970,11 +1048,56 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     hidden_state, cell_state = model.initial_state(cfg.env.num_envs, device)
     optimizer.zero_grad(set_to_none=True)
 
+    # 启用 RAM 解析 fallback：遍历底层 envs 尝试设置属性
+    if getattr(args, 'enable_ram_x_parse', False):
+        try:
+            if hasattr(env, 'envs'):
+                for _e in env.envs:
+                    # 逐层 unwrap 找到 MarioRewardWrapper
+                    cur = _e
+                    for _ in range(6):  # 防止过深循环
+                        if cur is None:
+                            break
+                        name = cur.__class__.__name__.lower()
+                        if name.startswith('mariorewardwrapper'):
+                            try:
+                                cur.enable_ram_x_parse = True
+                                cur.ram_addr_high = int(getattr(args, 'ram_x_high_addr'))
+                                cur.ram_addr_low = int(getattr(args, 'ram_x_low_addr'))
+                                print(f"[train][ram-x] enabled on wrapper (high=0x{cur.ram_addr_high:04X} low=0x{cur.ram_addr_low:04X})")
+                            except Exception:
+                                pass
+                            break
+                        cur = getattr(cur, 'env', None)
+        except Exception as _exc:
+            print(f"[train][ram-x][warn] enable failed: {_exc}")
+
     global_step = 0
     global_update = 0
     last_resource_log = 0.0
     episode_returns = np.zeros(cfg.env.num_envs, dtype=np.float32)
     completed_returns: list[float] = []
+    # 追踪每个 env 的最新 x_pos 与累计最大值，便于日志/诊断
+    env_last_x = np.zeros(cfg.env.num_envs, dtype=np.int32)
+    env_max_x = np.zeros(cfg.env.num_envs, dtype=np.int32)
+    env_prev_step_x = np.zeros(cfg.env.num_envs, dtype=np.int32)
+    distance_delta_sum = 0  # 本 update 内累计正向位移
+    shaping_raw_sum = 0.0
+    shaping_scaled_sum = 0.0
+    # 额外诊断：记录最近一次 shaping 信息 & 解析失败次数
+    shaping_last_dx = 0.0
+    shaping_last_scale = 0.0
+    shaping_last_raw = 0.0
+    shaping_last_scaled = 0.0
+    shaping_parse_fail = 0
+    action_hist = np.zeros(64, dtype=np.int64)  # 假设动作空间 <64
+    stagnation_steps = np.zeros(cfg.env.num_envs, dtype=np.int32)
+    stagnation_limit = 400  # 若某 env 连续无前进达到该步数可考虑截断
+    prev_global_max_x = 0
+    stagnation_update_counter = 0
+    stagnation_warn_updates = max(0, int(getattr(args, "stagnation_warn_updates", 0)))
+    auto_start_frames = int(getattr(cfg.env.env, "auto_start_frames", 0))
+    auto_start_sequence = [0] * auto_start_frames  # 暂以动作 0 代表 START/NOOP，可后续替换具体 start 动作
 
     last_grad_norm = 0.0
     last_log_time = time.time()
@@ -1183,12 +1306,99 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                             values = output.value
                     dist = Categorical(logits=logits)
                     actions = dist.sample()
+                    # 若配置 auto-start，在前若干全局 step 强制覆盖动作（仅第一轮）
+                    if auto_start_frames > 0 and update_idx == global_update and global_step < auto_start_frames * cfg.env.num_envs:
+                        actions = torch.zeros_like(actions)
+                    # Scripted forward warmup：在指定帧数内强制使用前进动作
+                    if getattr(args, "scripted_forward_frames", 0) > 0 and global_step < args.scripted_forward_frames * cfg.env.num_envs:
+                        try:
+                            # 推断 forward 动作 id（缓存）
+                            if not hasattr(run_training, "_forward_action_id") or run_training._forward_action_id is None:  # type: ignore[attr-defined]
+                                # 自动猜测：env.action_space.n 与 action_type 组合无直接暴露，借助 metrics 中已统计的 action_hist shape 或假设 id 小
+                                # 简单策略：若用户传入 forward_action_id 则直接用；否则使用 1 或 2 中含 RIGHT 概率较高，再 fallback 0
+                                faid = getattr(args, "forward_action_id", None)
+                                if faid is None:
+                                    # 假设 0 可能是 NOOP；优先尝试 1，再 2，再 3，再 0
+                                    candidates = [1, 2, 3, 4, 0]
+                                else:
+                                    candidates = [int(faid)]
+                                # 约束到动作空间范围
+                                space_n = env.action_space.n if hasattr(env.action_space, 'n') else max(candidates)+1
+                                run_training._forward_action_id = next((c for c in candidates if c < space_n), 0)  # type: ignore[attr-defined]
+                            fid = int(run_training._forward_action_id)  # type: ignore[attr-defined]
+                            actions = torch.full_like(actions, fid)
+                        except Exception:
+                            pass
+                    # Scripted sequence 覆盖（优先级高于 forward_frames）
+                    if getattr(args, 'scripted_sequence', None):
+                        # 预处理脚本为 (action_id, remaining_frames) 队列，缓存到 run_training._scripted_seq
+                        if not hasattr(run_training, '_scripted_seq'):
+                            seq_spec = str(args.scripted_sequence).split(',')
+                            parsed = []
+                            # 获取动作组合列表（如果 fc wrapper 暴露 _action_combos）
+                            action_combos = getattr(env.envs[0], '_action_combos', None) if hasattr(env, 'envs') and env.envs else None
+                            def _combo_to_id(name: str):
+                                if action_combos is None:
+                                    return None
+                                target = tuple(part.strip().upper() for part in name.split('+') if part.strip())
+                                for i, c in enumerate(action_combos):
+                                    if tuple(c) == target:
+                                        return i
+                                return None
+                            for token in seq_spec:
+                                token = token.strip()
+                                if not token:
+                                    continue
+                                if ':' in token:
+                                    nm, fr = token.split(':', 1)
+                                    try:
+                                        frn = max(1, int(fr))
+                                    except Exception:
+                                        frn = 1
+                                else:
+                                    nm, frn = token, 1
+                                aid = _combo_to_id(nm)
+                                if aid is None:
+                                    continue
+                                parsed.append([aid, frn])
+                            if parsed:
+                                run_training._scripted_seq = parsed  # type: ignore[attr-defined]
+                                run_training._scripted_seq_idx = 0  # type: ignore[attr-defined]
+                        # 应用脚本（每 global_step 减少一帧）
+                        if hasattr(run_training, '_scripted_seq'):
+                            seq = run_training._scripted_seq  # type: ignore[attr-defined]
+                            if seq:
+                                cur = seq[0]
+                                aid, remain = cur
+                                actions = torch.full_like(actions, int(aid))
+                                cur[1] -= 1
+                                if cur[1] <= 0:
+                                    seq.pop(0)
                     log_probs = dist.log_prob(actions)
                     actions_cpu = actions.detach().cpu()
+                    # 动作频次统计
+                    try:
+                        vals, counts = np.unique(actions_cpu.numpy(), return_counts=True)
+                        action_hist[vals] += counts
+                    except Exception:
+                        pass
                     log_probs_cpu = log_probs.detach().cpu()
                     values_cpu = values.detach().cpu()
                     step_start_time = time.time()
                     next_obs_np, reward_np, terminated, truncated, infos = env.step(actions_cpu.numpy())
+                    # 前若干步调试：打印原始 info 结构（仅 env0）
+                    if global_step < 20 * cfg.env.num_envs:
+                        try:
+                            if isinstance(infos, (list, tuple)) and infos and isinstance(infos[0], dict):
+                                keys0 = list(infos[0].keys())
+                                metrics0 = list(infos[0].get('metrics', {}).keys()) if isinstance(infos[0].get('metrics'), dict) else None
+                                print(f"[train][debug-info] gstep={global_step} keys={keys0} metrics_keys={metrics0}")
+                            elif isinstance(infos, dict):
+                                keys0 = list(infos.keys())
+                                mk = list(infos.get('metrics', {}).keys()) if isinstance(infos.get('metrics'), dict) else None
+                                print(f"[train][debug-info] gstep={global_step} dict-keys={keys0} metrics_keys={mk}")
+                        except Exception:
+                            pass
                     step_duration = time.time() - step_start_time
                     if step_timeout is not None and step_duration > step_timeout:
                         now_warn = time.time()
@@ -1214,6 +1424,122 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                 print(f"[train][trace][error] stack dump failed: {_exc}")
                             slow_step_events.clear()
                     done = np.logical_or(terminated, truncated)
+                    # 提取 x_pos 进度（infos 可能是 list 或 tuple）
+                    try:
+                        if isinstance(infos, (list, tuple)):
+                            for i_env, inf in enumerate(infos):
+                                if not isinstance(inf, dict):
+                                    continue
+                                x_val = inf.get("x_pos") or inf.get("progress")
+                                shaping_inf = inf.get("shaping") if isinstance(inf, dict) else None
+                                if x_val is None:
+                                    metrics = inf.get("metrics") if isinstance(inf, dict) else None
+                                    if metrics and isinstance(metrics, dict):
+                                        x_raw = metrics.get("mario_x") or metrics.get("x_pos")
+                                        if x_raw is not None:
+                                            try:
+                                                if hasattr(x_raw, "item"):
+                                                    x_raw = x_raw.item()
+                                                elif hasattr(x_raw, "__len__") and len(x_raw) > 0:
+                                                    x_raw = x_raw[0]
+                                                x_val = int(x_raw)
+                                            except Exception:
+                                                x_val = None
+                                if isinstance(x_val, (int, float)):
+                                    env_last_x[i_env] = int(x_val)
+                                    if env_last_x[i_env] > env_max_x[i_env]:
+                                        env_max_x[i_env] = env_last_x[i_env]
+                                    # 正向位移统计
+                                    dx = env_last_x[i_env] - env_prev_step_x[i_env]
+                                    # 如果之前始终为 0，允许第一次正值直接加入 (dx = current_x)
+                                    if env_prev_step_x[i_env] == 0 and env_last_x[i_env] > 0 and dx == env_last_x[i_env]:
+                                        pass  # dx 已是完整跳跃
+                                    if dx > 0:
+                                        distance_delta_sum += dx
+                                        stagnation_steps[i_env] = 0
+                                    else:
+                                        stagnation_steps[i_env] += 1
+                                    env_prev_step_x[i_env] = env_last_x[i_env]
+                                    # shaping 奖励原始/缩放累积
+                                    if isinstance(shaping_inf, dict):
+                                        try:
+                                            raw_v = shaping_inf.get("raw")
+                                            scaled_v = shaping_inf.get("scaled")
+                                            scale_v = shaping_inf.get("scale")
+                                            dx_v = shaping_inf.get("dx")
+                                            if isinstance(raw_v, (int, float)):
+                                                shaping_raw_sum += float(raw_v)
+                                                shaping_last_raw = float(raw_v)
+                                            if isinstance(scaled_v, (int, float)):
+                                                shaping_scaled_sum += float(scaled_v)
+                                                shaping_last_scaled = float(scaled_v)
+                                            if isinstance(scale_v, (int, float)):
+                                                shaping_last_scale = float(scale_v)
+                                            if isinstance(dx_v, (int, float)):
+                                                shaping_last_dx = float(dx_v)
+                                        except Exception:
+                                            shaping_parse_fail += 1
+                                            pass
+                                    # 早停截断（无进度过久）：标记 truncated=True
+                                    if stagnation_steps[i_env] >= stagnation_limit:
+                                        try:
+                                            if isinstance(infos[i_env], dict):
+                                                infos[i_env]["stagnation_truncate"] = True
+                                            truncated[i_env] = True
+                                        except Exception:
+                                            pass
+                        elif isinstance(infos, dict):  # 向量 env 可能直接给 dict
+                            # 单一 dict：尝试提取 batched 形式 (x_pos: array)
+                                        x_array = infos.get("x_pos")
+                                        if x_array is not None:
+                                            try:
+                                                arr = np.asarray(x_array).astype(int)
+                                                if arr.ndim == 0:
+                                                    # 标量 -> 仅更新 env0（其余视为无进展）
+                                                    arr = np.full((cfg.env.num_envs,), int(arr), dtype=int)
+                                                if arr.shape[0] == cfg.env.num_envs:
+                                                    for i_env in range(cfg.env.num_envs):
+                                                        last = int(arr[i_env])
+                                                        env_last_x[i_env] = last
+                                                        if last > env_max_x[i_env]:
+                                                            env_max_x[i_env] = last
+                                                        dx = last - env_prev_step_x[i_env]
+                                                        if env_prev_step_x[i_env] == 0 and last > 0 and dx == last:
+                                                            # 首次整体跳跃
+                                                            pass
+                                                        if dx > 0:
+                                                            distance_delta_sum += dx
+                                                            stagnation_steps[i_env] = 0
+                                                        else:
+                                                            stagnation_steps[i_env] += 1
+                                                        env_prev_step_x[i_env] = last
+                                            except Exception:
+                                                pass
+                                        # batched shaping: 可能是 list/tuple，每个元素为 dict
+                                        shaping_batch = infos.get("shaping")
+                                        if isinstance(shaping_batch, (list, tuple)) and len(shaping_batch) == cfg.env.num_envs:
+                                            for _i, sh in enumerate(shaping_batch):
+                                                if not isinstance(sh, dict):
+                                                    continue
+                                                try:
+                                                    raw_v = sh.get("raw")
+                                                    scaled_v = sh.get("scaled")
+                                                    scale_v = sh.get("scale")
+                                                    dx_v = sh.get("dx")
+                                                    if isinstance(raw_v, (int, float)):
+                                                        shaping_raw_sum += float(raw_v)
+                                                        shaping_last_raw = float(raw_v)
+                                                    if isinstance(scaled_v, (int, float)):
+                                                        shaping_scaled_sum += float(scaled_v)
+                                                        shaping_last_scaled = float(scaled_v)
+                                                    if isinstance(scale_v, (int, float)):
+                                                        shaping_last_scale = float(scale_v)
+                                                    if isinstance(dx_v, (int, float)):
+                                                        shaping_last_dx = float(dx_v)
+                                                except Exception:
+                                                    shaping_parse_fail += 1
+                    except Exception:
+                        pass
                     reward_cpu = _to_cpu_tensor(reward_np, dtype=torch.float32)
                     done_cpu = _to_cpu_tensor(done.astype(np.float32), dtype=torch.float32)
                     rollout.insert(step, obs_cpu, actions_cpu, log_probs_cpu, reward_cpu, values_cpu, done_cpu)
@@ -1398,6 +1724,17 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 writer.add_scalar("Loss/per", loss_per, global_step)
                 writer.add_scalar("Policy/entropy", entropy_val, global_step)
                 writer.add_scalar("LearningRate", lr_value, global_step)
+                # 进度统计
+                try:
+                    mean_x = float(np.mean(env_last_x))
+                    max_x = int(np.max(env_max_x))
+                    writer.add_scalar("Env/mean_x_pos", mean_x, global_step)
+                    writer.add_scalar("Env/max_x_pos", max_x, global_step)
+                    writer.add_scalar("Env/distance_delta_sum", float(distance_delta_sum), global_step)
+                    writer.add_scalar("Env/shaping_raw_sum", float(shaping_raw_sum), global_step)
+                    writer.add_scalar("Env/shaping_scaled_sum", float(shaping_scaled_sum), global_step)
+                except Exception:
+                    pass
                 writer.add_scalar("Reward/avg_return", avg_return, global_step)
                 writer.add_scalar("Reward/p50", p50, global_step)
                 writer.add_scalar("Reward/p90", p90, global_step)
@@ -1411,6 +1748,11 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     f"steps/s={env_steps_per_sec:.1f} upd/s={updates_per_sec:.2f} "
                     f"update={total_update_time:.1f}s rollout={rollout_duration:.1f}s learn={learn_duration:.1f}s"
                 )
+                if update_idx == global_update:
+                    try:
+                        print(f"[train][debug] first_log distance_delta_sum={distance_delta_sum} env_last_x={env_last_x.tolist()} env_prev_step_x={env_prev_step_x.tolist()}")
+                    except Exception:
+                        pass
 
                 metrics_entry = {
                     "timestamp": time.time(),
@@ -1437,7 +1779,33 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     "update_time": total_update_time,
                     "rollout_time": rollout_duration,
                     "learn_time": learn_duration,
+                    "env_mean_x_pos": float(np.mean(env_last_x)) if env_last_x.size else 0.0,
+                    "env_max_x_pos": int(np.max(env_max_x)) if env_max_x.size else 0,
+                    "env_distance_delta_sum": int(distance_delta_sum),
+                    "env_shaping_raw_sum": float(shaping_raw_sum),
+                    "env_shaping_scaled_sum": float(shaping_scaled_sum),
+                    "env_shaping_last_dx": float(shaping_last_dx),
+                    "env_shaping_last_scale": float(shaping_last_scale),
+                    "env_shaping_last_raw": float(shaping_last_raw),
+                    "env_shaping_last_scaled": float(shaping_last_scaled),
+                    "env_shaping_parse_fail": int(shaping_parse_fail),
                 }
+                # 若存在 forward 探测结果，仅在首个 log 写入一次（前 8 个）
+                if forward_probe_result is not None and update_idx == global_update:
+                    for i, (aid, dx_probe, last_x_probe) in enumerate(forward_probe_result[:8]):
+                        metrics_entry[f"probe_action_{i}_id"] = aid
+                        metrics_entry[f"probe_action_{i}_dx"] = dx_probe
+                        metrics_entry[f"probe_action_{i}_last_x"] = last_x_probe
+                    metrics_entry["probe_forward_action_selected"] = int(getattr(args, 'forward_action_id', -1) if getattr(args, 'forward_action_id', None) is not None else -1)
+                # 动作直方图（写入前 16 个 bins）
+                try:
+                    total_actions = int(action_hist.sum())
+                    if total_actions > 0:
+                        for aid in range(min(16, action_hist.shape[0])):
+                            if action_hist[aid] > 0:
+                                metrics_entry[f"action_freq_{aid}"] = float(action_hist[aid]) / total_actions
+                except Exception:
+                    pass
                 # 如果当前轮进行了 PER 抽样，添加采样耗时指标
                 if per_buffer is not None:
                     if update_idx % cfg.replay.per_sample_interval == 0:
@@ -1479,6 +1847,31 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
                 if wandb_run is not None:
                     wandb_run.log({**metrics_entry})
+                # 每次 log 后清空按 update 统计的累计量（下一次 update 重新积累）
+                distance_delta_sum = 0
+                shaping_raw_sum = 0.0
+                shaping_scaled_sum = 0.0
+                shaping_last_dx = 0.0
+                shaping_last_scale = 0.0
+                shaping_last_raw = 0.0
+                shaping_last_scaled = 0.0
+                shaping_parse_fail = 0
+                action_hist[:] = 0
+                stagnation_steps[:] = 0
+                env_prev_step_x[:] = env_last_x
+                # 更新级别停滞检测（基于全局 max）
+                try:
+                    global_max_now = int(env_max_x.max())
+                    if global_max_now > prev_global_max_x:
+                        prev_global_max_x = global_max_now
+                        stagnation_update_counter = 0
+                    else:
+                        stagnation_update_counter += 1
+                        if stagnation_warn_updates > 0 and stagnation_update_counter >= stagnation_warn_updates:
+                            print(f"[train][warn] Progress stagnation: no global max_x improvement for {stagnation_update_counter} updates (max_x={prev_global_max_x}).")
+                            stagnation_update_counter = 0  # 重置避免刷屏
+                except Exception:
+                    pass
 
                 # Resource monitoring: GPU/CPU/memory
                 def _get_resource_stats():
@@ -1601,18 +1994,42 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 save_model_snapshot(cfg, model, global_step, update_idx)
                 print("[train] latest snapshot refreshed")
                 heartbeat.notify(phase="checkpoint", message="最新快照已更新", progress=False)
+        # 首次 update 完成后做一次 debug 打印（仅一次）
+        if update_idx == global_update:
+            try:
+                mean_x_dbg = float(np.mean(env_last_x))
+                print(f"[train][debug] first_update_post_learn global_step={global_step} mean_x={mean_x_dbg:.1f} max_x={int(env_max_x.max())} distance_delta_sum={distance_delta_sum}")
+            except Exception:
+                pass
     except KeyboardInterrupt:
         print("[train][warn] interrupted by user, attempting graceful shutdown & latest snapshot save")
         heartbeat.notify(phase="interrupt", message="收到中断信号，保存最新模型", progress=False)
         try:
-            save_model_snapshot(cfg, model, global_step, update_idx)  # type: ignore[name-defined]
+            snap_path = save_model_snapshot(cfg, model, global_step, update_idx)  # type: ignore[name-defined]
+            # 更新 metadata reason=interrupt
+            try:
+                meta_file = snap_path.with_suffix('.json')
+                if meta_file.exists():
+                    meta = json.loads(meta_file.read_text(encoding='utf-8'))
+                    meta['save_state']['reason'] = 'interrupt'
+                    meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+            except Exception:
+                pass
         except Exception as exc:  # noqa: BLE001
             print(f"[train][error] failed to save latest snapshot on interrupt: {exc}")
     except Exception as exc:  # pragma: no cover - 异常捕获仅日志
         print(f"[train][error] unexpected exception: {exc}")
         heartbeat.notify(phase="error", message=str(exc), progress=False)
         try:
-            save_model_snapshot(cfg, model, global_step, update_idx)  # type: ignore[name-defined]
+            snap_path = save_model_snapshot(cfg, model, global_step, update_idx)  # type: ignore[name-defined]
+            try:
+                meta_file = snap_path.with_suffix('.json')
+                if meta_file.exists():
+                    meta = json.loads(meta_file.read_text(encoding='utf-8'))
+                    meta['save_state']['reason'] = 'exception'
+                    meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+            except Exception:
+                pass
             print("[train][info] latest snapshot saved after exception")
         except Exception as exc2:  # noqa: BLE001
             print(f"[train][error] failed to save snapshot after exception: {exc2}")

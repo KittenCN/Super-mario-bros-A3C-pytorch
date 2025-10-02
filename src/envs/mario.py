@@ -59,24 +59,26 @@ import sys, io
 _saved_stderr = sys.stderr
 try:
     sys.stderr = io.StringIO()
-    from gymnasium_super_mario_bros import make as mario_make  # type: ignore
-    from gymnasium_super_mario_bros.actions import (  # type: ignore
-        RIGHT_ONLY,
-        SIMPLE_MOVEMENT,
-        COMPLEX_MOVEMENT,
-    )
-    from gymnasium_super_mario_bros._roms import rom_path as mario_rom_path  # type: ignore
-    _MARIO_PACKAGE = "gymnasium-super-mario-bros"
-except ImportError:
     try:
-        from gym_super_mario_bros import make as mario_make  # type: ignore
-        from gym_super_mario_bros.actions import RIGHT_ONLY, SIMPLE_MOVEMENT, COMPLEX_MOVEMENT  # type: ignore
-        from gym_super_mario_bros._roms import rom_path as mario_rom_path  # type: ignore
-        _MARIO_PACKAGE = "gym-super-mario-bros"
-    except ImportError as err:  # pragma: no cover
-        raise RuntimeError(
-            "Install gymnasium-super-mario-bros>=0.8.0 or gym-super-mario-bros>=7.4.0"
-        ) from err
+        from gymnasium_super_mario_bros import make as mario_make  # type: ignore
+        from gymnasium_super_mario_bros.actions import (  # type: ignore
+            RIGHT_ONLY,
+            SIMPLE_MOVEMENT,
+            COMPLEX_MOVEMENT,
+        )
+        from gymnasium_super_mario_bros._roms import rom_path as mario_rom_path  # type: ignore
+        _MARIO_PACKAGE = "gymnasium-super-mario-bros"
+    except ImportError:
+        try:
+            from gym_super_mario_bros import make as mario_make  # type: ignore
+            from gym_super_mario_bros.actions import RIGHT_ONLY, SIMPLE_MOVEMENT, COMPLEX_MOVEMENT  # type: ignore
+            from gym_super_mario_bros._roms import rom_path as mario_rom_path  # type: ignore
+            _MARIO_PACKAGE = "gym-super-mario-bros"
+        except ImportError:
+            # 不再立即抛出：允许 fc_emulator-only 模式; 具体缺失在后续需要创建 nes_py 版环境时再报错
+            mario_make = None  # type: ignore
+            RIGHT_ONLY = SIMPLE_MOVEMENT = COMPLEX_MOVEMENT = None  # type: ignore
+            mario_rom_path = None  # type: ignore
 finally:
     sys.stderr = _saved_stderr
 
@@ -218,10 +220,36 @@ _patch_nes_py_ram_dtype()
 from .wrappers import MarioRewardWrapper, ProgressInfoWrapper, RewardConfig, TransformObservation, TransformReward
 
 
+EXTENDED_MOVEMENT: Optional[Sequence[Sequence[str]]] = None
+try:
+    # 构造一个包含 START / RIGHT / A / B 组合的扩展集合（去重）
+    base_ext = [
+        (),
+        ("START",),
+        ("RIGHT",),
+        ("RIGHT", "B"),
+        ("RIGHT", "A"),
+        ("RIGHT", "A", "B"),
+        ("START", "RIGHT"),
+        ("START", "RIGHT", "B"),
+    ]
+    # 规范化为元组
+    uniq = []
+    seen = set()
+    for c in base_ext:
+        tup = tuple(c)
+        if tup not in seen:
+            uniq.append(tup)
+            seen.add(tup)
+    EXTENDED_MOVEMENT = tuple(uniq)
+except Exception:
+    EXTENDED_MOVEMENT = None
+
 _ACTION_SPACES = {
     "right": RIGHT_ONLY,
     "simple": SIMPLE_MOVEMENT,
     "complex": COMPLEX_MOVEMENT,
+    "extended": EXTENDED_MOVEMENT,
 }
 
 
@@ -441,7 +469,27 @@ def _make_fc_emulator_env(config: MarioEnvConfig) -> "gym.Env":
         _FC_STAGE_WARNING_EMITTED = True
 
     combos = _convert_action_set(_select_actions(config.action_type))
-    rom_file = mario_rom_path(False, "vanilla")
+
+    def _resolve_rom() -> str:
+        # 优先环境变量指定 ROM
+        env_rom = os.environ.get("MARIO_ROM")
+        if env_rom and Path(env_rom).exists():
+            return env_rom
+        # 尝试安装包提供的 rom 路径
+        if 'mario_rom_path' in globals() and callable(mario_rom_path):  # type: ignore[name-defined]
+            try:
+                return mario_rom_path(False, "vanilla")  # type: ignore[operator]
+            except Exception:
+                pass
+        # 常见本地路径
+        for cand in ["./roms/smb.nes", "./roms/SuperMarioBros.nes", "./SuperMarioBros.nes"]:
+            if Path(cand).exists():
+                return cand
+        raise RuntimeError(
+            "无法定位 ROM: 未安装 gym-super-mario-bros 且未设置 MARIO_ROM; 请放置 ROM 到 ./roms/ 或设置环境变量 MARIO_ROM 指向 .nes 文件"
+        )
+
+    rom_file = _resolve_rom()
 
     base_env = NESGymEnv(
         rom_file,
@@ -452,6 +500,10 @@ def _make_fc_emulator_env(config: MarioEnvConfig) -> "gym.Env":
     )
 
     env: "gym.Env" = DiscreteActionWrapper(base_env, action_set=combos)
+    try:
+        setattr(env, "_action_combos", combos)
+    except Exception:
+        pass
     env = ProgressInfoWrapper(env)
     env = MarioRewardWrapper(env, config.reward_config)
     env = gym.wrappers.ResizeObservation(env, (84, 84))
@@ -563,8 +615,14 @@ def _make_single_env(
                 _diag("fc_env_ready")
             except Exception as exc:
                 _diag(f"fc_env_error:{repr(exc)}")
-                raise
-        else:
+                # 若 fc 模式失败且 NES/Gym 包存在，尝试回退
+                if mario_make is None:
+                    raise
+                else:
+                    _diag("fallback_to_gym_package")
+                    # 继续走下方 else 分支逻辑创建经典环境
+                    env = None
+        if env is None:
             # Eagerly import modules that may block during first-use and log timings
             try:
                 _diag("import_start_gsm")
@@ -574,6 +632,8 @@ def _make_single_env(
                 _diag("import_done_gsm")
             except Exception as e:
                 _diag(f"import_gsm_error:{repr(e)}")
+                if mario_make is None:
+                    raise RuntimeError("缺少 gym-super-mario-bros 包且 fc_emulator 初始化失败，无法创建环境。") from e
 
             lock_fd = None
             try:
