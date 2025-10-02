@@ -9,6 +9,7 @@ The format roughly follows Keep a Changelog and SemVer (future releases). Date f
 - `tests/test_shaping_smoke.py` 最小奖励塑形 & 距离增量烟雾测试，捕获首个正向位移，防止回归。
 - 文档：`docs/WARNINGS_POLICY.md` 记录测试告警治理策略。
 - README 增补 smoke 测试运行示例与告警抑制说明。
+- `scripts/auto_phase_training.sh` 三阶段自动训练脚本（支持 DRY_RUN / 跳过 / 强制重跑 / 自定义附加变量）。
 
 ### Changed
 - `scripts/run_2080ti_resume.sh` 支持 `LOG_INTERVAL` 环境变量，利于高频 metrics 输出与测试。

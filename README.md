@@ -103,6 +103,23 @@ If the sidecar metadata JSON is missing, `test.py` will reconstruct it from the 
 	```
 	推荐：初次跑在 extended 动作集合中结合 `--reward-distance-weight 0.05`；脚本阶段结束后正常策略接管。
 
+### 分阶段自动训练 | Automated Phase Training
+使用 `scripts/auto_phase_training.sh` 一键跑完 Phase1(bootstrap) -> Phase2(main) -> Phase3(refine)：
+```bash
+# 预览命令 (不真正训练)
+DRY_RUN=1 bash scripts/auto_phase_training.sh
+
+# 实际执行（默认三阶段：2000 -> 30000 -> 50000 updates）
+bash scripts/auto_phase_training.sh
+
+# 仅运行 Phase1
+SKIP_PHASE2=1 SKIP_PHASE3=1 bash scripts/auto_phase_training.sh
+
+# 强制重跑 Phase2 并追加自定义变量
+FORCE_PHASE2=1 PHASE2_EXTRA="NO_COMPILE=1" bash scripts/auto_phase_training.sh
+```
+生成的每阶段目录下写入 `.phase_done` 记录本阶段 meta，脚本可重入并跳过已完成阶段。用户可通过 `PHASE*_RUN / PHASE*_UPDATES / PHASE*_DISTANCE_WEIGHT` 等变量覆盖，详见脚本顶部注释。
+
 ## 项目结构 | Project Structure
 - `src/envs/`：环境工厂、奖励塑形、帧处理、录像封装。<br>`src/envs/`: environment factories, reward shaping, frame processing, video wrappers.
 - `src/models/`：IMPALA 残差块、序列模块、NoisyLinear 组件。<br>`src/models/`: IMPALA residual blocks, sequence modules, and NoisyLinear components.
