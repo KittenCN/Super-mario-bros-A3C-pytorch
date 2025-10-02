@@ -1,8 +1,6 @@
 __pycache__/
-runs/
-tensorboard/
-trained_models/
 output/
 .ipynb_checkpoints/
 *.pyc
 *.pyo
+*.pt
