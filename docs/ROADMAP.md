@@ -16,9 +16,9 @@
 | P0-1 | 历史 checkpoint global_step=0 回填 | 旧 overlap 期间保存的 ckpt 步数缺失，影响统计/调度 | 学习率调度、曲线对齐失真 | P0 | 已完成 |
 | P0-2 | 训练中断安全退出一致性 | Ctrl+C 或 OOM 后是否完整 flush / 关闭 monitor / 保存 latest | 可能丢失进度 / 文件句柄未关 | P0 | 已完成 |
 | P1-1 | metrics JSONL 结构化输出 | 当前依赖 stdout + (TB 目录为空问题)，缺少稳健数值日志 | 难以离线分析 | P1 | 1–2 天 |
-| P1-2 | TensorBoard 事件空目录调查 | 事件文件未生成 / writer 初始化逻辑验证 | 可视化受阻 | P1 | 1–2 天 |
+| P1-2 | TensorBoard 事件空目录调查 | 事件文件未生成 / writer 初始化逻辑验证 | 可视化受阻 | P1 | 进行中 (初步标记完成) |
 | P1-3 | Overlap 模式性能基线基准 | 对比 overlap=on/off steps/s、GPU 利用率 | 不知真实收益 | P1 | 2 天 |
-| P1-4 | PER 填充率与命中率监控 | 记录 size/capacity、采样重复率 | 难调优 | P1 | 1 天 |
+| P1-4 | PER 填充率与命中率监控 | 记录 size/capacity、采样重复率 | 难调优 | P1 | 已部分完成 |
 | P1-5 | 慢 step 溯源增强 | 当前仅打印耗时 > 阈值，未记录堆栈 | 定位 IO / 环锁慢点困难 | P1 | 2 天 |
 | P2-1 | Checkpoint 回填脚本 & 自动迁移 | 单次运行修正所有 metadata JSON | 提升一致性 | P2 | 1 天 |
 | P2-2 | Replay FP16 优势/价值存储 | 进一步减内存 (adv/value) 约 2x | 降低内存峰值 | P2 | 1–2 天 |
@@ -34,8 +34,8 @@
 ## 2. 立即执行 (T0, 本周内)
 1. (已完成) global_step 回填脚本：扫描 `trained_models`，`global_step==0 && global_update>0` 按公式修正，并写入审计字段。
 2. (已完成) 训练主循环异常安全：异常中断保存 latest + 清理资源。
-3. metrics JSONL：在每次 log_interval 写入结构化记录（含 env_steps/s、updates/s、replay_fill_rate、RSS、GPU mem）。
-4. TensorBoard 空目录诊断：添加调试日志（writer 实例化成功标记 / 路径）并验证写事件调用。
+3. (部分完成) metrics JSONL：已写入核心损失、速度、replay 填充与唯一率；后续补充 GPU util 聚合/分位指标。
+4. (初步完成) TensorBoard 空目录诊断：启动打印 log_dir 并写入 meta/started 标签；待验证空目录场景复现原因。
 
 ## 3. 短期 (T1, 下 1–2 周)
 1. Overlap 性能基准：脚本 `scripts/benchmark_overlap.py`，多组 (num_envs, rollout) 对照，输出 CSV。

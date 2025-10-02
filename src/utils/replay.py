@@ -71,6 +71,24 @@ class PrioritizedReplay:
         self.pos = 0
         self.size = 0
         self.step = 0
+        # 统计数据
+        self.sample_calls = 0
+        self.sample_size_accum = 0
+        self.last_sample_unique_ratio = 0.0
+        self.push_total = 0
+
+    def stats(self) -> dict:
+        """返回环形缓冲统计信息，用于日志输出。"""
+        fill_rate = float(self.size) / float(self.capacity) if self.capacity > 0 else 0.0
+        avg_batch = (self.sample_size_accum / self.sample_calls) if self.sample_calls > 0 else 0.0
+        return {
+            "capacity": int(self.capacity),
+            "size": int(self.size),
+            "fill_rate": fill_rate,
+            "avg_sample_batch": float(avg_batch),
+            "last_sample_unique_ratio": float(self.last_sample_unique_ratio),
+            "push_total": int(self.push_total),
+        }
 
     # ----------------- 内部工具 -----------------
     def _maybe_alloc(self, observations: torch.Tensor):
@@ -163,6 +181,7 @@ class PrioritizedReplay:
                 self.priorities[self.pos] = float(prio[i]) + 1e-5
                 self.pos = (self.pos + 1) % self.capacity
                 self.size = min(self.size + 1, self.capacity)
+            self.push_total += B
 
     def sample(self, batch_size: int) -> Optional[ReplaySample]:
         if self.size < batch_size or self.obs_storage is None:
@@ -191,6 +210,11 @@ class PrioritizedReplay:
         advantages = self.advantages[indices].to(self.device)  # type: ignore[index]
         weights_t = torch.tensor(weights, device=self.device, dtype=torch.float32)
         self.step += 1
+    # 更新唯一索引比例
+    unique = len(set(int(x) for x in indices.tolist()))
+    self.sample_calls += 1
+    self.sample_size_accum += batch_size
+    self.last_sample_unique_ratio = unique / float(batch_size)
         return ReplaySample(obs, actions, target_values, advantages, weights_t, indices)
 
     def update_priorities(self, indices: np.ndarray, priorities: torch.Tensor):

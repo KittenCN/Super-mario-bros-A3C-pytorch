@@ -834,6 +834,12 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         resume=bool(resume_path),
         enable_tb=bool(args.enable_tensorboard),
     )
+    try:
+        print(f"[train][log] tensorboard_log_dir={getattr(writer,'log_dir', getattr(writer,'_base',run_dir))}")
+        if args.enable_tensorboard:
+            writer.add_text("meta/started", datetime.now(UTC).isoformat(), 0)
+    except Exception:
+        pass
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
     maybe_save_config(cfg, args.config_out)
     heartbeat.notify(phase="日志", message="日志与保存目录已就绪", progress=False)
@@ -1295,6 +1301,22 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 "rollout_time": rollout_duration,
                 "learn_time": learn_duration,
             }
+
+            # PER stats (if enabled)
+            if per_buffer is not None:
+                rstats = per_buffer.stats()
+                metrics_entry.update({
+                    "replay_size": rstats["size"],
+                    "replay_capacity": rstats["capacity"],
+                    "replay_fill_rate": rstats["fill_rate"],
+                    "replay_last_unique_ratio": rstats["last_sample_unique_ratio"],
+                })
+                try:
+                    writer.add_scalar("Replay/fill_rate", rstats["fill_rate"], global_step)
+                    writer.add_scalar("Replay/last_unique_ratio", rstats["last_sample_unique_ratio"], global_step)
+                    writer.add_scalar("Replay/size", rstats["size"], global_step)
+                except Exception:
+                    pass
 
             if wandb_run is not None:
                 wandb_run.log({**metrics_entry})

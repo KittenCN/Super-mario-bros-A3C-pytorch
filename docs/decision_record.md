@@ -16,6 +16,7 @@
 8. 自适应显存运行脚本 (Adaptive memory launcher)
 9. 历史 checkpoint global_step 回填 (Global step backfill)
 10. 训练安全退出与最新快照保障 (Safe shutdown & snapshot)
+11. P1 指标体系初始实现 (Metrics JSONL + Replay stats + TB 诊断)
 
 ---
 ## 1. 环境构建可观测性增强
@@ -128,6 +129,15 @@
 - 风险 | Risk: 若历史 rollout_steps 与假设不符将产生系统性偏移；在追踪字段中记录方便后续二次迁移；可通过 `.bak` 还原。
 
 ## 10. 训练安全退出与最新快照保障
+-## 11. P1 指标体系初始实现
+- 问题 | Problem: 仅 stdout 文本日志，后期分析困难；Replay 使用情况缺乏可视化；TB 目录偶尔出现空目录难以判定是否正常初始化。
+- 决策 | Decision: 增加结构化 JSONL (已有 metrics.jsonl)、PER 填充与唯一率指标、TB writer 初始化标记 (add_text meta/started)。
+- 实施 | Implementation: 
+  - 在 `train.py` log_interval 分支写入 `replay_fill_rate`, `replay_last_unique_ratio`。
+  - `replay.py` 增加 stats()；采样时更新唯一率；push 计数。
+  - 训练启动打印 `[train][log] tensorboard_log_dir=...` 并在 TB (开启时) 写入 `meta/started`。
+- 验证 | Validation: 本地运行最少若干 update 后 metrics.jsonl 含新字段；TB 目录出现 events 文件且 meta/started 文本标签存在；控制台打印 log_dir。
+- 后续 | Next: 增加 GPU util (平均/峰值) 汇总字段；补充历史 episode return 分位数；对 metrics schema 编写文档。
 - 问题 | Problem: 训练过程遇到 Ctrl+C / 异常 / 外部终止时，可能未保存最新模型或未停止监控线程，造成资源泄露或进度丢失。
 - 备选 | Alternatives:
   - J1: 保持现有隐式清理（风险高）。
