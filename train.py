@@ -273,12 +273,47 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     return train_cfg
 
 
-def prepare_model(cfg: TrainingConfig, action_space: int, device: torch.device) -> MarioActorCritic:
+def prepare_model(cfg: TrainingConfig, action_space: int, device: torch.device, compile_now: bool = True) -> MarioActorCritic:
+    """构造并可选编译模型。
+
+    当需要从 checkpoint 恢复时，先不编译（compile_now=False），待权重加载完再尝试 torch.compile，
+    避免 `_orig_mod.` 前缀差异导致加载失败。
+    """
     model_cfg = dataclasses.replace(cfg.model, action_space=action_space, input_channels=cfg.model.input_channels)
     model = MarioActorCritic(model_cfg).to(device)
-    if cfg.compile_model and hasattr(torch, "compile"):
-        model = torch.compile(model)  # type: ignore[attr-defined]
+    if compile_now and cfg.compile_model and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model)  # type: ignore[attr-defined]
+        except Exception as e:  # pragma: no cover
+            print(f"[train][warn] torch.compile 失败，继续使用未编译模型: {e}")
     return model
+
+
+def _raw_module(mod: nn.Module) -> nn.Module:
+    """若是 torch.compile OptimizedModule，返回其 `_orig_mod`。"""
+    if hasattr(mod, "_orig_mod"):
+        try:
+            return getattr(mod, "_orig_mod")
+        except Exception:
+            return mod
+    return mod
+
+
+def _flex_load_state_dict(model: nn.Module, state: dict) -> list[str]:
+    """灵活加载 state_dict，自动适配是否带 `_orig_mod.` 前缀。返回问题键列表。"""
+    model_keys = set(model.state_dict().keys())
+    state_keys = set(state.keys())
+    model_prefixed = any(k.startswith("_orig_mod.") for k in model_keys)
+    state_prefixed = any(k.startswith("_orig_mod.") for k in state_keys)
+    adj = state
+    if model_prefixed and not state_prefixed:
+        adj = {f"_orig_mod.{k}": v for k, v in state.items()}
+    elif not model_prefixed and state_prefixed:
+        adj = {k[len("_orig_mod."):]: v for k, v in state.items() if k.startswith("_orig_mod.")}
+    missing, unexpected = model.load_state_dict(adj, strict=False)
+    issues: list[str] = list(missing)
+    issues.extend([f"unexpected:{u}" for u in unexpected])
+    return issues
 
 
 def compute_returns(
@@ -536,8 +571,9 @@ def save_checkpoint(
     base_dir = Path(cfg.save_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = base_dir / f"{_checkpoint_stem(cfg)}_{update_idx:07d}.pt"
+    base_model_for_save = _raw_module(model)
     payload = {
-        "model": model.state_dict(),
+        "model": base_model_for_save.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
@@ -574,8 +610,9 @@ def save_model_snapshot(
     base_dir = Path(cfg.save_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
     snapshot_path = base_dir / f"{_checkpoint_stem(cfg)}_latest.pt"
+    base_model_for_save = _raw_module(model)
     snap_payload = {
-        "model": model.state_dict(),
+        "model": base_model_for_save.state_dict(),
         "global_step": global_step,
         "global_update": update_idx,
         "config": dataclasses.asdict(cfg),  # latest 同样带 config
@@ -819,7 +856,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
     action_space = env.single_action_space.n
     cfg.model = dataclasses.replace(cfg.model, action_space=action_space, input_channels=env.single_observation_space.shape[0])
-    model = prepare_model(cfg, action_space, device)
+    model = prepare_model(cfg, action_space, device, compile_now=False)
     # Single-GPU / CPU path: model is already moved to device in prepare_model
     model.train()
 
@@ -949,7 +986,19 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         checkpoint = torch.load(resume_path, map_location=device)
         missing_warn: List[str] = []
         try:
-            model.load_state_dict(checkpoint["model"])
+            issues = _flex_load_state_dict(model, checkpoint["model"])
+            if issues:
+                # 控制台只输出前若干，避免噪声
+                print(f"[train][warn] flexible load issues: {issues[:8]}{'...' if len(issues)>8 else ''}")
+                # 写入详细列表到独立日志文件（幂等追加）
+                try:
+                    issues_path = Path(run_dir) / "state_dict_load_issues.log"
+                    with issues_path.open("a", encoding="utf-8") as fp:
+                        fp.write(f"# {datetime.now(UTC).isoformat()} resume={resume_path}\n")
+                        for it in issues:
+                            fp.write(it + "\n")
+                except Exception as _werr:  # noqa: BLE001
+                    print(f"[train][warn] failed to write issues log: {_werr}")
         except Exception as e:
             raise RuntimeError(f"Failed to load model state_dict from {resume_path}: {e}")
         for key, loader in (
@@ -976,6 +1025,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     last_log_update = global_update
     last_log_time = time.time()
 
+    # 加载完成后再尝试编译
+    if cfg.compile_model and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model)  # type: ignore[attr-defined]
+            print("[train][info] model compiled after weight load")
+        except Exception as e:  # pragma: no cover
+            print(f"[train][warn] post-load compile 失败，将继续使用未编译模型: {e}")
     overlap_enabled = bool(getattr(args, "overlap_collect", False)) and not cfg.env.asynchronous
     # 只在同步向量环境下尝试重叠，异步环境不启用（避免复杂性）
     if overlap_enabled:
@@ -1360,6 +1416,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     "timestamp": time.time(),
                     "update": update_idx,
                     "global_step": global_step,
+                    "model_compiled": 1 if hasattr(model, "_orig_mod") else 0,
                     "loss_total": loss_total,
                     "loss_policy": loss_policy,
                     "loss_value": loss_value,

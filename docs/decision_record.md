@@ -192,6 +192,22 @@
 - 风险 | Risk: FP16 存储可能引入极端大/小优势截断；后续需在高方差场景监控数值稳定性（可加入单元测试对比 FP32/FP16 KL）。
 - 后续 | Next: 计划添加自动化测试：填充随机数据后对比采样输出统计均值/方差在 FP32 与 FP16 模式差异阈值内 (<1e-3 相对误差)。
 
+## 16. 编译模型与 checkpoint 兼容性（延迟编译 + 灵活 state_dict 加载）
+- 问题 | Problem: 旧 checkpoint 在未编译模型下保存（键名无 `_orig_mod.` 前缀），而运行时若先执行 `torch.compile`，新模型的 `state_dict` 键空间包含 `_orig_mod.*`，直接 `load_state_dict` 会出现大量 Missing/Unexpected key 错误导致恢复失败。
+- 备选 | Alternatives:
+  - K1: 强制要求用户用一致版本（文档提示，不修改代码）。
+  - K2: 保存与加载时始终对键进行映射（可能引入额外拷贝开销）。
+  - K3: 延迟编译：恢复阶段先加载未编译模型再尝试编译；同时实现双向前缀自适应加载。
+- 决策 | Decision: 采用 K3，最小化对现有保存格式的破坏，并兼容历史文件。仅在加载成功后尝试 `torch.compile`，失败则降级继续。
+- 实施 | Implementation:
+  1. 新增 `_flex_load_state_dict()`：检测模型和 checkpoint 各自是否带 `_orig_mod.` 前缀，必要时添加或剥离后再以 `strict=False` 加载，收集 missing/unexpected 列表用于日志。
+  2. 新增 `_raw_module()`：保存 checkpoint 与 snapshot 时若模型已编译，取内部 `_orig_mod` 的 `state_dict()`，保证输出与历史未编译格式一致。
+  3. `prepare_model(..., compile_now=False)` 在构造阶段接受延迟编译标志；恢复完成后再尝试编译并打印成功/失败提示。
+  4. 更新 `save_checkpoint` / `save_model_snapshot` 使用 `_raw_module` 提取底层权重。
+- 验证 | Validation: 人工构造已编译与未编译两种运行模式，保存 checkpoint 后在另一模式下恢复：日志仅出现少量 `flexible load issues`（或无），训练继续；单元测试（replay 相关）通过。
+- 风险 | Risk: 后续若引入自定义包装器改变属性名（非 `_orig_mod`）需扩展映射；`strict=False` 可能掩盖真实结构性不兼容（通过日志截断提示缓解）。
+- 后续 | Next: 计划加入单元测试：构造一个模型 -> 保存 -> 模拟编译版本加载 / 去编译版本加载，断言参数 tensor 总数与哈希一致；并在 metrics 中记录 `model_compiled=0/1` 便于实验追踪。
+
 
 ---
 ## 验证与状态 | Validation & Status

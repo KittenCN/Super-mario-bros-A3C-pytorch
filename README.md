@@ -30,6 +30,12 @@ tensorboard --logdir tensorboard/a3c_super_mario_bros
 
 # 超参搜索示例 | Hyper-parameter search example
 python scripts/optuna_search.py --trials 5
+
+# 检查 checkpoint 元信息 (模型是否编译保存 / replay 配置 / 参数统计)
+python scripts/inspect_checkpoint.py --ckpt trained_models/run01/a3c_world1_stage1_latest.pt
+
+# 关闭 torch.compile 与 overlap（调试/基线）
+DISABLE_OVERLAP=1 NO_COMPILE=1 bash scripts/run_2080ti_resume.sh --dry-run
 ```
 
 > **提示 | Tip**：默认依赖 `torch>=2.1`。如改用 `gymnasium-super-mario-bros`，请同步调整 `requirements.txt`。<br>Default dependency targets `torch>=2.1`. If you switch to `gymnasium-super-mario-bros`, update `requirements.txt` accordingly.
