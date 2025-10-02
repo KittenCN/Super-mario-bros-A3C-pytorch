@@ -8,6 +8,8 @@
 Replay (PER): replay_size, replay_capacity, replay_fill_rate, replay_last_unique_ratio, replay_avg_unique_ratio, replay_push_total
 资源: resource.* (GPU/CPU/Mem) + gpu_util_last, gpu_util_mean_window (最近100快照均值)
 
+后台监控线程 (`src/utils/monitor.py`) 也会向同一 `metrics.jsonl` 追加仅包含 `{"timestamp": ..., "monitor": {...}}` 的记录，这些行没有 `global_step/update` 字段；进行训练指标聚合时需过滤或与主线程写入区分。
+
 新增/关联字段（2025-10-02 更新）:
 - per_sample_interval: 来自 checkpoint 元数据的抽样频率策略（非 metrics 行内字段，但分析时应读取 checkpoint JSON 以还原训练语义）。
 - replay_priority_mean/p50/p90/p99: 已在日志中输出，用于监控优先级分布是否塌缩。

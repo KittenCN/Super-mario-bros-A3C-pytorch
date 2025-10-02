@@ -26,6 +26,7 @@
 18. 脚本化前进与动作探测 (Scripted progression & forward action probing)
 19. RAM x_pos 回退解析与 shaping 诊断 (RAM fallback parsing)
 20. 运行脚本参数扩展与原子写 (Launcher extension & atomic writes)
+21. PER 间隔推送缺陷诊断 (PER interval push regression)
 
 ---
 ## 1. 环境构建可观测性增强
@@ -241,6 +242,14 @@
 - 实施 | Implementation: 加入 `REWARD_DISTANCE_WEIGHT` 等变量；构建命令时仅在非空时追加；保存函数写 `_tmp` 后 rename；异常捕获分支调用 snapshot。
 - 验证 | Validation: dry-run 展示附加 CLI；故意 Ctrl+C 后 latest.* 存在且完整；metrics 中 model_compiled 可正确反映编译状态。
 - 风险 | Risk: 变量过多增加脚本复杂性；通过注释及默认留空减少心智负担。
+
+
+## 21. PER 间隔推送缺陷诊断 (PER interval push regression)
+- 问题 | Problem: 训练循环内 `per_buffer.push()` 与抽样同条件绑定，`per_sample_interval>1` 时非抽样轮的 rollout 数据被跳过，replay 实际容量远低于预期。
+- 证据 | Evidence: `train.py` 第 1610 行起仅在 `update_idx % interval == 0` 分支 push；`tensorboard/a3c_super_mario_bros/20251002-125353/metrics.jsonl` 中 `replay_push_total` 始终等于单批 640；`trained_models/run_balanced` checkpoint 元数据展示 `replay_size` 长期停留在 640。
+- 影响 | Impact: 优先级分布高度稀疏，`replay_fill_rate` 停滞，TD 误差更新失真，训练长时间维持 avg_return=0，SPS 也因 CPU 回放而波动。
+- 决策 | Decision: 拆分 push 与 sample，确保每次 update 都写入 PER；仅在满足间隔条件时执行采样与 priority 更新；同步补充单元测试覆盖 `per_sample_interval>1`。
+- 后续 | Next: 修复后回归 `metrics_summary.py` 输出，观测 `replay_push_total` 与 `global_step` 同步增长；文档强调 interval 仅控制抽样频率而非写入频次。
 
 
 ---
