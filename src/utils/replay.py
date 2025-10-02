@@ -230,8 +230,9 @@ class PrioritizedReplay:
         else:
             obs = obs_raw.to(self.device)
         actions = self.actions[indices].to(self.device)  # type: ignore[index]
-    target_values = self.target_values[indices].to(self.device).to(torch.float32)  # type: ignore[index]
-    advantages = self.advantages[indices].to(self.device).to(torch.float32)  # type: ignore[index]
+        # 修复：此前两行意外减少缩进导致函数体语法错误（IndentationError）
+        target_values = self.target_values[indices].to(self.device).to(torch.float32)  # type: ignore[index]
+        advantages = self.advantages[indices].to(self.device).to(torch.float32)  # type: ignore[index]
         weights_t = torch.tensor(weights, device=self.device, dtype=torch.float32)
         self.step += 1
         # 更新唯一索引比例

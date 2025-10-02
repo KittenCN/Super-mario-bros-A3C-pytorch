@@ -16,3 +16,6 @@ optuna>=3.3.0
 
 # Utilities
 ffmpeg-python>=0.2.0
+
+# Dev / Testing
+pytest>=7.4.0

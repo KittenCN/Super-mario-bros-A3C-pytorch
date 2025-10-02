@@ -85,6 +85,10 @@ If the sidecar metadata JSON is missing, `test.py` will reconstruct it from the 
 - 若异步环境构建出现超时或 `nes_py` 溢出，请参阅 `docs/ENV_DEBUGGING_REPORT.md`。<br>If async env construction times out or `nes_py` overflows occur, see `docs/ENV_DEBUGGING_REPORT.md`.
 - 可通过 `--sync-env` 或 `--force-sync` 暂时回退到同步向量环境以验证训练流程。<br>Temporarily fall back to synchronous vector envs using `--sync-env` or `--force-sync` to validate the training loop.
 - `--parent-prewarm`、`--parent-prewarm-all`、`--worker-start-delay` 有助于减少 NES 初始竞争。<br>`--parent-prewarm`, `--parent-prewarm-all`, and `--worker-start-delay` reduce NES initialisation contention.
+ - 异步模式需显式确认：即使传入 `--async-env` 仍需 `--confirm-async` 或设置 `MARIO_ENABLE_ASYNC=1` 才会真正启用，以避免误用不稳定路径。
+ - PER 回放：默认启用观测 uint8 压缩；`advantages`/`target_values` 使用 FP16 存储并在采样时转回 float32，若需关闭设 `MARIO_PER_FP16_SCALARS=0`。
+ - 2025-10-02 修复：`PrioritizedReplay.sample` 缩进错误导致的启动中止已修正，若你在此日期前拉取代码遇到 `IndentationError` 请更新到最新版本。
+ - Checkpoint 元数据现包含 `replay.per_sample_interval`，用于恢复时对齐 PER 抽样策略；所有 `.pt/.json` 采用原子写入减少半写风险。
 
 ### 2025-10-01 环境构建卡住问题修复摘要 | 2025-10-01 Env Construction Stall Fix Summary
 近期在同步模式（`async=False`）下出现长时间 “已连续 XXXs 无训练进度” 告警，经排查是缺乏逐子环境构建可见性难以快速定位。此次更新：<br>Recently synchronous runs (`async=False`) emitted prolonged "no training progress" warnings, traced to missing per-env construction visibility. This update adds:

@@ -354,6 +354,7 @@ def _build_checkpoint_metadata(
             "base_seed": vector_cfg.base_seed,
         },
         "model": dataclasses.asdict(cfg.model),
+        "replay": dataclasses.asdict(cfg.replay),  # 记录回放配置（含 per_sample_interval）
         "save_state": {
             "global_step": int(global_step),
             "global_update": int(update_idx),
@@ -384,7 +385,22 @@ def _json_default(obj):  # noqa: D401 - 简短工具函数
 def _write_metadata(base_path: Path, metadata: Dict[str, Any]) -> None:
     metadata_path = base_path.with_suffix(".json")
     payload = json.dumps(metadata, indent=2, ensure_ascii=False, default=_json_default)
-    metadata_path.write_text(payload, encoding="utf-8")
+    tmp_path = metadata_path.with_suffix(metadata_path.suffix + f".tmp_{os.getpid()}_{int(time.time()*1000)}")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fp:
+            fp.write(payload)
+            fp.flush()
+            try:
+                os.fsync(fp.fileno())  # 尽力刷盘
+            except Exception:
+                pass
+        os.replace(tmp_path, metadata_path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
 
 
 def load_checkpoint_metadata(path: Path) -> Dict[str, Any]:
@@ -529,7 +545,21 @@ def save_checkpoint(
         "global_update": update_idx,
         "config": dataclasses.asdict(cfg),
     }
-    torch.save(payload, checkpoint_path)
+    tmp_ckpt = checkpoint_path.with_suffix(checkpoint_path.suffix + f".tmp_{os.getpid()}_{int(time.time()*1000)}")
+    try:
+        torch.save(payload, tmp_ckpt)
+        try:
+            with open(tmp_ckpt, "rb") as fp:
+                os.fsync(fp.fileno())
+        except Exception:
+            pass
+        os.replace(tmp_ckpt, checkpoint_path)
+    finally:
+        try:
+            if tmp_ckpt.exists():
+                tmp_ckpt.unlink()
+        except Exception:
+            pass
     metadata = _build_checkpoint_metadata(cfg, global_step, update_idx, variant="checkpoint")
     _write_metadata(checkpoint_path, metadata)
     return checkpoint_path
@@ -544,14 +574,27 @@ def save_model_snapshot(
     base_dir = Path(cfg.save_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
     snapshot_path = base_dir / f"{_checkpoint_stem(cfg)}_latest.pt"
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "global_step": global_step,
-            "global_update": update_idx,
-        },
-        snapshot_path,
-    )
+    snap_payload = {
+        "model": model.state_dict(),
+        "global_step": global_step,
+        "global_update": update_idx,
+        "config": dataclasses.asdict(cfg),  # latest 同样带 config
+    }
+    tmp_snap = snapshot_path.with_suffix(snapshot_path.suffix + f".tmp_{os.getpid()}_{int(time.time()*1000)}")
+    try:
+        torch.save(snap_payload, tmp_snap)
+        try:
+            with open(tmp_snap, "rb") as fp:
+                os.fsync(fp.fileno())
+        except Exception:
+            pass
+        os.replace(tmp_snap, snapshot_path)
+    finally:
+        try:
+            if tmp_snap.exists():
+                tmp_snap.unlink()
+        except Exception:
+            pass
     metadata = _build_checkpoint_metadata(cfg, global_step, update_idx, variant="latest")
     _write_metadata(snapshot_path, metadata)
     return snapshot_path
@@ -1220,7 +1263,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 vs_flat = vs.detach().reshape(-1, 1)
                 adv_flat = advantages.detach().reshape(-1, 1)
                 per_buffer.push(obs_flat, actions_flat, vs_flat, adv_flat)
+                per_sample_start = time.time()
                 per_sample = per_buffer.sample(cfg.rollout.batch_size)
+                per_sample_duration = (time.time() - per_sample_start) * 1000.0  # ms
                 if per_sample is not None:
                     with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
                         per_output = model(per_sample.observations, None, None)
@@ -1336,6 +1381,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     "rollout_time": rollout_duration,
                     "learn_time": learn_duration,
                 }
+                # 如果当前轮进行了 PER 抽样，添加采样耗时指标
+                if per_buffer is not None:
+                    if update_idx % cfg.replay.per_sample_interval == 0:
+                        metrics_entry["replay_sample_time_ms"] = float(locals().get("per_sample_duration", 0.0))
+                    else:
+                        # 保持时间序列稠密：未触发采样轮填 0
+                        metrics_entry["replay_sample_time_ms"] = 0.0
 
                 # PER stats (if enabled)
                 if per_buffer is not None:

@@ -20,6 +20,7 @@
 12. P1 指标扩展 (奖励分位数 / GPU 利用窗口 / 平均唯一率)
 13. 慢 step 窗口化堆栈追踪 (Slow step windowed tracing)
 14. Overlap 性能基准脚本 (benchmark_overlap.py)
+15. PER sample 语法错误修复与 FP16 标量存储确认
 
 ---
 ## 1. 环境构建可观测性增强
@@ -181,6 +182,15 @@
 - 实施 | Implementation: 新增 `scripts/benchmark_overlap.py`，参数：`--num-envs-list`, `--rollout-list`, `--warmup-frac`；运行单个 case 解析其 metrics.jsonl 计算稳定区间平均 `env_steps_per_sec`, `updates_per_sec`，附上 `gpu_util_mean_window`。
 - 验证 | Validation: 干运行单一组合成功生成 `bench_overlap_<ts>.csv`，列包含 `mode,num_envs,rollout,steps_per_sec_mean,updates_per_sec_mean,replay_fill_final,gpu_util_mean_window,duration_sec`。
 - 风险 | Risk: 多组合连续运行时间较长；建议初期限制组合数量或并行拆分；脚本目前串行保障资源一致性。
+
+## 15. PER sample 语法错误修复与 FP16 标量存储确认
+- 问题 | Problem: `src/utils/replay.py` 中 `sample` 函数的 `target_values` 与 `advantages` 两行缩进丢失，导致运行期 `IndentationError` 中止训练；同时需要确认 FP16 标量存储默认行为是否生效。
+- 发现 | Discovery: 启动脚本 `run_2080ti_resume.sh` 触发训练后立即报错，日志指向行 235 缩进异常。
+- 决策 | Decision: 立即修复缩进并添加注释说明；保持 FP16 (`MARIO_PER_FP16_SCALARS=1` 默认开启) 策略，采样时统一转回 float32。
+- 实施 | Implementation: 恢复两行缩进，新增注释 `# 修复：此前两行意外减少缩进导致函数体语法错误`；未改动 API。确认 `PrioritizedReplay.__init__` 中 `_fp16_scalars` 环境变量逻辑与 push/sample 路径类型转换正确。
+- 验证 | Validation: 静态语法检查通过（无 IndentationError）；本地 sample 路径 smoke（插入少量伪数据）返回张量 dtype 符合预期 (obs float32, actions long, target_values/advantages float32, weights float32)。
+- 风险 | Risk: FP16 存储可能引入极端大/小优势截断；后续需在高方差场景监控数值稳定性（可加入单元测试对比 FP32/FP16 KL）。
+- 后续 | Next: 计划添加自动化测试：填充随机数据后对比采样输出统计均值/方差在 FP32 与 FP16 模式差异阈值内 (<1e-3 相对误差)。
 
 
 ---
