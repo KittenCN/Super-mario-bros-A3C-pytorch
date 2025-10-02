@@ -1059,435 +1059,435 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
     try:
         for update_idx in range(global_update, cfg.total_updates):
-        update_wall_start = time.time()
-        heartbeat.notify(
-            update_idx=update_idx,
-            global_step=global_step,
-            phase="rollout",
-            message=f"采集第{update_idx}轮数据",
-        )
-        # 当前 update 使用的步进进度间隔（前 warmup_updates 个使用 warmup_interval）
-        current_interval = warmup_interval if (update_idx - global_update) < warmup_updates else base_interval
-        if not overlap_enabled:
-            # 原始同步采集逻辑保留
-            rollout.reset()
-            if hidden_state is not None:
-                rollout.set_initial_hidden(hidden_state.detach(), cell_state.detach() if cell_state is not None else None)
-            else:
-                rollout.set_initial_hidden(None, None)
-            for step in range(cfg.rollout.num_steps):
-                # 采集阶段不需要梯度：使用 no_grad 避免构建计算图，同时避免 inference_mode 的 backward 限制
-                with torch.no_grad():
-                    with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
-                        output = model(obs_gpu, hidden_state, cell_state)
-                        logits = output.logits
-                        values = output.value
-                dist = Categorical(logits=logits)
-                actions = dist.sample()
-                log_probs = dist.log_prob(actions)
-                actions_cpu = actions.detach().cpu()
-                log_probs_cpu = log_probs.detach().cpu()
-                values_cpu = values.detach().cpu()
-                step_start_time = time.time()
-                next_obs_np, reward_np, terminated, truncated, infos = env.step(actions_cpu.numpy())
-                step_duration = time.time() - step_start_time
-                if step_timeout is not None and step_duration > step_timeout:
-                    now_warn = time.time()
-                    if slow_step_cooldown is None or now_warn - last_slow_step_warn >= slow_step_cooldown:
-                        print(f"[train][warn] env.step 耗时 {step_duration:.1f}s (阈值 {step_timeout:.1f}s)，可能存在卡顿。")
-                        heartbeat.notify(phase="rollout", message=f"env.step {step_duration:.1f}s", progress=False)
-                        last_slow_step_warn = now_warn
-                    slow_step_events.append(now_warn)
-                    # 仅保留窗口内事件
-                    slow_step_events = [t for t in slow_step_events if now_warn - t <= slow_trace_window]
-                    if len(slow_step_events) >= slow_trace_threshold:
-                        trace_path = Path(run_dir) / f"slow_step_trace_{int(now_warn)}.log"
-                        try:
-                            import faulthandler, traceback as _tb
-                            with trace_path.open("w", encoding="utf-8") as fp:
-                                fp.write(f"# Slow step trace trigger at {datetime.now(UTC).isoformat()}\n")
-                                faulthandler.dump_traceback(file=fp)
-                                for tid, frame in sys._current_frames().items():  # type: ignore[attr-defined]
-                                    fp.write(f"\n# Thread {tid}\n")
-                                    fp.write("".join(_tb.format_stack(frame)))
-                            print(f"[train][trace] slow step threshold reached -> {trace_path}")
-                        except Exception as _exc:  # noqa: BLE001
-                            print(f"[train][trace][error] stack dump failed: {_exc}")
-                        slow_step_events.clear()
-                done = np.logical_or(terminated, truncated)
-                reward_cpu = _to_cpu_tensor(reward_np, dtype=torch.float32)
-                done_cpu = _to_cpu_tensor(done.astype(np.float32), dtype=torch.float32)
-                rollout.insert(step, obs_cpu, actions_cpu, log_probs_cpu, reward_cpu, values_cpu, done_cpu)
-                obs_cpu = _to_cpu_tensor(next_obs_np)
-                obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
-                episode_returns += reward_np
-                if done.any():
-                    for idx_env, flag in enumerate(done):
-                        if flag:
-                            completed_returns.append(float(episode_returns[idx_env]))
-                            episode_returns[idx_env] = 0.0
-                    if len(completed_returns) > 1000:
-                        completed_returns = completed_returns[-1000:]
-                if output.hidden_state is not None:
-                    hidden_state = output.hidden_state.detach().clone()
+            update_wall_start = time.time()
+            heartbeat.notify(
+                update_idx=update_idx,
+                global_step=global_step,
+                phase="rollout",
+                message=f"采集第{update_idx}轮数据",
+            )
+            # 当前 update 使用的步进进度间隔（前 warmup_updates 个使用 warmup_interval）
+            current_interval = warmup_interval if (update_idx - global_update) < warmup_updates else base_interval
+            if not overlap_enabled:
+                # 原始同步采集逻辑保留
+                rollout.reset()
+                if hidden_state is not None:
+                    rollout.set_initial_hidden(hidden_state.detach(), cell_state.detach() if cell_state is not None else None)
+                else:
+                    rollout.set_initial_hidden(None, None)
+                for step in range(cfg.rollout.num_steps):
+                    # 采集阶段不需要梯度：使用 no_grad 避免构建计算图，同时避免 inference_mode 的 backward 限制
+                    with torch.no_grad():
+                        with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
+                            output = model(obs_gpu, hidden_state, cell_state)
+                            logits = output.logits
+                            values = output.value
+                    dist = Categorical(logits=logits)
+                    actions = dist.sample()
+                    log_probs = dist.log_prob(actions)
+                    actions_cpu = actions.detach().cpu()
+                    log_probs_cpu = log_probs.detach().cpu()
+                    values_cpu = values.detach().cpu()
+                    step_start_time = time.time()
+                    next_obs_np, reward_np, terminated, truncated, infos = env.step(actions_cpu.numpy())
+                    step_duration = time.time() - step_start_time
+                    if step_timeout is not None and step_duration > step_timeout:
+                        now_warn = time.time()
+                        if slow_step_cooldown is None or now_warn - last_slow_step_warn >= slow_step_cooldown:
+                            print(f"[train][warn] env.step 耗时 {step_duration:.1f}s (阈值 {step_timeout:.1f}s)，可能存在卡顿。")
+                            heartbeat.notify(phase="rollout", message=f"env.step {step_duration:.1f}s", progress=False)
+                            last_slow_step_warn = now_warn
+                        slow_step_events.append(now_warn)
+                        # 仅保留窗口内事件
+                        slow_step_events = [t for t in slow_step_events if now_warn - t <= slow_trace_window]
+                        if len(slow_step_events) >= slow_trace_threshold:
+                            trace_path = Path(run_dir) / f"slow_step_trace_{int(now_warn)}.log"
+                            try:
+                                import faulthandler, traceback as _tb
+                                with trace_path.open("w", encoding="utf-8") as fp:
+                                    fp.write(f"# Slow step trace trigger at {datetime.now(UTC).isoformat()}\n")
+                                    faulthandler.dump_traceback(file=fp)
+                                    for tid, frame in sys._current_frames().items():  # type: ignore[attr-defined]
+                                        fp.write(f"\n# Thread {tid}\n")
+                                        fp.write("".join(_tb.format_stack(frame)))
+                                print(f"[train][trace] slow step threshold reached -> {trace_path}")
+                            except Exception as _exc:  # noqa: BLE001
+                                print(f"[train][trace][error] stack dump failed: {_exc}")
+                            slow_step_events.clear()
+                    done = np.logical_or(terminated, truncated)
+                    reward_cpu = _to_cpu_tensor(reward_np, dtype=torch.float32)
+                    done_cpu = _to_cpu_tensor(done.astype(np.float32), dtype=torch.float32)
+                    rollout.insert(step, obs_cpu, actions_cpu, log_probs_cpu, reward_cpu, values_cpu, done_cpu)
+                    obs_cpu = _to_cpu_tensor(next_obs_np)
+                    obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
+                    episode_returns += reward_np
                     if done.any():
-                        mask = torch.as_tensor(done, dtype=torch.bool, device=device)
-                        hidden_state[:, mask] = 0.0
-                    if output.cell_state is not None:
-                        cell_state = output.cell_state.detach().clone()
+                        for idx_env, flag in enumerate(done):
+                            if flag:
+                                completed_returns.append(float(episode_returns[idx_env]))
+                                episode_returns[idx_env] = 0.0
+                        if len(completed_returns) > 1000:
+                            completed_returns = completed_returns[-1000:]
+                    if output.hidden_state is not None:
+                        hidden_state = output.hidden_state.detach().clone()
                         if done.any():
                             mask = torch.as_tensor(done, dtype=torch.bool, device=device)
-                            cell_state[:, mask] = 0.0
+                            hidden_state[:, mask] = 0.0
+                        if output.cell_state is not None:
+                            cell_state = output.cell_state.detach().clone()
+                            if done.any():
+                                mask = torch.as_tensor(done, dtype=torch.bool, device=device)
+                                cell_state[:, mask] = 0.0
+                        else:
+                            cell_state = None
                     else:
+                        hidden_state = None
                         cell_state = None
-                else:
-                    hidden_state = None
-                    cell_state = None
-                # 主动释放局部变量引用，帮助 Python 更快回收（避免长生存期列表）
-                del output, logits, values, dist, actions, log_probs
-                global_step += cfg.env.num_envs
-                if (step + 1) % current_interval == 0 or step + 1 == cfg.rollout.num_steps:
-                    heartbeat.notify(global_step=global_step, phase="rollout", message=f"采样进度 {step + 1}/{cfg.rollout.num_steps}")
-            rollout.set_next_obs(obs_cpu)
-        else:
-            # overlap 模式
-            if update_idx == global_update:
-                # 首次需要前台采集以获得初始缓冲
-                current_buffer.reset()
-                obs_cpu, hidden_state, cell_state, episode_returns, steps_collected = _collect_rollout(current_buffer, obs_cpu, hidden_state, cell_state, episode_returns, update_idx, progress_heartbeat=True, step_interval=current_interval)
-                obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
-                global_step += steps_collected  # 首次采集完成后累加步数
+                    # 主动释放局部变量引用，帮助 Python 更快回收（避免长生存期列表）
+                    del output, logits, values, dist, actions, log_probs
+                    global_step += cfg.env.num_envs
+                    if (step + 1) % current_interval == 0 or step + 1 == cfg.rollout.num_steps:
+                        heartbeat.notify(global_step=global_step, phase="rollout", message=f"采样进度 {step + 1}/{cfg.rollout.num_steps}")
+                rollout.set_next_obs(obs_cpu)
             else:
-                # 等待后台线程完成上一个 next_buffer
-                if pending_thread is not None:
-                    pending_thread.join()
-                # 将 next_buffer 变为当前
-                current_buffer, next_buffer = next_buffer, current_buffer  # type: ignore
-                rollout = current_buffer  # 保持后续变量引用一致
-                obs_cpu = pending_result.obs_cpu  # type: ignore
-                obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
-                hidden_state = pending_result.hidden
-                cell_state = pending_result.cell
-                if pending_result.episode_returns is not None:
-                    episode_returns = pending_result.episode_returns
-                # 累计后台线程采集的步数
-                global_step += getattr(pending_result, "steps", cfg.rollout.num_steps * cfg.env.num_envs)
-            # 在学习阶段开始前启动下一次后台采集（除非最后一次）
-            if update_idx + 1 < cfg.total_updates:
-                pending_thread = _start_background_collection(obs_cpu, hidden_state, cell_state, episode_returns, update_idx + 1, step_interval=current_interval)
+                # overlap 模式
+                if update_idx == global_update:
+                    # 首次需要前台采集以获得初始缓冲
+                    current_buffer.reset()
+                    obs_cpu, hidden_state, cell_state, episode_returns, steps_collected = _collect_rollout(current_buffer, obs_cpu, hidden_state, cell_state, episode_returns, update_idx, progress_heartbeat=True, step_interval=current_interval)
+                    obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
+                    global_step += steps_collected  # 首次采集完成后累加步数
+                else:
+                    # 等待后台线程完成上一个 next_buffer
+                    if pending_thread is not None:
+                        pending_thread.join()
+                    # 将 next_buffer 变为当前
+                    current_buffer, next_buffer = next_buffer, current_buffer  # type: ignore
+                    rollout = current_buffer  # 保持后续变量引用一致
+                    obs_cpu = pending_result.obs_cpu  # type: ignore
+                    obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
+                    hidden_state = pending_result.hidden
+                    cell_state = pending_result.cell
+                    if pending_result.episode_returns is not None:
+                        episode_returns = pending_result.episode_returns
+                    # 累计后台线程采集的步数
+                    global_step += getattr(pending_result, "steps", cfg.rollout.num_steps * cfg.env.num_envs)
+                # 在学习阶段开始前启动下一次后台采集（除非最后一次）
+                if update_idx + 1 < cfg.total_updates:
+                    pending_thread = _start_background_collection(obs_cpu, hidden_state, cell_state, episode_returns, update_idx + 1, step_interval=current_interval)
 
-        rollout_duration = time.time() - update_wall_start
-        heartbeat.notify(
-            update_idx=update_idx,
-            global_step=global_step,
-            phase="learn",
-            message="回放采样完成，开始计算回报",
-        )
-        learn_start = time.time()
-
-        with torch.no_grad():
-            bootstrap = model(obs_gpu, hidden_state, cell_state).value.detach()
-
-        sequences = rollout.get_sequences(device)
-
-        with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
-            target_output = model(
-                sequences["obs"],
-                sequences["initial_hidden"].hidden,
-                sequences["initial_hidden"].cell,
+            rollout_duration = time.time() - update_wall_start
+            heartbeat.notify(
+                update_idx=update_idx,
+                global_step=global_step,
+                phase="learn",
+                message="回放采样完成，开始计算回报",
             )
-            target_logits = target_output.logits
-            target_values = target_output.value
+            learn_start = time.time()
 
-        target_dist = Categorical(logits=target_logits)
-        target_log_probs = target_dist.log_prob(sequences["actions"])
-        entropy = target_dist.entropy().mean()
+            with torch.no_grad():
+                bootstrap = model(obs_gpu, hidden_state, cell_state).value.detach()
 
-        vs, advantages = compute_returns(
-            cfg,
-            behaviour_log_probs=sequences["behaviour_log_probs"],
-            target_log_probs=target_log_probs,
-            rewards=sequences["rewards"],
-            values=target_values,
-            bootstrap_value=bootstrap,
-            dones=sequences["dones"],
-        )
+            sequences = rollout.get_sequences(device)
 
-        per_loss = torch.tensor(0.0, device=device)
-        if per_buffer is not None and (update_idx % cfg.replay.per_sample_interval == 0):
-            obs_flat = sequences["obs"].reshape(-1, *sequences["obs"].shape[2:])
-            actions_flat = sequences["actions"].reshape(-1)
-            vs_flat = vs.detach().reshape(-1, 1)
-            adv_flat = advantages.detach().reshape(-1, 1)
-            per_buffer.push(obs_flat, actions_flat, vs_flat, adv_flat)
-            per_sample = per_buffer.sample(cfg.rollout.batch_size)
-            if per_sample is not None:
-                with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
-                    per_output = model(per_sample.observations, None, None)
-                    per_dist = Categorical(logits=per_output.logits)
-                    per_values = per_output.value.squeeze(-1)
-                per_log_probs = per_dist.log_prob(per_sample.actions)
-                per_policy_loss = -(per_log_probs * per_sample.advantages.detach() * per_sample.weights).mean()
-                td_error_raw = per_sample.target_values - per_values
-                per_value_loss = (td_error_raw.pow(2) * per_sample.weights).mean()
-                per_loss = per_policy_loss + cfg.optimizer.value_loss_coef * per_value_loss
-                per_buffer.update_priorities(per_sample.indices, td_error_raw.detach().abs())
+            with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
+                target_output = model(
+                    sequences["obs"],
+                    sequences["initial_hidden"].hidden,
+                    sequences["initial_hidden"].cell,
+                )
+                target_logits = target_output.logits
+                target_values = target_output.value
 
-        policy_loss = -(advantages.detach() * target_log_probs).mean()
-        value_loss = F.mse_loss(target_values, vs.detach())
-        total_loss = policy_loss + cfg.optimizer.value_loss_coef * value_loss - cfg.optimizer.beta_entropy * entropy + per_loss
-        total_loss = total_loss / cfg.gradient_accumulation
+            target_dist = Categorical(logits=target_logits)
+            target_log_probs = target_dist.log_prob(sequences["actions"])
+            entropy = target_dist.entropy().mean()
 
-        scaler.scale(total_loss).backward()
-
-        if (update_idx + 1) % cfg.gradient_accumulation == 0:
-            scaler.unscale_(optimizer)
-            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optimizer.max_grad_norm)
-            last_grad_norm = float(grad_norm_tensor)
-            # Execute optimizer step via scaler then advance scheduler only if optimizer succeeded
-            try:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                try:
-                    scheduler.step()
-                except Exception:
-                    pass
-            except Exception:
-                # If optimizer step failed, still zero grads to avoid stale grads
-                try:
-                    optimizer.zero_grad(set_to_none=True)
-                except Exception:
-                    pass
-
-        learn_duration = time.time() - learn_start
-        total_update_time = time.time() - update_wall_start
-        heartbeat.notify(
-            update_idx=update_idx,
-            global_step=global_step,
-            phase="log",
-            message=f"单轮耗时 {total_update_time:.1f}s",
-        )
-
-        if update_idx % cfg.log_interval == 0:
-            loss_total = float(total_loss.item())
-            loss_policy = float(policy_loss.item())
-            loss_value = float(value_loss.item())
-            loss_per = float(per_loss.item())
-            entropy_val = float(entropy.item())
-            lr_value = float(scheduler.get_last_lr()[0])
-            recent_returns = completed_returns[-100:] if completed_returns else []
-            avg_return = float(np.mean(recent_returns)) if recent_returns else 0.0
-            return_std = float(np.std(recent_returns)) if recent_returns else 0.0
-            return_max = float(np.max(recent_returns)) if recent_returns else 0.0
-            return_min = float(np.min(recent_returns)) if recent_returns else 0.0
-            p50 = float(np.percentile(recent_returns, 50)) if recent_returns else 0.0
-            p90 = float(np.percentile(recent_returns, 90)) if recent_returns else 0.0
-            p99 = float(np.percentile(recent_returns, 99)) if recent_returns else 0.0
-            now = time.time()
-            updates_since_last = max(update_idx - last_log_update, 1)
-            steps_since_last = max(global_step - last_log_step, cfg.env.num_envs)
-            elapsed = max(now - last_log_time, 1e-6)
-            updates_per_sec = updates_since_last / elapsed
-            env_steps_per_sec = steps_since_last / elapsed
-
-            writer.add_scalar("Loss/total", loss_total, global_step)
-            writer.add_scalar("Loss/policy", loss_policy, global_step)
-            writer.add_scalar("Loss/value", loss_value, global_step)
-            writer.add_scalar("Loss/per", loss_per, global_step)
-            writer.add_scalar("Policy/entropy", entropy_val, global_step)
-            writer.add_scalar("LearningRate", lr_value, global_step)
-            writer.add_scalar("Reward/avg_return", avg_return, global_step)
-            writer.add_scalar("Reward/p50", p50, global_step)
-            writer.add_scalar("Reward/p90", p90, global_step)
-            writer.add_scalar("Reward/p99", p99, global_step)
-            writer.add_scalar("Reward/recent_std", return_std, global_step)
-            writer.add_scalar("Grad/global_norm", last_grad_norm, global_step)
-
-            print(
-                f"[train] update={update_idx} step={global_step} avg_return={avg_return:.2f} "
-                f"loss={loss_total:.4f} lr={lr_value:.2e} grad={last_grad_norm:.3f} "
-                f"steps/s={env_steps_per_sec:.1f} upd/s={updates_per_sec:.2f} "
-                f"update={total_update_time:.1f}s rollout={rollout_duration:.1f}s learn={learn_duration:.1f}s"
-            )
-
-            metrics_entry = {
-                "timestamp": time.time(),
-                "update": update_idx,
-                "global_step": global_step,
-                "loss_total": loss_total,
-                "loss_policy": loss_policy,
-                "loss_value": loss_value,
-                "loss_per": loss_per,
-                "entropy": entropy_val,
-                "learning_rate": lr_value,
-                "avg_return": avg_return,
-                "recent_return_std": return_std,
-                "recent_return_max": return_max,
-                "recent_return_min": return_min,
-                "recent_return_p50": p50,
-                "recent_return_p90": p90,
-                "recent_return_p99": p99,
-                "episodes_completed": len(completed_returns),
-                "grad_norm": last_grad_norm,
-                "env_steps_per_sec": env_steps_per_sec,
-                "updates_per_sec": updates_per_sec,
-                "update_time": total_update_time,
-                "rollout_time": rollout_duration,
-                "learn_time": learn_duration,
-            }
-
-            # PER stats (if enabled)
-            if per_buffer is not None:
-                rstats = per_buffer.stats()
-                metrics_entry.update({
-                    "replay_size": rstats["size"],
-                    "replay_capacity": rstats["capacity"],
-                    "replay_fill_rate": rstats["fill_rate"],
-                    "replay_last_unique_ratio": rstats["last_sample_unique_ratio"],
-                    "replay_avg_unique_ratio": rstats.get("avg_sample_unique_ratio", 0.0),
-                    "replay_push_total": rstats.get("push_total", 0),
-                    "replay_priority_mean": rstats.get("priority_mean", 0.0),
-                    "replay_priority_p50": rstats.get("priority_p50", 0.0),
-                    "replay_priority_p90": rstats.get("priority_p90", 0.0),
-                    "replay_priority_p99": rstats.get("priority_p99", 0.0),
-                })
-                try:
-                    writer.add_scalar("Replay/fill_rate", rstats["fill_rate"], global_step)
-                    writer.add_scalar("Replay/last_unique_ratio", rstats["last_sample_unique_ratio"], global_step)
-                    if "avg_sample_unique_ratio" in rstats:
-                        writer.add_scalar("Replay/avg_unique_ratio", rstats["avg_sample_unique_ratio"], global_step)
-                    writer.add_scalar("Replay/size", rstats["size"], global_step)
-                    if "priority_mean" in rstats:
-                        writer.add_scalar("Replay/priority_mean", rstats["priority_mean"], global_step)
-                        writer.add_scalar("Replay/priority_p90", rstats["priority_p90"], global_step)
-                except Exception:
-                    pass
-
-            if wandb_run is not None:
-                wandb_run.log({**metrics_entry})
-
-            # Resource monitoring: GPU/CPU/memory
-            def _get_resource_stats():
-                stats = {}
-                # GPU stats via torch
-                try:
-                    if torch.cuda.is_available():
-                        stats["gpu_count"] = torch.cuda.device_count()
-                        for gi in range(torch.cuda.device_count()):
-                            stats[f"gpu_{gi}_mem_alloc_bytes"] = float(torch.cuda.memory_allocated(gi))
-                            stats[f"gpu_{gi}_mem_reserved_bytes"] = float(torch.cuda.memory_reserved(gi))
-                except Exception:
-                    pass
-
-                # GPU utilization and memory via nvidia-smi (if available)
-                try:
-                    cmd = [
-                        "nvidia-smi",
-                        "--query-gpu=utilization.gpu,memory.used,memory.total",
-                        "--format=csv,noheader,nounits",
-                    ]
-                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
-                    if res.returncode == 0 and res.stdout.strip():
-                        lines = [l for l in res.stdout.strip().splitlines() if l.strip()]
-                        for idx, line in enumerate(lines):
-                            parts = [p.strip() for p in line.split(",")]
-                            if len(parts) >= 3:
-                                util, mem_used, mem_total = parts[:3]
-                                stats[f"gpu_{idx}_util_pct"] = float(util)
-                                stats[f"gpu_{idx}_mem_used_mb"] = float(mem_used)
-                                stats[f"gpu_{idx}_mem_total_mb"] = float(mem_total)
-                except Exception:
-                    pass
-
-                # Process and system stats via psutil if available
-                collected = False
-                if psutil is not None:
-                    try:
-                        p = psutil.Process()
-                        stats["proc_cpu_percent"] = float(p.cpu_percent(interval=None))
-                        stats["proc_mem_rss_bytes"] = float(p.memory_info().rss)
-                        stats["system_cpu_percent"] = float(psutil.cpu_percent(interval=None))
-                        stats["system_mem_percent"] = float(psutil.virtual_memory().percent)
-                        collected = True
-                    except Exception:
-                        pass
-                if not collected:
-                    try:
-                        load1, load5, load15 = os.getloadavg()
-                        stats["load1"] = float(load1)
-                    except Exception:
-                        pass
-
-                return stats
-
-            stats = {}
-            current_time = time.time()
-            if current_time - last_resource_log >= 60.0:
-                stats = _get_resource_stats()
-                last_resource_log = current_time
-                for name, val in stats.items():
-                    try:
-                        writer.add_scalar(f"Resource/{name}", float(val), global_step)
-                    except Exception:
-                        pass
-                if wandb_run is not None and stats:
-                    logd = dict(stats)
-                    logd["global_step"] = global_step
-                    wandb_run.log(logd)
-
-            # 降低 nvidia-smi 调用频率：仅当距离上次记录 >=120s 再写入 GPU util（否则仅使用 torch.cuda.memory 信息）
-            if stats:
-                metrics_entry["resource"] = stats
-                # GPU 利用率窗口聚合
-                if not hasattr(run_training, "_gpu_util_hist"):
-                    run_training._gpu_util_hist = []  # type: ignore[attr-defined]
-                gpu_hist: list[float] = run_training._gpu_util_hist  # type: ignore[attr-defined]
-                util_vals = [v for k, v in stats.items() if k.endswith("_util_pct")]
-                if util_vals:
-                    util_mean_snapshot = float(np.mean(util_vals))
-                    gpu_hist.append(util_mean_snapshot)
-                    if len(gpu_hist) > 100:
-                        del gpu_hist[: len(gpu_hist) - 100]
-                    metrics_entry["gpu_util_last"] = util_mean_snapshot
-                    metrics_entry["gpu_util_mean_window"] = float(np.mean(gpu_hist))
-                    try:
-                        writer.add_scalar("Resource/gpu_util_last", util_mean_snapshot, global_step)
-                        writer.add_scalar("Resource/gpu_util_mean_window", float(np.mean(gpu_hist)), global_step)
-                    except Exception:
-                        pass
-
-            try:
-                with metrics_file.open("a", encoding="utf-8") as fp:
-                    fp.write(json.dumps(metrics_entry, ensure_ascii=False) + "\n")
-            except Exception:
-                pass
-
-            # 训练健康度检查：长时间没有完成 episode 可能意味着仍在使用 Dummy env（历史 bug）或奖励逻辑异常
-            if update_idx > 0 and len(completed_returns) == 0 and update_idx % (cfg.log_interval * 10) == 0:
-                print("[train][warn] No completed episodes yet – verify environments are real (not Dummy) and reward/done signals are propagating.")
-
-            last_log_time = now
-            last_log_step = global_step
-            last_log_update = update_idx
-
-        if cfg.checkpoint_interval and update_idx % cfg.checkpoint_interval == 0 and update_idx > 0:
-            checkpoint_path = save_checkpoint(
+            vs, advantages = compute_returns(
                 cfg,
-                model,
-                optimizer,
-                scheduler,
-                scaler,
-                global_step,
-                update_idx,
+                behaviour_log_probs=sequences["behaviour_log_probs"],
+                target_log_probs=target_log_probs,
+                rewards=sequences["rewards"],
+                values=target_values,
+                bootstrap_value=bootstrap,
+                dones=sequences["dones"],
             )
-            print(f"[train] checkpoint saved -> {checkpoint_path}")
-            heartbeat.notify(phase="checkpoint", message=f"保存 {checkpoint_path.name}", progress=False)
 
-        if cfg.eval_interval and update_idx % cfg.eval_interval == 0 and update_idx > 0:
-            save_model_snapshot(cfg, model, global_step, update_idx)
-            print("[train] latest snapshot refreshed")
-            heartbeat.notify(phase="checkpoint", message="最新快照已更新", progress=False)
+            per_loss = torch.tensor(0.0, device=device)
+            if per_buffer is not None and (update_idx % cfg.replay.per_sample_interval == 0):
+                obs_flat = sequences["obs"].reshape(-1, *sequences["obs"].shape[2:])
+                actions_flat = sequences["actions"].reshape(-1)
+                vs_flat = vs.detach().reshape(-1, 1)
+                adv_flat = advantages.detach().reshape(-1, 1)
+                per_buffer.push(obs_flat, actions_flat, vs_flat, adv_flat)
+                per_sample = per_buffer.sample(cfg.rollout.batch_size)
+                if per_sample is not None:
+                    with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
+                        per_output = model(per_sample.observations, None, None)
+                        per_dist = Categorical(logits=per_output.logits)
+                        per_values = per_output.value.squeeze(-1)
+                    per_log_probs = per_dist.log_prob(per_sample.actions)
+                    per_policy_loss = -(per_log_probs * per_sample.advantages.detach() * per_sample.weights).mean()
+                    td_error_raw = per_sample.target_values - per_values
+                    per_value_loss = (td_error_raw.pow(2) * per_sample.weights).mean()
+                    per_loss = per_policy_loss + cfg.optimizer.value_loss_coef * per_value_loss
+                    per_buffer.update_priorities(per_sample.indices, td_error_raw.detach().abs())
+
+            policy_loss = -(advantages.detach() * target_log_probs).mean()
+            value_loss = F.mse_loss(target_values, vs.detach())
+            total_loss = policy_loss + cfg.optimizer.value_loss_coef * value_loss - cfg.optimizer.beta_entropy * entropy + per_loss
+            total_loss = total_loss / cfg.gradient_accumulation
+
+            scaler.scale(total_loss).backward()
+
+            if (update_idx + 1) % cfg.gradient_accumulation == 0:
+                scaler.unscale_(optimizer)
+                grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optimizer.max_grad_norm)
+                last_grad_norm = float(grad_norm_tensor)
+                # Execute optimizer step via scaler then advance scheduler only if optimizer succeeded
+                try:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    try:
+                        scheduler.step()
+                    except Exception:
+                        pass
+                except Exception:
+                    # If optimizer step failed, still zero grads to avoid stale grads
+                    try:
+                        optimizer.zero_grad(set_to_none=True)
+                    except Exception:
+                        pass
+
+            learn_duration = time.time() - learn_start
+            total_update_time = time.time() - update_wall_start
+            heartbeat.notify(
+                update_idx=update_idx,
+                global_step=global_step,
+                phase="log",
+                message=f"单轮耗时 {total_update_time:.1f}s",
+            )
+
+            if update_idx % cfg.log_interval == 0:
+                loss_total = float(total_loss.item())
+                loss_policy = float(policy_loss.item())
+                loss_value = float(value_loss.item())
+                loss_per = float(per_loss.item())
+                entropy_val = float(entropy.item())
+                lr_value = float(scheduler.get_last_lr()[0])
+                recent_returns = completed_returns[-100:] if completed_returns else []
+                avg_return = float(np.mean(recent_returns)) if recent_returns else 0.0
+                return_std = float(np.std(recent_returns)) if recent_returns else 0.0
+                return_max = float(np.max(recent_returns)) if recent_returns else 0.0
+                return_min = float(np.min(recent_returns)) if recent_returns else 0.0
+                p50 = float(np.percentile(recent_returns, 50)) if recent_returns else 0.0
+                p90 = float(np.percentile(recent_returns, 90)) if recent_returns else 0.0
+                p99 = float(np.percentile(recent_returns, 99)) if recent_returns else 0.0
+                now = time.time()
+                updates_since_last = max(update_idx - last_log_update, 1)
+                steps_since_last = max(global_step - last_log_step, cfg.env.num_envs)
+                elapsed = max(now - last_log_time, 1e-6)
+                updates_per_sec = updates_since_last / elapsed
+                env_steps_per_sec = steps_since_last / elapsed
+
+                writer.add_scalar("Loss/total", loss_total, global_step)
+                writer.add_scalar("Loss/policy", loss_policy, global_step)
+                writer.add_scalar("Loss/value", loss_value, global_step)
+                writer.add_scalar("Loss/per", loss_per, global_step)
+                writer.add_scalar("Policy/entropy", entropy_val, global_step)
+                writer.add_scalar("LearningRate", lr_value, global_step)
+                writer.add_scalar("Reward/avg_return", avg_return, global_step)
+                writer.add_scalar("Reward/p50", p50, global_step)
+                writer.add_scalar("Reward/p90", p90, global_step)
+                writer.add_scalar("Reward/p99", p99, global_step)
+                writer.add_scalar("Reward/recent_std", return_std, global_step)
+                writer.add_scalar("Grad/global_norm", last_grad_norm, global_step)
+
+                print(
+                    f"[train] update={update_idx} step={global_step} avg_return={avg_return:.2f} "
+                    f"loss={loss_total:.4f} lr={lr_value:.2e} grad={last_grad_norm:.3f} "
+                    f"steps/s={env_steps_per_sec:.1f} upd/s={updates_per_sec:.2f} "
+                    f"update={total_update_time:.1f}s rollout={rollout_duration:.1f}s learn={learn_duration:.1f}s"
+                )
+
+                metrics_entry = {
+                    "timestamp": time.time(),
+                    "update": update_idx,
+                    "global_step": global_step,
+                    "loss_total": loss_total,
+                    "loss_policy": loss_policy,
+                    "loss_value": loss_value,
+                    "loss_per": loss_per,
+                    "entropy": entropy_val,
+                    "learning_rate": lr_value,
+                    "avg_return": avg_return,
+                    "recent_return_std": return_std,
+                    "recent_return_max": return_max,
+                    "recent_return_min": return_min,
+                    "recent_return_p50": p50,
+                    "recent_return_p90": p90,
+                    "recent_return_p99": p99,
+                    "episodes_completed": len(completed_returns),
+                    "grad_norm": last_grad_norm,
+                    "env_steps_per_sec": env_steps_per_sec,
+                    "updates_per_sec": updates_per_sec,
+                    "update_time": total_update_time,
+                    "rollout_time": rollout_duration,
+                    "learn_time": learn_duration,
+                }
+
+                # PER stats (if enabled)
+                if per_buffer is not None:
+                    rstats = per_buffer.stats()
+                    metrics_entry.update({
+                        "replay_size": rstats["size"],
+                        "replay_capacity": rstats["capacity"],
+                        "replay_fill_rate": rstats["fill_rate"],
+                        "replay_last_unique_ratio": rstats["last_sample_unique_ratio"],
+                        "replay_avg_unique_ratio": rstats.get("avg_sample_unique_ratio", 0.0),
+                        "replay_push_total": rstats.get("push_total", 0),
+                        "replay_priority_mean": rstats.get("priority_mean", 0.0),
+                        "replay_priority_p50": rstats.get("priority_p50", 0.0),
+                        "replay_priority_p90": rstats.get("priority_p90", 0.0),
+                        "replay_priority_p99": rstats.get("priority_p99", 0.0),
+                    })
+                    try:
+                        writer.add_scalar("Replay/fill_rate", rstats["fill_rate"], global_step)
+                        writer.add_scalar("Replay/last_unique_ratio", rstats["last_sample_unique_ratio"], global_step)
+                        if "avg_sample_unique_ratio" in rstats:
+                            writer.add_scalar("Replay/avg_unique_ratio", rstats["avg_sample_unique_ratio"], global_step)
+                        writer.add_scalar("Replay/size", rstats["size"], global_step)
+                        if "priority_mean" in rstats:
+                            writer.add_scalar("Replay/priority_mean", rstats["priority_mean"], global_step)
+                            writer.add_scalar("Replay/priority_p90", rstats["priority_p90"], global_step)
+                    except Exception:
+                        pass
+
+                if wandb_run is not None:
+                    wandb_run.log({**metrics_entry})
+
+                # Resource monitoring: GPU/CPU/memory
+                def _get_resource_stats():
+                    stats = {}
+                    # GPU stats via torch
+                    try:
+                        if torch.cuda.is_available():
+                            stats["gpu_count"] = torch.cuda.device_count()
+                            for gi in range(torch.cuda.device_count()):
+                                stats[f"gpu_{gi}_mem_alloc_bytes"] = float(torch.cuda.memory_allocated(gi))
+                                stats[f"gpu_{gi}_mem_reserved_bytes"] = float(torch.cuda.memory_reserved(gi))
+                    except Exception:
+                        pass
+
+                    # GPU utilization and memory via nvidia-smi (if available)
+                    try:
+                        cmd = [
+                            "nvidia-smi",
+                            "--query-gpu=utilization.gpu,memory.used,memory.total",
+                            "--format=csv,noheader,nounits",
+                        ]
+                        res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+                        if res.returncode == 0 and res.stdout.strip():
+                            lines = [l for l in res.stdout.strip().splitlines() if l.strip()]
+                            for idx, line in enumerate(lines):
+                                parts = [p.strip() for p in line.split(",")]
+                                if len(parts) >= 3:
+                                    util, mem_used, mem_total = parts[:3]
+                                    stats[f"gpu_{idx}_util_pct"] = float(util)
+                                    stats[f"gpu_{idx}_mem_used_mb"] = float(mem_used)
+                                    stats[f"gpu_{idx}_mem_total_mb"] = float(mem_total)
+                    except Exception:
+                        pass
+
+                    # Process and system stats via psutil if available
+                    collected = False
+                    if psutil is not None:
+                        try:
+                            p = psutil.Process()
+                            stats["proc_cpu_percent"] = float(p.cpu_percent(interval=None))
+                            stats["proc_mem_rss_bytes"] = float(p.memory_info().rss)
+                            stats["system_cpu_percent"] = float(psutil.cpu_percent(interval=None))
+                            stats["system_mem_percent"] = float(psutil.virtual_memory().percent)
+                            collected = True
+                        except Exception:
+                            pass
+                    if not collected:
+                        try:
+                            load1, load5, load15 = os.getloadavg()
+                            stats["load1"] = float(load1)
+                        except Exception:
+                            pass
+
+                    return stats
+
+                stats = {}
+                current_time = time.time()
+                if current_time - last_resource_log >= 60.0:
+                    stats = _get_resource_stats()
+                    last_resource_log = current_time
+                    for name, val in stats.items():
+                        try:
+                            writer.add_scalar(f"Resource/{name}", float(val), global_step)
+                        except Exception:
+                            pass
+                    if wandb_run is not None and stats:
+                        logd = dict(stats)
+                        logd["global_step"] = global_step
+                        wandb_run.log(logd)
+
+                # 降低 nvidia-smi 调用频率：仅当距离上次记录 >=120s 再写入 GPU util（否则仅使用 torch.cuda.memory 信息）
+                if stats:
+                    metrics_entry["resource"] = stats
+                    # GPU 利用率窗口聚合
+                    if not hasattr(run_training, "_gpu_util_hist"):
+                        run_training._gpu_util_hist = []  # type: ignore[attr-defined]
+                    gpu_hist: list[float] = run_training._gpu_util_hist  # type: ignore[attr-defined]
+                    util_vals = [v for k, v in stats.items() if k.endswith("_util_pct")]
+                    if util_vals:
+                        util_mean_snapshot = float(np.mean(util_vals))
+                        gpu_hist.append(util_mean_snapshot)
+                        if len(gpu_hist) > 100:
+                            del gpu_hist[: len(gpu_hist) - 100]
+                        metrics_entry["gpu_util_last"] = util_mean_snapshot
+                        metrics_entry["gpu_util_mean_window"] = float(np.mean(gpu_hist))
+                        try:
+                            writer.add_scalar("Resource/gpu_util_last", util_mean_snapshot, global_step)
+                            writer.add_scalar("Resource/gpu_util_mean_window", float(np.mean(gpu_hist)), global_step)
+                        except Exception:
+                            pass
+
+                try:
+                    with metrics_file.open("a", encoding="utf-8") as fp:
+                        fp.write(json.dumps(metrics_entry, ensure_ascii=False) + "\n")
+                except Exception:
+                    pass
+
+                # 训练健康度检查：长时间没有完成 episode 可能意味着仍在使用 Dummy env（历史 bug）或奖励逻辑异常
+                if update_idx > 0 and len(completed_returns) == 0 and update_idx % (cfg.log_interval * 10) == 0:
+                    print("[train][warn] No completed episodes yet – verify environments are real (not Dummy) and reward/done signals are propagating.")
+
+                last_log_time = now
+                last_log_step = global_step
+                last_log_update = update_idx
+
+            if cfg.checkpoint_interval and update_idx % cfg.checkpoint_interval == 0 and update_idx > 0:
+                checkpoint_path = save_checkpoint(
+                    cfg,
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    global_step,
+                    update_idx,
+                )
+                print(f"[train] checkpoint saved -> {checkpoint_path}")
+                heartbeat.notify(phase="checkpoint", message=f"保存 {checkpoint_path.name}", progress=False)
+
+            if cfg.eval_interval and update_idx % cfg.eval_interval == 0 and update_idx > 0:
+                save_model_snapshot(cfg, model, global_step, update_idx)
+                print("[train] latest snapshot refreshed")
+                heartbeat.notify(phase="checkpoint", message="最新快照已更新", progress=False)
     except KeyboardInterrupt:
         print("[train][warn] interrupted by user, attempting graceful shutdown & latest snapshot save")
         heartbeat.notify(phase="interrupt", message="收到中断信号，保存最新模型", progress=False)
