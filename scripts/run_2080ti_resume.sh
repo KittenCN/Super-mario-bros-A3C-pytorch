@@ -19,6 +19,9 @@
 #     REWARD_DISTANCE_WEIGHT / REWARD_SCALE_START / REWARD_SCALE_FINAL / REWARD_SCALE_ANNEAL_STEPS
 #     SCRIPTED_SEQUENCE='START:8,RIGHT+B:120' 或 SCRIPTED_FORWARD_FRAMES / FORWARD_ACTION_ID / PROBE_FORWARD
 #     ENABLE_RAM_X_PARSE=1 启用 RAM 回退解析（fc_emulator 缺失 x_pos 时）
+# 14.(新增 2025-10-02) BOOTSTRAP=1 启动“冷启动推进”模式：若未显式指定相关参数则自动注入一组较激进的
+#     初期位移与奖励塑形默认（distance_weight=0.08 + scripted START / RIGHT+B 序列 + RAM 解析），
+#     用于 distance/shaping 长期为 0 的场景，减少手动调参往返。
 #
 # 用法 / Usage:
 #   bash scripts/run_2080ti_resume.sh            # 直接启动
@@ -64,6 +67,7 @@ show_help() {
   PER_INTERVAL=4          # PER 抽样间隔
   SAVE_ROOT=trained_models # 根保存目录
   LOG_DIR=tensorboard/a3c_super_mario_bros
+  LOG_INTERVAL=             # (可选) 覆盖 --log-interval，控制 metrics 输出频率 (默认100)
   # ---- 奖励 / 前进脚本相关 (均可选) ----
   REWARD_DISTANCE_WEIGHT=0.0125   # 位移奖励权重 (默认 1/80) 建议调高以强化初期推进 (如 0.05)
   REWARD_SCALE_START=0.2          # 动态缩放初始值
@@ -76,6 +80,7 @@ show_help() {
   ENABLE_RAM_X_PARSE=1            # 1 启用 RAM 解析 x_pos 回退
   RAM_X_HIGH=0x006D               # RAM 高字节地址
   RAM_X_LOW=0x0086                # RAM 低字节地址
+  BOOTSTRAP=0                     # 1=自动注入一组冷启动推进默认参数（若用户未显式设置相关变量）
   NO_COMPILE=0            # 1=传 --no-compile 禁用 torch.compile (或 COMPILE=0)
   DISABLE_OVERLAP=0       # 1=不添加 --overlap-collect
   AUTO_MEM=0             # 1=开启自动显存降载重试
@@ -127,6 +132,7 @@ TOTAL_UPDATES=${TOTAL_UPDATES:-100000}
 PER_INTERVAL=${PER_INTERVAL:-4}
 SAVE_ROOT=${SAVE_ROOT:-trained_models}
 LOG_DIR=${LOG_DIR:-tensorboard/a3c_super_mario_bros}
+LOG_INTERVAL=${LOG_INTERVAL:-}
 AUTO_MEM=${AUTO_MEM:-0}
 MEM_TARGET_GB=${MEM_TARGET_GB:-1.0}
 MAX_RETRIES=${MAX_RETRIES:-4}
@@ -134,6 +140,7 @@ AUTO_MEM_STREAM=${AUTO_MEM_STREAM:-1}
 NO_COMPILE=${NO_COMPILE:-0}
 COMPILE=${COMPILE:-1}
 DISABLE_OVERLAP=${DISABLE_OVERLAP:-0}
+BOOTSTRAP=${BOOTSTRAP:-0}
 
 # 奖励 / 脚本化 / 探测相关可选值读取（若未提供则保持缺省或空）
 REWARD_DISTANCE_WEIGHT=${REWARD_DISTANCE_WEIGHT:-}
@@ -147,6 +154,19 @@ PROBE_FORWARD=${PROBE_FORWARD:-}
 ENABLE_RAM_X_PARSE=${ENABLE_RAM_X_PARSE:-1}
 RAM_X_HIGH=${RAM_X_HIGH:-0x006D}
 RAM_X_LOW=${RAM_X_LOW:-0x0086}
+
+# 若启用 BOOTSTRAP 且用户未显式提供相关 shaping / scripted / scale 参数，则填充默认值
+if [[ "$BOOTSTRAP" == "1" ]]; then
+  # 仅在变量为空或未设定时注入，避免覆盖用户显式选择
+  if [[ -z "${REWARD_DISTANCE_WEIGHT}" ]]; then REWARD_DISTANCE_WEIGHT=0.08; fi
+  if [[ -z "${REWARD_SCALE_START}" ]]; then REWARD_SCALE_START=0.2; fi
+  if [[ -z "${REWARD_SCALE_FINAL}" ]]; then REWARD_SCALE_FINAL=0.1; fi
+  if [[ -z "${REWARD_SCALE_ANNEAL_STEPS}" ]]; then REWARD_SCALE_ANNEAL_STEPS=50000; fi
+  # 若用户未提供脚本化动作 & 未指定脚本化帧数，则注入一段较长前进，保证出现正向 dx
+  if [[ -z "${SCRIPTED_SEQUENCE}" && -z "${SCRIPTED_FORWARD_FRAMES}" ]]; then SCRIPTED_SEQUENCE='START:8,RIGHT+B:180'; fi
+  # 强制确保 RAM 解析开启
+  ENABLE_RAM_X_PARSE=1
+fi
 
 # 细粒度进度相关（若未显式设定使用默认）
 ROLL_PROGRESS_INTERVAL=${ROLL_PROGRESS_INTERVAL:-8}
@@ -187,6 +207,7 @@ build_cmd() {
   --per \
   --per-sample-interval "${PER_INTERVAL}" \
   --log-dir "${LOG_DIR}" \
+  $( [[ -n "${LOG_INTERVAL}" ]] && echo --log-interval "${LOG_INTERVAL}" ) \
   --save-dir "${SAVE_DIR}" \
   $( (( DISABLE_OVERLAP == 1 )) && echo "" || echo "--overlap-collect" ) \
   --parent-prewarm \

@@ -181,19 +181,25 @@ class MarioRewardWrapper(gym.Wrapper):
         try:
             shaping = info.setdefault("shaping", {}) if isinstance(info, dict) else None
             if isinstance(shaping, dict):
-                shaping.setdefault("dx", dx)
-                shaping.setdefault("score_delta", score_delta)
-                shaping.setdefault("raw", float(raw_before_scale))
-                shaping.setdefault("scale", float(dyn_scale))
-                shaping.setdefault("scaled", float(shaped_reward))
+                # 直接覆盖，保证日志/metrics 始终反映最新一次 step 的诊断值
+                shaping["dx"] = dx
+                shaping["score_delta"] = score_delta
+                shaping["raw"] = float(raw_before_scale)
+                shaping["scale"] = float(dyn_scale)
+                shaping["scaled"] = float(shaped_reward)
                 if self.enable_ram_x_parse:
-                    shaping.setdefault("ram_parse", {
+                    shaping["ram_parse"] = {
                         "success": self._ram_success,
                         "failure": self._ram_failure,
                         "last_x": self._ram_last_x,
-                    })
+                    }
         except Exception:
             pass
+
+        # 调试：首次出现正向位移时打印一次（不依赖 RAM debug 次数）
+        if dx > 0 and getattr(self, "_printed_first_dx", False) is False:
+            print(f"[reward][dx] first_positive_dx step={self._step_counter} dx={dx:.2f} distance_weight={self.config.distance_weight}")
+            setattr(self, "_printed_first_dx", True)
 
         if terminated or truncated:
             if info.get("flag_get"):

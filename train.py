@@ -396,7 +396,7 @@ def _maybe_print_training_hints(update_idx: int, metrics: Dict[str, Any]) -> Non
     global_step_value = int(metrics.get("global_step", 0) or 0)
 
     if distance_delta == 0 and shaping_raw == 0 and global_step_value > 0:
-        hints.append("距离增量为 0，考虑提高 reward_distance_weight 或启用 scripted-forward。")
+        hints.append("距离增量为 0，考虑提高 reward_distance_weight 或启用 scripted-forward 或设置 BOOTSTRAP=1。")
 
     if avg_return <= 0.0 and update_idx >= 200:
         hints.append("avg_return 长期为 0，可检查奖励塑形或动作脚本是否生效。")

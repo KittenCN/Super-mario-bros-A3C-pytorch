@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "timestamp": "2025-10-02T13:11:49.169569Z",
+  "timestamp": "2025-10-02T13:15:05.910355Z",
   "world": 1,
   "stage": 1,
   "action_type": "extended",
@@ -54,9 +54,9 @@
     "per_sample_interval": 4
   },
   "save_state": {
-    "global_step": 1086080,
-    "global_update": 1691,
+    "global_step": 1088640,
+    "global_update": 1692,
     "type": "latest",
-    "reason": "interrupt"
+    "reason": "exception"
   }
 }
