@@ -57,6 +57,17 @@ If the sidecar metadata JSON is missing, `test.py` will reconstruct it from the 
 
 ## 高级用法 | Advanced Usage
 - **Optuna 搜索**：`scripts/optuna_search.py` 运行短程实验，返回最佳 `avg_return`。<br>**Optuna search**: `scripts/optuna_search.py` runs short experiments and returns the best `avg_return`.
+- **Overlap 基准 (benchmark)**：`scripts/benchmark_overlap.py` 对比 `--overlap-collect` 开/关 下不同 `(num_envs, rollout_steps)` 的吞吐：
+	- `steps_per_sec_mean`：丢弃 warmup 前若干比例 (`--warmup-fraction`) 后计算剩余记录中 `env_steps_per_sec` 均值。
+	- `updates_per_sec_mean`：同理对 `updates_per_sec` 取均值。
+	- `warmup_fraction` 目的：忽略初始 JIT / 缓冲填充 / cache 预热抖动，提升基准稳定性。
+	示例：
+	```bash
+	python scripts/benchmark_overlap.py --num-envs 4 8 --rollout-steps 32 64 --updates 300 --warmup-fraction 0.3
+	```
+	输出 CSV `benchmarks/bench_overlap_*.csv`，字段含义见首行表头。
+- **PER 优先级分析**：训练日志新增 `replay_priority_mean/p50/p90/p99` 与采样唯一率 `replay_avg_unique_ratio`；用于监控优先级分布是否塌缩。
+- **FP16 标量存储**：设置环境变量 `MARIO_PER_FP16_SCALARS=0` 可关闭默认的 FP16 advantages/target_values 压缩（若需严格数值一致性对比）。
 - **Docker**：`docker build -t mario-a3c .` 后通过 `docker run --gpus all mario-a3c` 启动训练。<br>**Docker**: build with `docker build -t mario-a3c .` then launch via `docker run --gpus all mario-a3c`.
 - **Conda**：`conda env create -f environment.yml && conda activate mario-a3c`。<br>**Conda**: run `conda env create -f environment.yml && conda activate mario-a3c`.
 - **配置导出**：`--config-out configs/run.json` 保存最终 `TrainingConfig` 用于复现。<br>**Config export**: use `--config-out configs/run.json` to save the effective `TrainingConfig` for reproducibility.

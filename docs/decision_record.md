@@ -17,6 +17,9 @@
 9. 历史 checkpoint global_step 回填 (Global step backfill)
 10. 训练安全退出与最新快照保障 (Safe shutdown & snapshot)
 11. P1 指标体系初始实现 (Metrics JSONL + Replay stats + TB 诊断)
+12. P1 指标扩展 (奖励分位数 / GPU 利用窗口 / 平均唯一率)
+13. 慢 step 窗口化堆栈追踪 (Slow step windowed tracing)
+14. Overlap 性能基准脚本 (benchmark_overlap.py)
 
 ---
 ## 1. 环境构建可观测性增强
@@ -129,7 +132,8 @@
 - 风险 | Risk: 若历史 rollout_steps 与假设不符将产生系统性偏移；在追踪字段中记录方便后续二次迁移；可通过 `.bak` 还原。
 
 ## 10. 训练安全退出与最新快照保障
--## 11. P1 指标体系初始实现
+
+## 11. P1 指标体系初始实现
 - 问题 | Problem: 仅 stdout 文本日志，后期分析困难；Replay 使用情况缺乏可视化；TB 目录偶尔出现空目录难以判定是否正常初始化。
 - 决策 | Decision: 增加结构化 JSONL (已有 metrics.jsonl)、PER 填充与唯一率指标、TB writer 初始化标记 (add_text meta/started)。
 - 实施 | Implementation: 
@@ -151,6 +155,32 @@
   4. 继续执行统一清理段。
 - 验证 | Validation: 人为发送 KeyboardInterrupt，日志出现警告 & latest JSON/PT 文件时间戳更新；后续通过 `--resume latest` 成功恢复。
 - 风险 | Risk: 异常发生于 checkpoint 写入中途可能产生不完整文件；建议后续引入原子写（先写临时文件再 rename）。
+
+## 12. P1 指标扩展 (奖励分位数 / GPU 利用窗口 / 平均唯一率)
+- 问题 | Problem: 初始指标不足以刻画训练奖励分布尾部、长期 GPU 利用趋势与 PER 重复采样动态。
+- 决策 | Decision: 增量加入 p50/p90/p99 reward、`gpu_util_last` 与滑动窗口均值 `gpu_util_mean_window`、`replay_avg_unique_ratio`、`replay_push_total` 并保持向后兼容。
+- 实施 | Implementation:
+  - 在 `train.py` 日志分支计算最近 episode returns 分位数（缓存窗口）写入 JSONL & TensorBoard。
+  - 引入 GPU 利用滑动窗口累积器（默认窗口 100 采样点）。
+  - 扩展 `PrioritizedReplay.stats()` 返回 `avg_sample_unique_ratio` 与累计 push 计数。
+  - 新建文档 `docs/metrics_schema.md` 规范字段含义，指导解析端使用 `dict.get()` 兼容旧记录。
+- 验证 | Validation: 本地短跑运行 metrics.jsonl 出现新字段；旧历史文件无解析错误；TB 中新增 scalar 曲线。
+- 取舍 | Trade-off: 轻度增加每次 log 周期计算开销，可忽略；避免实时高频统计以保持主循环轻量。
+- 风险 | Risk: 分位数窗口选择过小会导致抖动（可调窗口大小后续参数化）。
+
+## 13. 慢 step 窗口化堆栈追踪 (Slow step windowed tracing)
+- 问题 | Problem: 单次偶发慢 step 可能是系统抖动，不宜立即 dump；需要在一定窗口内多次超阈值才触发堆栈抓取以减少噪声。
+- 决策 | Decision: 引入窗口计数 + 阈值触发机制 (`--slow-step-trace-threshold`, `--slow-step-trace-window`)；在阈值次数达成后一次性写出 Python 线程栈到独立日志文件。
+- 实施 | Implementation: `train.py` 内维护循环局部计数器，满足条件使用 `faulthandler` 与 `traceback` 输出所有线程栈；文件命名 `slow_step_trace_<timestamp>.log`。
+- 验证 | Validation: 人为将阈值设置很低（如 0.001s）触发生成日志；文件内容含主线程与采集线程调用栈。
+- 风险 | Risk: 若阈值配置过低导致频繁写文件；当前策略：同一窗口只写一次并重置计数。
+
+## 14. Overlap 性能基准脚本 (benchmark_overlap.py)
+- 问题 | Problem: 缺乏自动化、可重复对比 overlap=on/off 性能的手段，人工测试误差大。
+- 决策 | Decision: 编写矩阵化基准脚本遍历 `(num_envs, rollout_steps)`，分别运行 sync & overlap，聚合稳定阶段吞吐与更新速率输出 CSV。
+- 实施 | Implementation: 新增 `scripts/benchmark_overlap.py`，参数：`--num-envs-list`, `--rollout-list`, `--warmup-frac`；运行单个 case 解析其 metrics.jsonl 计算稳定区间平均 `env_steps_per_sec`, `updates_per_sec`，附上 `gpu_util_mean_window`。
+- 验证 | Validation: 干运行单一组合成功生成 `bench_overlap_<ts>.csv`，列包含 `mode,num_envs,rollout,steps_per_sec_mean,updates_per_sec_mean,replay_fill_final,gpu_util_mean_window,duration_sec`。
+- 风险 | Risk: 多组合连续运行时间较长；建议初期限制组合数量或并行拆分；脚本目前串行保障资源一致性。
 
 
 ---

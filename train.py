@@ -183,6 +183,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=1,
         help="warmup 阶段的步进进度间隔 (>=1)，默认每步打印", 
     )
+    parser.add_argument("--slow-step-trace-threshold", type=int, default=5, help="在窗口内累计达到该慢 step 次数触发栈追踪")
+    parser.add_argument("--slow-step-trace-window", type=float, default=120.0, help="慢 step 统计时间窗口 (秒)")
     return parser.parse_args(argv)
 
 
@@ -838,6 +840,10 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         print(f"[train][log] tensorboard_log_dir={getattr(writer,'log_dir', getattr(writer,'_base',run_dir))}")
         if args.enable_tensorboard:
             writer.add_text("meta/started", datetime.now(UTC).isoformat(), 0)
+            try:
+                writer.add_scalar("meta/init", 1, 0)
+            except Exception:
+                pass
     except Exception:
         pass
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
@@ -866,6 +872,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     if step_timeout is not None:
         slow_step_cooldown = max(step_timeout * 0.5, 5.0)
     last_slow_step_warn = 0.0
+    slow_step_events: list[float] = []
+    slow_trace_threshold = getattr(args, "slow_step_trace_threshold", 5)
+    slow_trace_window = getattr(args, "slow_step_trace_window", 120.0)
 
     rollout = RolloutBuffer(cfg.rollout.num_steps, cfg.env.num_envs, env.single_observation_space.shape, device, pin_memory=(device.type == "cuda"))
     per_buffer = None
@@ -1088,6 +1097,23 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         print(f"[train][warn] env.step 耗时 {step_duration:.1f}s (阈值 {step_timeout:.1f}s)，可能存在卡顿。")
                         heartbeat.notify(phase="rollout", message=f"env.step {step_duration:.1f}s", progress=False)
                         last_slow_step_warn = now_warn
+                    slow_step_events.append(now_warn)
+                    # 仅保留窗口内事件
+                    slow_step_events = [t for t in slow_step_events if now_warn - t <= slow_trace_window]
+                    if len(slow_step_events) >= slow_trace_threshold:
+                        trace_path = Path(run_dir) / f"slow_step_trace_{int(now_warn)}.log"
+                        try:
+                            import faulthandler, traceback as _tb
+                            with trace_path.open("w", encoding="utf-8") as fp:
+                                fp.write(f"# Slow step trace trigger at {datetime.now(UTC).isoformat()}\n")
+                                faulthandler.dump_traceback(file=fp)
+                                for tid, frame in sys._current_frames().items():  # type: ignore[attr-defined]
+                                    fp.write(f"\n# Thread {tid}\n")
+                                    fp.write("".join(_tb.format_stack(frame)))
+                            print(f"[train][trace] slow step threshold reached -> {trace_path}")
+                        except Exception as _exc:  # noqa: BLE001
+                            print(f"[train][trace][error] stack dump failed: {_exc}")
+                        slow_step_events.clear()
                 done = np.logical_or(terminated, truncated)
                 reward_cpu = _to_cpu_tensor(reward_np, dtype=torch.float32)
                 done_cpu = _to_cpu_tensor(done.astype(np.float32), dtype=torch.float32)
@@ -1255,6 +1281,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             return_std = float(np.std(recent_returns)) if recent_returns else 0.0
             return_max = float(np.max(recent_returns)) if recent_returns else 0.0
             return_min = float(np.min(recent_returns)) if recent_returns else 0.0
+            p50 = float(np.percentile(recent_returns, 50)) if recent_returns else 0.0
+            p90 = float(np.percentile(recent_returns, 90)) if recent_returns else 0.0
+            p99 = float(np.percentile(recent_returns, 99)) if recent_returns else 0.0
             now = time.time()
             updates_since_last = max(update_idx - last_log_update, 1)
             steps_since_last = max(global_step - last_log_step, cfg.env.num_envs)
@@ -1269,6 +1298,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             writer.add_scalar("Policy/entropy", entropy_val, global_step)
             writer.add_scalar("LearningRate", lr_value, global_step)
             writer.add_scalar("Reward/avg_return", avg_return, global_step)
+            writer.add_scalar("Reward/p50", p50, global_step)
+            writer.add_scalar("Reward/p90", p90, global_step)
+            writer.add_scalar("Reward/p99", p99, global_step)
             writer.add_scalar("Reward/recent_std", return_std, global_step)
             writer.add_scalar("Grad/global_norm", last_grad_norm, global_step)
 
@@ -1293,6 +1325,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 "recent_return_std": return_std,
                 "recent_return_max": return_max,
                 "recent_return_min": return_min,
+                "recent_return_p50": p50,
+                "recent_return_p90": p90,
+                "recent_return_p99": p99,
                 "episodes_completed": len(completed_returns),
                 "grad_norm": last_grad_norm,
                 "env_steps_per_sec": env_steps_per_sec,
@@ -1310,11 +1345,22 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     "replay_capacity": rstats["capacity"],
                     "replay_fill_rate": rstats["fill_rate"],
                     "replay_last_unique_ratio": rstats["last_sample_unique_ratio"],
+                    "replay_avg_unique_ratio": rstats.get("avg_sample_unique_ratio", 0.0),
+                    "replay_push_total": rstats.get("push_total", 0),
+                    "replay_priority_mean": rstats.get("priority_mean", 0.0),
+                    "replay_priority_p50": rstats.get("priority_p50", 0.0),
+                    "replay_priority_p90": rstats.get("priority_p90", 0.0),
+                    "replay_priority_p99": rstats.get("priority_p99", 0.0),
                 })
                 try:
                     writer.add_scalar("Replay/fill_rate", rstats["fill_rate"], global_step)
                     writer.add_scalar("Replay/last_unique_ratio", rstats["last_sample_unique_ratio"], global_step)
+                    if "avg_sample_unique_ratio" in rstats:
+                        writer.add_scalar("Replay/avg_unique_ratio", rstats["avg_sample_unique_ratio"], global_step)
                     writer.add_scalar("Replay/size", rstats["size"], global_step)
+                    if "priority_mean" in rstats:
+                        writer.add_scalar("Replay/priority_mean", rstats["priority_mean"], global_step)
+                        writer.add_scalar("Replay/priority_p90", rstats["priority_p90"], global_step)
                 except Exception:
                     pass
 
@@ -1393,6 +1439,23 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             # 降低 nvidia-smi 调用频率：仅当距离上次记录 >=120s 再写入 GPU util（否则仅使用 torch.cuda.memory 信息）
             if stats:
                 metrics_entry["resource"] = stats
+                # GPU 利用率窗口聚合
+                if not hasattr(run_training, "_gpu_util_hist"):
+                    run_training._gpu_util_hist = []  # type: ignore[attr-defined]
+                gpu_hist: list[float] = run_training._gpu_util_hist  # type: ignore[attr-defined]
+                util_vals = [v for k, v in stats.items() if k.endswith("_util_pct")]
+                if util_vals:
+                    util_mean_snapshot = float(np.mean(util_vals))
+                    gpu_hist.append(util_mean_snapshot)
+                    if len(gpu_hist) > 100:
+                        del gpu_hist[: len(gpu_hist) - 100]
+                    metrics_entry["gpu_util_last"] = util_mean_snapshot
+                    metrics_entry["gpu_util_mean_window"] = float(np.mean(gpu_hist))
+                    try:
+                        writer.add_scalar("Resource/gpu_util_last", util_mean_snapshot, global_step)
+                        writer.add_scalar("Resource/gpu_util_mean_window", float(np.mean(gpu_hist)), global_step)
+                    except Exception:
+                        pass
 
             try:
                 with metrics_file.open("a", encoding="utf-8") as fp:

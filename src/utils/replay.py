@@ -71,23 +71,47 @@ class PrioritizedReplay:
         self.pos = 0
         self.size = 0
         self.step = 0
-        # 统计数据
+        # 统计数据 (采样批次、唯一率、推入次数)
         self.sample_calls = 0
         self.sample_size_accum = 0
         self.last_sample_unique_ratio = 0.0
+        self.unique_ratio_accum = 0.0
         self.push_total = 0
+        # 配置：是否用 fp16 存储标量（advantages / target_values）节省内存
+        self._fp16_scalars = os.environ.get("MARIO_PER_FP16_SCALARS", "1").lower() not in {"0", "false", "off"}
 
     def stats(self) -> dict:
-        """返回环形缓冲统计信息，用于日志输出。"""
+        """返回环形缓冲统计信息 + 优先级分布指标。
+
+        注意：优先级分位数在样本数较大时会涉及一次 `np.percentile`，开销 O(n log n)，
+        日志周期通常较低（例如每 100 updates）可接受；如需进一步优化可引入随机抽样估计。
+        """
         fill_rate = float(self.size) / float(self.capacity) if self.capacity > 0 else 0.0
         avg_batch = (self.sample_size_accum / self.sample_calls) if self.sample_calls > 0 else 0.0
+        avg_unique = (self.unique_ratio_accum / self.sample_calls) if self.sample_calls > 0 else 0.0
+        prio_view = self.priorities[: self.size]
+        if self.size > 0:
+            try:
+                prio_mean = float(prio_view.mean())
+                prio_p50 = float(np.percentile(prio_view, 50))
+                prio_p90 = float(np.percentile(prio_view, 90))
+                prio_p99 = float(np.percentile(prio_view, 99))
+            except Exception:
+                prio_mean = prio_p50 = prio_p90 = prio_p99 = 0.0
+        else:
+            prio_mean = prio_p50 = prio_p90 = prio_p99 = 0.0
         return {
             "capacity": int(self.capacity),
             "size": int(self.size),
             "fill_rate": fill_rate,
             "avg_sample_batch": float(avg_batch),
             "last_sample_unique_ratio": float(self.last_sample_unique_ratio),
+            "avg_sample_unique_ratio": float(avg_unique),
             "push_total": int(self.push_total),
+            "priority_mean": prio_mean,
+            "priority_p50": prio_p50,
+            "priority_p90": prio_p90,
+            "priority_p99": prio_p99,
         }
 
     # ----------------- 内部工具 -----------------
@@ -118,8 +142,9 @@ class PrioritizedReplay:
         obs_dtype = torch.uint8 if self._compress else torch.float32
         self.obs_storage = torch.empty((self.capacity, c, h, w), dtype=obs_dtype, device=torch.device("cpu"))
         self.actions = torch.empty((self.capacity,), dtype=torch.long, device=torch.device("cpu"))
-        self.target_values = torch.empty((self.capacity,), dtype=torch.float32, device=torch.device("cpu"))
-        self.advantages = torch.empty((self.capacity,), dtype=torch.float32, device=torch.device("cpu"))
+        scalar_dtype = torch.float16 if self._fp16_scalars else torch.float32
+        self.target_values = torch.empty((self.capacity,), dtype=scalar_dtype, device=torch.device("cpu"))
+        self.advantages = torch.empty((self.capacity,), dtype=scalar_dtype, device=torch.device("cpu"))
         eff_bytes = self.capacity * c * h * w * (1 if self._compress else 4)
         eff_gb = eff_bytes / (1024 ** 3)
         mode = "uint8" if self._compress else "float32"
@@ -128,13 +153,12 @@ class PrioritizedReplay:
         )
         if self._compress:
             print("[replay][hint] set MARIO_PER_COMPRESS=0 可禁用压缩；MARIO_PER_MAX_MEM_GB 调整内存上限。")
+        if self._fp16_scalars:
+            print("[replay][info] using FP16 storage for advantages/target_values (MARIO_PER_FP16_SCALARS=0 可关闭)")
 
     # ----------------- 公共 API -----------------
-    def __len__(self) -> int:
+    def __len__(self) -> int:  # pragma: no cover
         return self.size
-
-    def __len__(self) -> int:
-        return len(self.storage)
 
     def beta(self) -> float:
         fraction = min(1.0, self.step / float(max(1, self.beta_steps)))
@@ -171,8 +195,8 @@ class PrioritizedReplay:
             else:
                 obs_comp = observations.detach().cpu()
             act_cpu = act.detach().cpu()
-            tgt_cpu = tgt.detach().cpu()
-            adv_cpu = adv.detach().cpu()
+            tgt_cpu = tgt.detach().cpu().to(self.target_values.dtype)
+            adv_cpu = adv.detach().cpu().to(self.advantages.dtype)
             for i in range(B):
                 self.obs_storage[self.pos].copy_(obs_comp[i])  # type: ignore[arg-type]
                 self.actions[self.pos].copy_(act_cpu[i])       # type: ignore[arg-type]
@@ -206,15 +230,16 @@ class PrioritizedReplay:
         else:
             obs = obs_raw.to(self.device)
         actions = self.actions[indices].to(self.device)  # type: ignore[index]
-        target_values = self.target_values[indices].to(self.device)  # type: ignore[index]
-        advantages = self.advantages[indices].to(self.device)  # type: ignore[index]
+    target_values = self.target_values[indices].to(self.device).to(torch.float32)  # type: ignore[index]
+    advantages = self.advantages[indices].to(self.device).to(torch.float32)  # type: ignore[index]
         weights_t = torch.tensor(weights, device=self.device, dtype=torch.float32)
         self.step += 1
-    # 更新唯一索引比例
-    unique = len(set(int(x) for x in indices.tolist()))
-    self.sample_calls += 1
-    self.sample_size_accum += batch_size
-    self.last_sample_unique_ratio = unique / float(batch_size)
+        # 更新唯一索引比例
+        unique = len(set(int(x) for x in indices.tolist()))
+        self.sample_calls += 1
+        self.sample_size_accum += batch_size
+        self.last_sample_unique_ratio = unique / float(batch_size)
+        self.unique_ratio_accum += self.last_sample_unique_ratio
         return ReplaySample(obs, actions, target_values, advantages, weights_t, indices)
 
     def update_priorities(self, indices: np.ndarray, priorities: torch.Tensor):

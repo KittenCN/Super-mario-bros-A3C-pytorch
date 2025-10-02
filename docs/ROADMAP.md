@@ -15,11 +15,12 @@
 |------|------|------|-----------|--------|----------|
 | P0-1 | 历史 checkpoint global_step=0 回填 | 旧 overlap 期间保存的 ckpt 步数缺失，影响统计/调度 | 学习率调度、曲线对齐失真 | P0 | 已完成 |
 | P0-2 | 训练中断安全退出一致性 | Ctrl+C 或 OOM 后是否完整 flush / 关闭 monitor / 保存 latest | 可能丢失进度 / 文件句柄未关 | P0 | 已完成 |
-| P1-1 | metrics JSONL 结构化输出 | 当前依赖 stdout + (TB 目录为空问题)，缺少稳健数值日志 | 难以离线分析 | P1 | 1–2 天 |
-| P1-2 | TensorBoard 事件空目录调查 | 事件文件未生成 / writer 初始化逻辑验证 | 可视化受阻 | P1 | 进行中 (初步标记完成) |
-| P1-3 | Overlap 模式性能基线基准 | 对比 overlap=on/off steps/s、GPU 利用率 | 不知真实收益 | P1 | 2 天 |
-| P1-4 | PER 填充率与命中率监控 | 记录 size/capacity、采样重复率 | 难调优 | P1 | 已部分完成 |
-| P1-5 | 慢 step 溯源增强 | 当前仅打印耗时 > 阈值，未记录堆栈 | 定位 IO / 环锁慢点困难 | P1 | 2 天 |
+| P1-1 | metrics JSONL 结构化输出 | 当前依赖 stdout + (TB 目录为空问题)，缺少稳健数值日志 | 难以离线分析 | P1 | 已完成 |
+| P1-2 | TensorBoard 事件空目录调查 | 事件文件未生成 / writer 初始化逻辑验证 | 可视化受阻 | P1 | 已完成 (init 标记 + log_dir 输出) |
+| P1-3 | Overlap 模式性能基线基准 | 对比 overlap=on/off steps/s、GPU 利用率 | 不知真实收益 | P1 | 已完成 (脚本) |
+| P1-4 | PER 填充率与命中率监控 | 记录 size/capacity、采样重复率 | 难调优 | P1 | 已完成 (avg_unique_ratio) |
+| P1-5 | 慢 step 溯源增强 | 当前仅打印耗时 > 阈值，未记录堆栈 | 定位 IO / 环锁慢点困难 | P1 | 已完成 (窗口化追踪) |
+| P1-6 | 奖励分位数 / GPU 利用滑动窗口 | 增强奖励分布 & 资源趋势洞察 | 指标更全面 | P1 | 已完成 |
 | P2-1 | Checkpoint 回填脚本 & 自动迁移 | 单次运行修正所有 metadata JSON | 提升一致性 | P2 | 1 天 |
 | P2-2 | Replay FP16 优势/价值存储 | 进一步减内存 (adv/value) 约 2x | 降低内存峰值 | P2 | 1–2 天 |
 | P2-3 | GPU 端 PER / 混合预取 | 减少 host->device 复制 | 提升吞吐 | P2 | 3–5 天 |
@@ -38,10 +39,11 @@
 4. (初步完成) TensorBoard 空目录诊断：启动打印 log_dir 并写入 meta/started 标签；待验证空目录场景复现原因。
 
 ## 3. 短期 (T1, 下 1–2 周)
-1. Overlap 性能基准：脚本 `scripts/benchmark_overlap.py`，多组 (num_envs, rollout) 对照，输出 CSV。
-2. PER 指标扩展：`PrioritizedReplay` 增加 `sample_count`、`unique_indices_rate`、`avg_priority`，训练循环定期记录。
-3. FP16 replay scalar 存储：`advantages`、`target_values` 改用半精度（采样时转回 float32）。
-4. Checkpoint 迁移工具集成 CI（手动触发）。
+1. (已完成) Overlap 性能基准：脚本 `scripts/benchmark_overlap.py`。
+2. (已完成) PER 指标扩展：加入 `avg_sample_unique_ratio`、`replay_push_total`。
+3. (已完成) 奖励分位数 & GPU 滑动窗口利用率。
+4. FP16 replay scalar 存储：`advantages`、`target_values` 改用半精度（采样时转回 float32）。
+5. Checkpoint 迁移工具集成 CI（手动触发）。
 
 ## 4. 中期 (T2, 1 个月)
 1. GPU 侧 PER：使用 torch scatter / segment ops 实现优先级数组与采样（或引入简化 segment tree）。
@@ -65,9 +67,9 @@
 
 ## 7. 每项任务验收 (Definition of Done 简版)
 - 回填脚本：执行后所有旧 JSON `global_step` 合理且新增字段 `reconstructed_step_source:"rebuild"`。
-- metrics JSONL：5 个核心指标（loss_total, avg_return, env_steps_per_sec, replay_fill_rate, gpu_mem_used_mb）可被外部简单 jq 解析。
+- metrics JSONL：核心与扩展指标（loss_total, avg_return, recent_return_p50/p90/p99, env_steps_per_sec, replay_fill_rate, replay_avg_unique_ratio, gpu_util_mean_window, gpu_mem_used_mb）可被外部简单 jq 解析。
 - Overlap benchmark：生成 `bench_overlap_<timestamp>.csv` 含 columns: mode, num_envs, rollout, steps_per_sec, gpu_util_mean。
-- PER 填充率：日志出现 `[replay][stat] fill=XX.X% unique=YY.Y%`。
+- PER 填充率：日志出现 `[replay][stat] fill=XX.X% unique=YY.Y% avg_unique=ZZ.Z%`。
 
 ## 8. 近期执行顺序建议
 1. (P0-1) 回填脚本
