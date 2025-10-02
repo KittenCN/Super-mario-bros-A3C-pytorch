@@ -54,8 +54,14 @@
     "per_sample_interval": 4
   },
   "save_state": {
-    "global_step": 1920,
+    "global_step": 5120000,
     "global_update": 8000,
     "type": "checkpoint"
+  },
+  "reconstructed_step_source": {
+    "method": "assumed_rollout_steps",
+    "rollout_steps": 64,
+    "formula": "global_update * num_envs * rollout_steps",
+    "computed_at": "2025-10-02T08:34:31.855385Z"
   }
 }

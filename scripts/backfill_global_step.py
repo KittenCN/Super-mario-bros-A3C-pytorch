@@ -56,23 +56,32 @@ def dump_json(path: Path, data: dict) -> None:
     path.write_text(payload, encoding="utf-8")
 
 
-def backfill_file(path: Path, rollout_steps: int, dry_run: bool, backup: bool) -> tuple[bool, str]:
+def backfill_file(
+    path: Path,
+    rollout_steps: int,
+    dry_run: bool,
+    backup: bool,
+    update_if_lower: bool,
+) -> tuple[bool, str]:
     meta = load_json(path)
     save_state = meta.get("save_state", {})
     global_step = int(save_state.get("global_step", 0) or 0)
     global_update = int(save_state.get("global_update", 0) or 0)
-    if global_step > 0:
-        return False, "already_has_step"
     if global_update <= 0:
         return False, "no_update_info"
-    if "reconstructed_step_source" in meta:
-        return False, "already_reconstructed"
     # 提取 num_envs；无则失败
     try:
         num_envs = int(meta["vector_env"]["num_envs"])  # type: ignore[index]
     except Exception:
         return False, "missing_num_envs"
     new_global_step = global_update * num_envs * rollout_steps
+    if global_step > 0:
+        if not update_if_lower:
+            return False, "already_has_step"
+        if new_global_step <= global_step:
+            return False, "current_step>=computed"
+    if "reconstructed_step_source" in meta and not update_if_lower:
+        return False, "already_reconstructed"
     meta["save_state"]["global_step"] = int(new_global_step)
     meta["reconstructed_step_source"] = {
         "method": "assumed_rollout_steps",
@@ -96,6 +105,11 @@ def main():  # noqa: D401
     parser.add_argument("--assume-rollout-steps", type=int, default=64, help="假设历史训练的 rollout_steps")
     parser.add_argument("--dry-run", action="store_true", help="仅打印将修改的文件")
     parser.add_argument("--no-backup", action="store_true", help="不生成 .bak 备份文件")
+    parser.add_argument(
+        "--update-if-lower",
+        action="store_true",
+        help="当计算值大于已有 global_step 时也回填（用于历史残留小步数）",
+    )
     args = parser.parse_args()
     root = Path(args.root)
     if not root.exists():
@@ -108,7 +122,13 @@ def main():  # noqa: D401
     changed = 0
     skipped = 0
     for f in files:
-        ok, status = backfill_file(f, args.assume_rollout_steps, args.dry_run, backup=not args.no_backup)
+        ok, status = backfill_file(
+            f,
+            args.assume_rollout_steps,
+            args.dry_run,
+            backup=not args.no_backup,
+            update_if_lower=args.update_if_lower,
+        )
         if ok:
             changed += 1
             print(f"[migrate] {f}: {status}")

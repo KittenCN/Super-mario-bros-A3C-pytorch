@@ -138,6 +138,7 @@
 - 参数 | Assumption: 旧 runs 使用 rollout_steps=64（可通过 `--assume-rollout-steps` 覆盖）。
 - 验证 | Validation: 对示例文件 `_0002000.json` 等执行 dry-run 输出预期 step 数；真实执行后 JSON 更新且含追踪字段。
 - 风险 | Risk: 若历史 rollout_steps 与假设不符将产生系统性偏移；在追踪字段中记录方便后续二次迁移；可通过 `.bak` 还原。
+- 2025-10-02 更新 | Update: 脚本新增 `--update-if-lower`，允许在已有 `global_step` 小于推导值时回填；已对 `trained_models/run_balanced/` 系列 checkpoint 应用，写入 `reconstructed_step_source` 并记录新时间戳。
 
 ## 10. 训练安全退出与最新快照保障
 

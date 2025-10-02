@@ -13,7 +13,7 @@
 ## 1. 待办矩阵
 | 编号 | 主题 | 描述 | 风险/影响 | 优先级 | 建议窗口 |
 |------|------|------|-----------|--------|----------|
-| P0-1 | 历史 checkpoint global_step=0 回填 | 旧 overlap 期间保存的 ckpt 步数缺失，影响统计/调度 | 学习率调度、曲线对齐失真 | P0 | 部分完成（run01 已回填，其余待批量执行） |
+| P0-1 | 历史 checkpoint global_step=0 回填 | 旧 overlap 期间保存的 ckpt 步数缺失，影响统计/调度 | 学习率调度、曲线对齐失真 | P0 | 部分完成（run01、run_balanced 已回填；run_tput/exp_shaping1 待补充元数据） |
 | P0-2 | 训练中断安全退出一致性 | Ctrl+C 或 OOM 后是否完整 flush / 关闭 monitor / 保存 latest | 可能丢失进度 / 文件句柄未关 | P0 | 已完成 |
 | P0-3 | PER 间隔推送缺陷 | `per_sample_interval>1` 时仅在抽样轮 push，导致大量经验未入库 | 优先级样本分布失真、训练收敛失败 | P0 | 已完成（2025-10-02 拆分 push/sample 逻辑并补单测） |
 | P1-1 | metrics JSONL 结构化输出 | 当前依赖 stdout + (TB 目录为空问题)，缺少稳健数值日志 | 难以离线分析 | P1 | 已完成 |
@@ -35,10 +35,10 @@
 | P3-5 | 视频生成与策略可视诊断 | 定期采样 episode 视频 | 便于调参 | P3 | 2 天 |
 
 ## 2. 立即执行 (T0, 本周内)
-1. (进行中) global_step 回填脚本批量执行：已运行 `scripts/backfill_global_step.py`，`run01/`(含 0008000) 已写入 `reconstructed_step_source`，其余 (`run_balanced/`, `run_tput/`, `exp_shaping1/`) 仍需人工确认实际步数是否合理。
+1. (进行中) global_step 回填脚本批量执行：已运行 `scripts/backfill_global_step.py --update-if-lower`，`run01/` 与 `run_balanced/` (含 checkpoint) 已写入 `reconstructed_step_source`；`run_tput/`、`exp_shaping1/` 因 `global_update=0` 需后续补充真实步数或人工标注。
 2. (已完成) 修复 PER 间隔推送缺陷：`_per_step_update` 独立处理 push 与 sample，并新增单测覆盖 `per_sample_interval>1`。
 3. (已完成) GPU 可用性告警：`--device auto` 无 CUDA 时阻断启动（或设置 `MARIO_ALLOW_CPU_AUTO=1` 后警告继续）。
-4. (验证中) metrics JSONL + TensorBoard：监控线程与训练线程并发写入已工作，但需补充 GPU util 缺失原因定位，并确认空目录告警在无 TB 写权限情况下的表现。
+4. (验证中) metrics JSONL + TensorBoard：抽样检查 `tensorboard/a3c_super_mario_bros/20251002-110631/metrics.jsonl`，确认包含 `replay_per_sample_interval`、`replay_sample_time_ms`、`gpu_util_mean_window` 等字段；仍需在最新训练跑中观察空目录场景。
 5. (已完成) 训练主循环异常安全：异常中断保存 latest + 清理资源。
 
 ## 3. 短期 (T1, 下 1–2 周)
@@ -77,7 +77,7 @@
 - PER 填充率：日志出现 `[replay][stat] fill=XX.X% unique=YY.Y% avg_unique=ZZ.Z%`。
 
 ## 8. 近期执行顺序建议
-1. (P0-1) 对剩余 checkpoint 执行 global_step 回填并写入审计字段。
+1. (P0-1) 对剩余 checkpoint (`run_tput/`, `exp_shaping1/`) 补全 global_step 与审计字段。
 2. (P1-7) 补充 GPU 可用性告警 / 自动降级策略。
 3. (P1-1/P1-2) metrics JSONL + TensorBoard 联合验证，确认 monitor 线程与训练线程并发写入稳定。
 4. (P1-4) PER 指标记录回归，确保修复后统计仍可用。
