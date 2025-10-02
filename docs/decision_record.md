@@ -245,6 +245,7 @@
 - 实施 | Implementation: 加入 `REWARD_DISTANCE_WEIGHT` 等变量；构建命令时仅在非空时追加；保存函数写 `_tmp` 后 rename；异常捕获分支调用 snapshot。
 - 验证 | Validation: dry-run 展示附加 CLI；故意 Ctrl+C 后 latest.* 存在且完整；metrics 中 model_compiled 可正确反映编译状态。
 - 风险 | Risk: 变量过多增加脚本复杂性；通过注释及默认留空减少心智负担。
+- 2025-10-03 更新 | Update: 调整 `BOOTSTRAP=1` 默认注入参数，使 distance_weight≥0.12、scale_start=0.25、scale_final=0.12、anneal_steps=80000，并默认添加更长的 `SCRIPTED_SEQUENCE` 与 `PROBE_FORWARD=24`，以在冷启动阶段提供更强的前进信号。
 
 
 ## 21. PER 间隔推送缺陷诊断 (PER interval push regression)

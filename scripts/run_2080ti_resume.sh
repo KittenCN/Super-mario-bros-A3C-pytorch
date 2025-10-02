@@ -19,7 +19,7 @@
 #     REWARD_DISTANCE_WEIGHT / REWARD_SCALE_START / REWARD_SCALE_FINAL / REWARD_SCALE_ANNEAL_STEPS
 #     SCRIPTED_SEQUENCE='START:8,RIGHT+B:120' 或 SCRIPTED_FORWARD_FRAMES / FORWARD_ACTION_ID / PROBE_FORWARD
 #     ENABLE_RAM_X_PARSE=1 启用 RAM 回退解析（fc_emulator 缺失 x_pos 时）
-# 14.(新增 2025-10-02) BOOTSTRAP=1 启动“冷启动推进”模式：若未显式指定相关参数则自动注入一组较激进的
+# 14.(新增 2025-10-02) BOOTSTRAP=1 启动“冷启动推进”模式：若未显式指定相关参数则自动注入一组更激进的
 #     初期位移与奖励塑形默认（distance_weight=0.08 + scripted START / RIGHT+B 序列 + RAM 解析），
 #     用于 distance/shaping 长期为 0 的场景，减少手动调参往返。
 #
@@ -80,7 +80,7 @@ show_help() {
   ENABLE_RAM_X_PARSE=1            # 1 启用 RAM 解析 x_pos 回退
   RAM_X_HIGH=0x006D               # RAM 高字节地址
   RAM_X_LOW=0x0086                # RAM 低字节地址
-  BOOTSTRAP=0                     # 1=自动注入一组冷启动推进默认参数（若用户未显式设置相关变量）
+  BOOTSTRAP=0                     # 1=自动注入更激进的冷启动推进默认参数（若用户未显式设置相关变量）
   NO_COMPILE=0            # 1=传 --no-compile 禁用 torch.compile (或 COMPILE=0)
   DISABLE_OVERLAP=0       # 1=不添加 --overlap-collect
   AUTO_MEM=0             # 1=开启自动显存降载重试
@@ -158,12 +158,13 @@ RAM_X_LOW=${RAM_X_LOW:-0x0086}
 # 若启用 BOOTSTRAP 且用户未显式提供相关 shaping / scripted / scale 参数，则填充默认值
 if [[ "$BOOTSTRAP" == "1" ]]; then
   # 仅在变量为空或未设定时注入，避免覆盖用户显式选择
-  if [[ -z "${REWARD_DISTANCE_WEIGHT}" ]]; then REWARD_DISTANCE_WEIGHT=0.08; fi
-  if [[ -z "${REWARD_SCALE_START}" ]]; then REWARD_SCALE_START=0.2; fi
-  if [[ -z "${REWARD_SCALE_FINAL}" ]]; then REWARD_SCALE_FINAL=0.1; fi
-  if [[ -z "${REWARD_SCALE_ANNEAL_STEPS}" ]]; then REWARD_SCALE_ANNEAL_STEPS=50000; fi
-  # 若用户未提供脚本化动作 & 未指定脚本化帧数，则注入一段较长前进，保证出现正向 dx
-  if [[ -z "${SCRIPTED_SEQUENCE}" && -z "${SCRIPTED_FORWARD_FRAMES}" ]]; then SCRIPTED_SEQUENCE='START:8,RIGHT+B:180'; fi
+  if [[ -z "${REWARD_DISTANCE_WEIGHT}" ]]; then REWARD_DISTANCE_WEIGHT=0.12; fi
+  if [[ -z "${REWARD_SCALE_START}" ]]; then REWARD_SCALE_START=0.25; fi
+  if [[ -z "${REWARD_SCALE_FINAL}" ]]; then REWARD_SCALE_FINAL=0.12; fi
+  if [[ -z "${REWARD_SCALE_ANNEAL_STEPS}" ]]; then REWARD_SCALE_ANNEAL_STEPS=80000; fi
+  # 若用户未提供脚本化动作 & 未指定脚本化帧数，则注入一段更长的前进，引导产生稳定的正向位移
+  if [[ -z "${SCRIPTED_SEQUENCE}" && -z "${SCRIPTED_FORWARD_FRAMES}" ]]; then SCRIPTED_SEQUENCE='START:12,RIGHT+B:240,RIGHT+A+B:60'; fi
+  if [[ -z "${PROBE_FORWARD}" ]]; then PROBE_FORWARD=24; fi
   # 强制确保 RAM 解析开启
   ENABLE_RAM_X_PARSE=1
 fi
