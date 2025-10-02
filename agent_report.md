@@ -126,3 +126,35 @@ python scripts/parse_env_report.py env_stability_report.jsonl
 - 诊断文件位置与格式说明：每个 `mario_env_diag_*` 目录包含若干 `env_init_idx{N}_pid{PID}.log`，每行带时间戳与标记（例如 `patch_start`, `calling_mario_make`, `mario_make_done`, `joypad_done` 等），可按时间点追踪 worker 初始化阶段。
 
 结论：抽样日志清楚地表明主要阻塞发生在 `mario_make()` 阶段（nes_py 原生初始化 / ROM 加载），且在高并发构造时更易触发。父进程预热与文件锁是合理缓解，但在当前环境下仍不足以完全避免阻塞；建议采取更强的序列化或替代后端以彻底稳定异步路径。
+
+---
+## 2025-10-02 补充 (Reward Shaping / Scripted Progression / Flexible Resume)
+
+### 新增能力概览
+- 距离 + 得分增量奖励塑形，线性退火 scale（`--reward-distance-weight`, `--reward-scale-start/final/anneal-steps`）。
+- RAM 回退解析 x_pos（`--enable-ram-x-parse`）支持 fc_emulator 缺失字段场景。
+- 脚本化前进：`--scripted-sequence`, `--scripted-forward-frames`；自动动作探测：`--probe-forward-actions`；显式 `--forward-action-id`。
+- 编译/未编译 checkpoint 自适应加载，自动处理 `_orig_mod.` 前缀。
+- 中断安全退出：异常 / Ctrl+C 保存 latest 原子快照。
+- 运行脚本扩展：支持环境变量注入上述 shaping / 脚本参数。
+
+### 关键指标新增
+`env_distance_delta_sum`, `env_shaping_raw_sum`, `env_shaping_scaled_sum`, `env_shaping_last_*`, `replay_priority_p50/p90/p99`, `gpu_util_mean_window`, `model_compiled`。
+
+### 快速验证命令
+```bash
+RUN_NAME=shaping_demo ACTION_TYPE=extended REWARD_DISTANCE_WEIGHT=0.05 \
+SCRIPTED_SEQUENCE='START:8,RIGHT+B:180' ENABLE_RAM_X_PARSE=1 \
+bash scripts/run_2080ti_resume.sh --dry-run
+```
+
+### 推荐调参流程
+1. 先用 scripted 序列确保 `env_distance_delta_sum>0`；
+2. 调整 distance_weight 至 raw_sum / distance_delta_sum 比值合理 (<2x)；
+3. 观察 scaled_sum 与 episode return 比例，必要时调低 scale_start；
+4. 移除 scripted，验证策略自发前进是否保留正向 shaping。
+
+### 后续工作建议
+- 添加 shaping smoke test：执行 1 个 scripted episode 断言 raw_sum>0。
+- 指标转存为 Parquet 加速分析。
+- GPU PER 采样原型 + KL 验证脚本。

@@ -54,6 +54,20 @@ python inference.py --checkpoint trained_models/run01/a3c_world1_stage1_0008000.
 - `--max-steps`: 单轮最大步数（默认10000）
 - `--seed`: 随机种子
 
+### Checkpoint 兼容性 (编译/未编译)
+训练阶段可能使用 `torch.compile`，保存的 checkpoint 已自动去除 `_orig_mod.` 前缀；推理脚本会：
+1. 尝试直接加载；
+2. 若键缺失，自动剥离或补加 `_orig_mod.` 前缀柔性匹配；
+3. 打印 missing/unexpected 汇总（不终止，只警告）。
+如需关闭编译路径差异，可重新以未编译模式保存最新模型。
+
+### 无元数据 JSON 的恢复
+若只保留了 `.pt` 文件，推理会尝试：
+1. 读取内部嵌入的 `config` 字段；
+2. 根据文件名模式推断 world/stage；
+3. 生成并写出新的同名 `.json` 元数据旁路文件。
+恢复失败时请参考 `trained_models/` 其他 JSON 样例手动补齐。详见 README 对应章节。
+
 ## 输出说明
 
 推理完成后会显示：

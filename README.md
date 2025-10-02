@@ -77,6 +77,28 @@ If the sidecar metadata JSON is missing, `test.py` will reconstruct it from the 
 - **Docker**：`docker build -t mario-a3c .` 后通过 `docker run --gpus all mario-a3c` 启动训练。<br>**Docker**: build with `docker build -t mario-a3c .` then launch via `docker run --gpus all mario-a3c`.
 - **Conda**：`conda env create -f environment.yml && conda activate mario-a3c`。<br>**Conda**: run `conda env create -f environment.yml && conda activate mario-a3c`.
 - **配置导出**：`--config-out configs/run.json` 保存最终 `TrainingConfig` 用于复现。<br>**Config export**: use `--config-out configs/run.json` to save the effective `TrainingConfig` for reproducibility.
+- **奖励塑形 (Reward Shaping)**：通过距离与得分增量提供早期信号。
+	```bash
+	# 基础：距离权重 + 动态缩放退火
+	python train.py --world 1 --stage 1 --num-envs 8 --reward-distance-weight 0.05 \
+		--reward-scale-start 0.3 --reward-scale-final 0.1 --reward-scale-anneal-steps 80000
+
+	# 启用 RAM 回退解析 (fc_emulator 缺失 x_pos 时)
+	python train.py ... --enable-ram-x-parse --ram-x-high-addr 0x006D --ram-x-low-addr 0x0086
+	```
+	监控指标：`env_distance_delta_sum`、`env_shaping_raw_sum`、`env_shaping_scaled_sum`（见 `docs/metrics_schema.md`）。
+- **脚本化前进 / 探测 (Scripted Progression & Probing)**：降低起步阶段停滞。
+	```bash
+	# 简单脚本序列：按 START 8 帧后持续 RIGHT+B 180 帧
+	python train.py ... --scripted-sequence 'START:8,RIGHT+B:180'
+
+	# 指定连续前进帧数（不显式动作 id）
+	python train.py ... --scripted-forward-frames 240
+
+	# 自动探测前进动作 (每动作连续 12 帧) 并选择 dx 最大的动作 id
+	python train.py ... --probe-forward-actions 12
+	```
+	推荐：初次跑在 extended 动作集合中结合 `--reward-distance-weight 0.05`；脚本阶段结束后正常策略接管。
 
 ## 项目结构 | Project Structure
 - `src/envs/`：环境工厂、奖励塑形、帧处理、录像封装。<br>`src/envs/`: environment factories, reward shaping, frame processing, video wrappers.

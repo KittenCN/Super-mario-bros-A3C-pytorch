@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "timestamp": "2025-10-02T07:43:03.547797Z",
+  "world": 1,
+  "stage": 1,
+  "action_type": "extended",
+  "frame_skip": 4,
+  "frame_stack": 4,
+  "video_dir": "output/videos",
+  "record_video": false,
+  "vector_env": {
+    "num_envs": 10,
+    "asynchronous": false,
+    "stage_schedule": [
+      [
+        1,
+        1
+      ],
+      [
+        1,
+        2
+      ],
+      [
+        1,
+        3
+      ],
+      [
+        1,
+        4
+      ]
+    ],
+    "random_start_stage": false,
+    "base_seed": 42
+  },
+  "model": {
+    "input_channels": 4,
+    "action_space": 8,
+    "base_channels": 32,
+    "hidden_size": 512,
+    "num_res_blocks": 3,
+    "recurrent_type": "gru",
+    "transformer_layers": 2,
+    "transformer_heads": 4,
+    "dropout": 0.1,
+    "use_noisy_linear": false
+  },
+  "replay": {
+    "capacity": 200000,
+    "priority_alpha": 0.6,
+    "priority_beta": 0.4,
+    "priority_beta_final": 1.0,
+    "priority_beta_steps": 1000000,
+    "enable": true,
+    "per_sample_interval": 4
+  },
+  "save_state": {
+    "global_step": 2560,
+    "global_update": 0,
+    "type": "latest",
+    "reason": "exception"
+  }
+}

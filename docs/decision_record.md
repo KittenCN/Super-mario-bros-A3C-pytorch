@@ -21,6 +21,11 @@
 13. 慢 step 窗口化堆栈追踪 (Slow step windowed tracing)
 14. Overlap 性能基准脚本 (benchmark_overlap.py)
 15. PER sample 语法错误修复与 FP16 标量存储确认
+16. 编译模型与 checkpoint 兼容性（延迟编译 + 灵活 state_dict 加载）
+17. 奖励塑形与距离度量 (Distance reward & dynamic scaling)
+18. 脚本化前进与动作探测 (Scripted progression & forward action probing)
+19. RAM x_pos 回退解析与 shaping 诊断 (RAM fallback parsing)
+20. 运行脚本参数扩展与原子写 (Launcher extension & atomic writes)
 
 ---
 ## 1. 环境构建可观测性增强
@@ -207,6 +212,35 @@
 - 验证 | Validation: 人工构造已编译与未编译两种运行模式，保存 checkpoint 后在另一模式下恢复：日志仅出现少量 `flexible load issues`（或无），训练继续；单元测试（replay 相关）通过。
 - 风险 | Risk: 后续若引入自定义包装器改变属性名（非 `_orig_mod`）需扩展映射；`strict=False` 可能掩盖真实结构性不兼容（通过日志截断提示缓解）。
 - 后续 | Next: 计划加入单元测试：构造一个模型 -> 保存 -> 模拟编译版本加载 / 去编译版本加载，断言参数 tensor 总数与哈希一致；并在 metrics 中记录 `model_compiled=0/1` 便于实验追踪。
+
+## 17. 奖励塑形与距离度量 (Distance reward & dynamic scaling)
+- 问题 | Problem: 原始环境奖励稀疏，起步阶段随机策略难以产生正向信号；episode return 长时间贴近 0。
+- 决策 | Decision: 引入 `raw_shaping = score_delta + distance_weight * dx`，并通过线性退火 scale (start→final) 输出 `scaled_shaping = raw_shaping * scale`，再与 env reward 相加；所有中间量用于诊断。
+- 实施 | Implementation: `MarioRewardWrapper` 计算 dx（info.x_pos 或 RAM fallback），缓存 last_raw/last_scaled/last_dx/last_scale；metrics 增加累积和与 last_* 字段。
+- CLI: `--reward-distance-weight --reward-scale-start --reward-scale-final --reward-scale-anneal-steps`。
+- 验证 | Validation: 在脚本化前进 180 帧下 `env_distance_delta_sum>0` 且 `env_shaping_raw_sum` 非零；scale 随 global_step 线性插值下降。
+- 风险 | Risk: distance_weight 过大可能淹没 score 差分；scale 不当会放大噪声；需监控 scaled_sum / episode_return 比值（推荐 < 0.6 初期）。
+
+## 18. 脚本化前进与动作探测 (Scripted progression & forward action probing)
+- 问题 | Problem: 初期 dx=0 导致 shaping 亦为 0；难以跨越起点惯性阶段。
+- 决策 | Decision: 提供四级优先级：显式 forward_action_id > 探测 `--probe-forward-actions N` > `--scripted-sequence` > `--scripted-forward-frames`；一旦 episode 出现智能体非零策略动作或脚本耗尽即回退正常策略。
+- 实施 | Implementation: 训练循环开头检查是否仍处 scripted 阶段；探测阶段对每个动作执行 N 连帧记录 dx，选择最大者；打印 `[scripted][probe] action=i dx=...` 日志。
+- 验证 | Validation: 探测输出表明 extended 动作集中某组合 (RIGHT+B) dx 最大；选择后 distance 奖励开始滚动累积。
+- 风险 | Risk: 过长脚本→策略依赖；探测成本 O(ActionSpace*N) 需在小 N (≤12) 与低频阶段使用。
+
+## 19. RAM x_pos 回退解析与 shaping 诊断 (RAM fallback parsing)
+- 问题 | Problem: fc_emulator 缺失 info.x_pos 导致 dx=0；distance 奖励失效。
+- 决策 | Decision: 启用 `--enable-ram-x-parse` 时读取 NES RAM (0x006D 高 + 0x0086 低) 组合成位置；地址可通过 CLI 覆盖；失败计数 env_shaping_parse_fail 记录。
+- 实施 | Implementation: Wrapper 缓存上一帧 x；若解析失败增加 fail 计数并不更新 dx；日志在 debug 模式输出 RAM 值。
+- 验证 | Validation: 启用后在前进脚本阶段 dx>0；fail 计数保持 0；禁用开关后 raw_sum 回落 0。
+- 风险 | Risk: ROM 变体地址偏移；文档提示如 dx 异常为 0 可尝试调整地址。
+
+## 20. 运行脚本参数扩展与原子写 (Launcher extension & atomic writes)
+- 问题 | Problem: 新奖励 & 脚本化 CLI 不易通过单一脚本复现；checkpoint 写入可能中途中断产生半文件。
+- 决策 | Decision: `run_2080ti_resume.sh` 增加条件拼接环境变量映射；checkpoint 保存采用临时文件 + `os.replace`；中断路径写 latest 快照。
+- 实施 | Implementation: 加入 `REWARD_DISTANCE_WEIGHT` 等变量；构建命令时仅在非空时追加；保存函数写 `_tmp` 后 rename；异常捕获分支调用 snapshot。
+- 验证 | Validation: dry-run 展示附加 CLI；故意 Ctrl+C 后 latest.* 存在且完整；metrics 中 model_compiled 可正确反映编译状态。
+- 风险 | Risk: 变量过多增加脚本复杂性；通过注释及默认留空减少心智负担。
 
 
 ---

@@ -15,6 +15,10 @@
 # 10.(新增) 优化 PER 内存：支持 uint8 压缩与上限自适应 (MARIO_PER_MAX_MEM_GB / MARIO_PER_COMPRESS)，脚本提供便捷变量
 # 11.(新增) 可选关闭 torch.compile：通过 NO_COMPILE=1 或 COMPILE=0，便于调试 / 避免首次编译开销
 # 12.(新增) 可选关闭 overlap：DISABLE_OVERLAP=1 直接去掉 --overlap-collect
+# 13.(新增 2025-10-02) 距离奖励 / 动态缩放 / 脚本化前进支持：
+#     REWARD_DISTANCE_WEIGHT / REWARD_SCALE_START / REWARD_SCALE_FINAL / REWARD_SCALE_ANNEAL_STEPS
+#     SCRIPTED_SEQUENCE='START:8,RIGHT+B:120' 或 SCRIPTED_FORWARD_FRAMES / FORWARD_ACTION_ID / PROBE_FORWARD
+#     ENABLE_RAM_X_PARSE=1 启用 RAM 回退解析（fc_emulator 缺失 x_pos 时）
 #
 # 用法 / Usage:
 #   bash scripts/run_2080ti_resume.sh            # 直接启动
@@ -60,6 +64,18 @@ show_help() {
   PER_INTERVAL=4          # PER 抽样间隔
   SAVE_ROOT=trained_models # 根保存目录
   LOG_DIR=tensorboard/a3c_super_mario_bros
+  # ---- 奖励 / 前进脚本相关 (均可选) ----
+  REWARD_DISTANCE_WEIGHT=0.0125   # 位移奖励权重 (默认 1/80) 建议调高以强化初期推进 (如 0.05)
+  REWARD_SCALE_START=0.2          # 动态缩放初始值
+  REWARD_SCALE_FINAL=0.1          # 动态缩放结束值
+  REWARD_SCALE_ANNEAL_STEPS=50000 # 动态缩放线性退火步数 (env steps)
+  SCRIPTED_SEQUENCE=              # 例如: 'START:8,RIGHT+B:120' (优先级高于 SCRIPTED_FORWARD_FRAMES)
+  SCRIPTED_FORWARD_FRAMES=0       # 仅早期强制前进的帧数 (乘以 num_envs) 0=禁用
+  FORWARD_ACTION_ID=              # 明确指定前进动作 id (extended 动作集合中 RIGHT+B 常见 id 不固定)
+  PROBE_FORWARD=0                 # >0 时探测每个动作连续执行该步数, 自动选择 forward_action_id
+  ENABLE_RAM_X_PARSE=1            # 1 启用 RAM 解析 x_pos 回退
+  RAM_X_HIGH=0x006D               # RAM 高字节地址
+  RAM_X_LOW=0x0086                # RAM 低字节地址
   NO_COMPILE=0            # 1=传 --no-compile 禁用 torch.compile (或 COMPILE=0)
   DISABLE_OVERLAP=0       # 1=不添加 --overlap-collect
   AUTO_MEM=0             # 1=开启自动显存降载重试
@@ -119,6 +135,19 @@ NO_COMPILE=${NO_COMPILE:-0}
 COMPILE=${COMPILE:-1}
 DISABLE_OVERLAP=${DISABLE_OVERLAP:-0}
 
+# 奖励 / 脚本化 / 探测相关可选值读取（若未提供则保持缺省或空）
+REWARD_DISTANCE_WEIGHT=${REWARD_DISTANCE_WEIGHT:-}
+REWARD_SCALE_START=${REWARD_SCALE_START:-}
+REWARD_SCALE_FINAL=${REWARD_SCALE_FINAL:-}
+REWARD_SCALE_ANNEAL_STEPS=${REWARD_SCALE_ANNEAL_STEPS:-}
+SCRIPTED_SEQUENCE=${SCRIPTED_SEQUENCE:-}
+SCRIPTED_FORWARD_FRAMES=${SCRIPTED_FORWARD_FRAMES:-}
+FORWARD_ACTION_ID=${FORWARD_ACTION_ID:-}
+PROBE_FORWARD=${PROBE_FORWARD:-}
+ENABLE_RAM_X_PARSE=${ENABLE_RAM_X_PARSE:-1}
+RAM_X_HIGH=${RAM_X_HIGH:-0x006D}
+RAM_X_LOW=${RAM_X_LOW:-0x0086}
+
 # 细粒度进度相关（若未显式设定使用默认）
 ROLL_PROGRESS_INTERVAL=${ROLL_PROGRESS_INTERVAL:-8}
 ROLL_PROGRESS_WARMUP_UPDATES=${ROLL_PROGRESS_WARMUP_UPDATES:-2}
@@ -173,6 +202,17 @@ build_cmd() {
   if (( NO_COMPILE == 1 )) || (( COMPILE == 0 )); then
     CMD+=(--no-compile)
   fi
+  # 距离奖励与动态缩放（仅当变量非空）
+  if [[ -n "$REWARD_DISTANCE_WEIGHT" ]]; then CMD+=(--reward-distance-weight "$REWARD_DISTANCE_WEIGHT"); fi
+  if [[ -n "$REWARD_SCALE_START" ]]; then CMD+=(--reward-scale-start "$REWARD_SCALE_START"); fi
+  if [[ -n "$REWARD_SCALE_FINAL" ]]; then CMD+=(--reward-scale-final "$REWARD_SCALE_FINAL"); fi
+  if [[ -n "$REWARD_SCALE_ANNEAL_STEPS" ]]; then CMD+=(--reward-scale-anneal-steps "$REWARD_SCALE_ANNEAL_STEPS"); fi
+  # 脚本化前进 / 探测 / RAM 解析
+  if [[ -n "$SCRIPTED_SEQUENCE" ]]; then CMD+=(--scripted-sequence "$SCRIPTED_SEQUENCE"); fi
+  if [[ -n "$SCRIPTED_FORWARD_FRAMES" && "$SCRIPTED_FORWARD_FRAMES" != "0" ]]; then CMD+=(--scripted-forward-frames "$SCRIPTED_FORWARD_FRAMES"); fi
+  if [[ -n "$FORWARD_ACTION_ID" ]]; then CMD+=(--forward-action-id "$FORWARD_ACTION_ID"); fi
+  if [[ -n "$PROBE_FORWARD" && "$PROBE_FORWARD" != "0" ]]; then CMD+=(--probe-forward-actions "$PROBE_FORWARD"); fi
+  if [[ "$ENABLE_RAM_X_PARSE" == "1" ]]; then CMD+=(--enable-ram-x-parse --ram-x-high-addr "$RAM_X_HIGH" --ram-x-low-addr "$RAM_X_LOW"); fi
 }
 
 build_cmd
