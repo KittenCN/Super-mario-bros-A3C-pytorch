@@ -27,6 +27,7 @@
 19. RAM x_pos 回退解析与 shaping 诊断 (RAM fallback parsing)
 20. 运行脚本参数扩展与原子写 (Launcher extension & atomic writes)
 21. PER 间隔推送缺陷诊断 (PER interval push regression)
+22. GPU 自动降级守卫 (Device auto guard)
 
 ---
 ## 1. 环境构建可观测性增强
@@ -252,6 +253,13 @@
 - 实施 | Implementation: 新增 `_per_step_update` 辅助函数集中处理 push + sample + priority 更新；日志按采样结果输出 `replay_sample_time_ms` 与细分耗时；更新 `tests/test_replay_basic.py`，通过 `_DummyModel` 验证 `per_sample_interval=3` 时 `push_total == updates * num_steps * num_envs`。
 - 验证 | Validation: `pytest tests/test_replay_basic.py` 通过；`replay_push_total` 随更新累积，非抽样轮 `replay_sample_time_ms` 自动填 0。
 - 后续 | Next: 修复后回归 `metrics_summary.py` 输出，观测 `replay_push_total` 与 `global_step` 同步增长；文档强调 interval 仅控制抽样频率而非写入频次。
+
+## 22. GPU 自动降级守卫 (Device auto guard)
+- 问题 | Problem: 默认 `--device auto` 在无 CUDA 环境会静默退化到 CPU，训练速度降至 <0.3 SPS，且用户不易察觉。
+- 决策 | Decision: 检测 CUDA 不可用时阻止自动回退，要求显式传入 `--device cpu`，或通过环境变量允许降级。
+- 实施 | Implementation: 在 `run_training` 中新增守卫；若 `MARIO_ALLOW_CPU_AUTO` 未开启且 `torch.cuda.is_available()==False`，抛出 `[train][error]` 提示；若设置允许，则打印警告后继续使用 CPU。
+- 验证 | Validation: 单元测试 `tests/test_replay_basic.py` 仍通过（显式设置 `--device cpu` 场景不受影响）；本地执行 `pytest` 表明守卫未破坏现有流程。
+- 后续 | Next: 需要在 README / 启动指南中提示新增环境变量；CI / 脚本应视部署环境决定是否设置 `MARIO_ALLOW_CPU_AUTO=1`。
 
 
 ---

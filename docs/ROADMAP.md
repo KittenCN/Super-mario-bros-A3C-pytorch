@@ -35,9 +35,9 @@
 | P3-5 | 视频生成与策略可视诊断 | 定期采样 episode 视频 | 便于调参 | P3 | 2 天 |
 
 ## 2. 立即执行 (T0, 本周内)
-1. (进行中) global_step 回填脚本批量执行：`run01/` 已回填并带审计字段，其余 (`run_balanced/`, `run_tput/`, `exp_shaping1/`) 仍保留旧值，需要一次性跑 `scripts/backfill_global_step.py` 并抽查 JSON。
+1. (进行中) global_step 回填脚本批量执行：已运行 `scripts/backfill_global_step.py`，`run01/`(含 0008000) 已写入 `reconstructed_step_source`，其余 (`run_balanced/`, `run_tput/`, `exp_shaping1/`) 仍需人工确认实际步数是否合理。
 2. (已完成) 修复 PER 间隔推送缺陷：`_per_step_update` 独立处理 push 与 sample，并新增单测覆盖 `per_sample_interval>1`。
-3. (新增) GPU 可用性告警：当 `--device auto` 但 `torch.cuda.is_available()==False` 时给出显式警告或自动降级策略（当前运行会静默改用 CPU，SPS ≈0.15）。
+3. (已完成) GPU 可用性告警：`--device auto` 无 CUDA 时阻断启动（或设置 `MARIO_ALLOW_CPU_AUTO=1` 后警告继续）。
 4. (验证中) metrics JSONL + TensorBoard：监控线程与训练线程并发写入已工作，但需补充 GPU util 缺失原因定位，并确认空目录告警在无 TB 写权限情况下的表现。
 5. (已完成) 训练主循环异常安全：异常中断保存 latest + 清理资源。
 

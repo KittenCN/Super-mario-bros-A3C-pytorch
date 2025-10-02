@@ -753,7 +753,17 @@ def call_with_timeout(fn, timeout: float, *args, **kwargs):
 def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     # Device and performance tuning
     if cfg.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        allow_cpu_auto = os.environ.get("MARIO_ALLOW_CPU_AUTO", "0").lower() in {"1", "true", "yes", "on"}
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            message = (
+                "未检测到可用的 CUDA 设备；请显式传入 --device cpu (或设置 MARIO_ALLOW_CPU_AUTO=1 允许自动回退)"
+            )
+            if not allow_cpu_auto:
+                raise SystemExit(f"[train][error] {message}")
+            print(f"[train][warn] {message}")
+            device = torch.device("cpu")
     else:
         device = torch.device(cfg.device)
 
