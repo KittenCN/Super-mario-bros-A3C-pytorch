@@ -898,10 +898,14 @@ def _maybe_print_training_hints(update_idx: int, metrics: Dict[str, Any]) -> Non
     avg_return = float(metrics.get("avg_return", 0.0) or 0.0)
     distance_delta = float(metrics.get("env_distance_delta_sum", 0) or 0)
     shaping_raw = float(metrics.get("env_shaping_raw_sum", 0.0) or 0.0)
+    shaping_scaled = float(metrics.get("env_shaping_scaled_sum", 0.0) or 0.0)
     replay_fill = float(metrics.get("replay_fill_rate", 0.0) or 0.0)
     gpu_util = float(metrics.get("gpu_util_mean_window", -1.0) or -1.0)
     loss_total = float(metrics.get("loss_total", 0.0) or 0.0)
     global_step_value = int(metrics.get("global_step", 0) or 0)
+    episodes_completed = int(metrics.get("episodes_completed", 0) or 0)
+    train_device = str(metrics.get("train_device", ""))
+    num_envs = int(metrics.get("num_envs", 0) or 0)
 
     if distance_delta == 0 and shaping_raw == 0 and global_step_value > 0:
         hints.append(
@@ -909,15 +913,27 @@ def _maybe_print_training_hints(update_idx: int, metrics: Dict[str, Any]) -> Non
         )
 
     if avg_return <= 0.0 and update_idx >= 200:
-        hints.append("avg_return 长期为 0，可检查奖励塑形或动作脚本是否生效。")
+        if shaping_scaled > 1.0 and episodes_completed == 0:
+            hints.append(
+                "已检测到推进/塑形奖励，但原生奖励仍为 0；建议缩短 episode 超时或增加死亡惩罚以促使环境结束。"
+            )
+        elif shaping_scaled <= 1.0:
+            hints.append("avg_return 长期为 0，可检查奖励塑形或动作脚本是否生效。")
 
     if replay_fill < 0.05 and update_idx >= 100:
         hints.append(
             "经验回放填充率 <5%，建议延长预热或提高 per_sample_interval 以外的 push 频率。"
         )
 
-    if gpu_util >= 0 and gpu_util < 5.0 and update_idx >= 200:
-        hints.append("GPU 利用率极低，确认是否使用 GPU 设备或提高并行度/rollout。")
+    if (
+        train_device == "cuda"
+        and gpu_util >= 0
+        and gpu_util < 5.0
+        and update_idx >= max(200, num_envs * 10)
+    ):
+        hints.append(
+            "GPU 利用率较低（长期 <5%），可增加 num_envs/rollout 或确认数据加载是否受 CPU 限制。"
+        )
 
     if loss_total > 2.5 and update_idx >= 50:
         hints.append("loss_total 偏高，可检查学习率或梯度截断设置。")
@@ -3113,6 +3129,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     "update": update_idx,
                     "global_step": global_step,
                     "model_compiled": 1 if hasattr(model, "_orig_mod") else 0,
+                    "train_device": device.type,
+                    "num_envs": cfg.env.num_envs,
                     "loss_total": loss_total,
                     "loss_policy": loss_policy,
                     "loss_value": loss_value,
