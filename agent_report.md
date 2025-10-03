@@ -158,3 +158,25 @@ bash scripts/run_2080ti_resume.sh --dry-run
 - 添加 shaping smoke test：执行 1 个 scripted episode 断言 raw_sum>0。
 - 指标转存为 Parquet 加速分析。
 - GPU PER 采样原型 + KL 验证脚本。
+
+## 2025-10-03 补充 (Adaptive Runtime Injection & Diagnostics)
+
+### 新增实施
+- 自适应 distance_weight 由 shadow 记录改为实时写回 `MarioRewardWrapper`（setter）。
+- 增加集成测试 `tests/test_adaptive_injection_integration.py` 验证写回后 raw 奖励线性放大。
+- 训练 metrics 增加 `wrapper_distance_weight` 反映当前实际权重；`adaptive_distance_weight_effective` 继续表示最新调度目标。
+- 增加可选调试 `MARIO_SHAPING_DEBUG=1` 输出 dx 解析路径；wrapper 内部记录最近一次 shaping 诊断。
+
+### 当前已观察到的问题
+- fc_emulator backend 下 `env_positive_dx_ratio` 恒 0，导致自适应持续上调；原因：stagnation_steps 未在 dx>0 时清零（需在 rollout 更新逻辑里补条件）。
+- `env_shaping_raw_sum` 恒 0，需确认 fc_emulator info 字段与 `MarioRewardWrapper` 解析逻辑映射是否缺失（可能 `score_delta` 与 dx 未被 wrapper 捕获）。
+
+### 修复计划（P1 优先级）
+1. 在 rollout 采集循环内：若本步任何 env x_pos 增量>0 => 对应 stagnation_steps[i]=0。
+2. 若 distance_delta_sum>0 & env_positive_dx_ratio==0 => fallback 推断 ratio= min(1.0, distance_delta_sum/(num_envs*frame_skip)) 并记录 `adaptive_ratio_fallback=1`。
+3. 在 wrapper 打印一次 `[reward][warn] dx_missed ...` 当检测到 current_x>prev_x 但 dx=0（已添加 debug 钩子，可扩展为阈值校验）。
+4. 单 env smoke：验证 shaping_raw_sum>0；失败时自动 dump 一帧 info + shaping 诊断。
+
+### 度量对齐
+- 添加后续字段提案：`stagnation_envs`, `stagnation_mean_steps`, `adaptive_ratio_fallback`。
+- 考虑在 README 的自适应章节补充“故障排查：ratio 长期为 0”说明。

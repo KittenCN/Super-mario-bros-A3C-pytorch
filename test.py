@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.distributions import Categorical
 
-from src.app_config import EvaluationConfig, ModelConfig
+from src.config import EvaluationConfig, ModelConfig
 from src.envs import MarioEnvConfig, create_eval_env
 from src.models import MarioActorCritic
 from src.utils.heartbeat import HeartbeatReporter

@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import io
 import sys
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple, TypeVar, Generic, Protocol
 
 # Temporarily silence stderr during imports that may emit Gym migration notices
 _saved_stderr = sys.stderr
@@ -42,7 +42,12 @@ class RewardConfig:
 
 
 class MarioRewardWrapper(gym.Wrapper):
-    """Reward shaping to encourage progress and penalize failure."""
+    """Reward shaping wrapper.
+
+    新增：
+    - set_distance_weight(): 允许训练循环/自适应调度器在运行期安全更新 distance_weight。
+    - get_diagnostics(): 返回最近一次 step 缓存的 shaping 诊断，便于测试/监控。
+    """
 
     def __init__(self, env: gym.Env, config: Optional[RewardConfig] = None) -> None:
         super().__init__(env)
@@ -62,6 +67,26 @@ class MarioRewardWrapper(gym.Wrapper):
         )
         # 调试输出计数（需放在 __init__ 内，否则模块导入时引用 self 抛 NameError 导致静默退出）
         self._ram_debug_prints: int = 0  # 限制调试输出次数
+        # 最近一次 step 的诊断快照（避免直接引用 info 被外部修改）
+        self._last_diag: Dict[str, Any] = {}
+
+    # ---- Runtime adaptive setters ----
+    def set_distance_weight(self, new_weight: float) -> None:
+        """Update distance_weight at runtime (用于 AdaptiveScheduler 注入)。"""
+        try:
+            if not isinstance(new_weight, (int, float)):
+                return
+            if new_weight < 0:
+                return
+            self.config.distance_weight = float(new_weight)
+        except Exception:  # pragma: no cover - 防御性
+            pass
+
+    def get_distance_weight(self) -> float:
+        return float(self.config.distance_weight)
+
+    def get_diagnostics(self) -> Dict[str, Any]:  # 供测试/调试
+        return dict(self._last_diag)
 
     def reset(
         self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
@@ -190,6 +215,17 @@ class MarioRewardWrapper(gym.Wrapper):
             )
         else:
             dx = 0.0
+        # 诊断：若外部统计出现推进但本地 dx 始终 0，便于定位 (通过环境变量开关避免噪音)
+        try:
+            if dx == 0.0 and isinstance(current_x, (int, float)) and self.config.distance_weight > 0 and self._step_counter < 5:
+                import os
+
+                if os.environ.get("MARIO_SHAPING_DEBUG", "0") in {"1", "true", "on"}:
+                    print(
+                        f"[reward][debug] dx_zero current_x={current_x} prev_x={self._prev_x} first_pending={self._first_progress_pending} step={self._step_counter}"
+                    )
+        except Exception:  # pragma: no cover
+            pass
 
         # 动态缩放系数
         self._step_counter += 1
@@ -240,20 +276,30 @@ class MarioRewardWrapper(gym.Wrapper):
         # 诊断信息（不覆盖已有 key）
         try:
             shaping = info.setdefault("shaping", {}) if isinstance(info, dict) else None
+            diag_local: Dict[str, Any] = {}
             if isinstance(shaping, dict):
-                # 直接覆盖，保证日志/metrics 始终反映最新一次 step 的诊断值
                 shaping["dx"] = dx
                 shaping["score_delta"] = score_delta
                 shaping["raw"] = float(raw_before_scale)
                 shaping["scale"] = float(dyn_scale)
                 shaping["scaled"] = float(shaped_reward)
+                diag_local = {
+                    "dx": dx,
+                    "score_delta": score_delta,
+                    "raw": float(raw_before_scale),
+                    "scale": float(dyn_scale),
+                    "scaled": float(shaped_reward),
+                }
                 if self.enable_ram_x_parse:
-                    shaping["ram_parse"] = {
+                    ram_d = {
                         "success": self._ram_success,
                         "failure": self._ram_failure,
                         "last_x": self._ram_last_x,
                     }
-        except Exception:
+                    shaping["ram_parse"] = ram_d
+                    diag_local["ram_parse"] = ram_d
+            self._last_diag = diag_local
+        except Exception:  # pragma: no cover
             pass
 
         # 调试：首次出现正向位移时打印一次（不依赖 RAM debug 次数）

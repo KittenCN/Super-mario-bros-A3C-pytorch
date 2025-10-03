@@ -9,7 +9,7 @@ sys.path.append(os.getcwd())
 import torch
 import torch.nn as nn
 
-from src.app_config import TrainingConfig
+from src.config import TrainingConfig
 from src.utils.replay import PrioritizedReplay
 from train import _build_checkpoint_metadata, _per_step_update, _write_metadata
 

@@ -70,7 +70,7 @@ from torch.optim import AdamW  # noqa: E402
 from torch.optim.lr_scheduler import LambdaLR  # noqa: E402
 
 from src.algorithms import vtrace_returns  # noqa: E402
-from src.app_config import TrainingConfig, create_default_stage_schedule  # noqa: E402
+from src.config import TrainingConfig, create_default_stage_schedule  # noqa: E402
 
 # Import patch utilities to allow parent process to prewarm and patch nes_py
 from src.envs.mario import (  # noqa: E402
@@ -2916,9 +2916,40 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                         cfg.optimizer, beta_entropy=float(new_ent)
                                     )
                                 if new_dw is not None:
-                                    metrics_entry["adaptive_distance_weight_effective"] = float(
-                                        new_dw
-                                    )
+                                    metrics_entry["adaptive_distance_weight_effective"] = float(new_dw)
+                                    # 写回实际 reward wrapper（所有 env）以使 shaping 立即生效
+                                    try:
+                                        if hasattr(env, "envs"):
+                                            for _e in env.envs:  # type: ignore[attr-defined]
+                                                cur = _e
+                                                for _ in range(8):  # unwrap 深度限制
+                                                    if cur is None:
+                                                        break
+                                                    if cur.__class__.__name__.lower().startswith("mariorewardwrapper"):
+                                                        try:
+                                                            cur.set_distance_weight(float(new_dw))  # type: ignore[attr-defined]
+                                                            metrics_entry.setdefault("wrapper_distance_weight", float(new_dw))
+                                                        except Exception:
+                                                            pass
+                                                        break
+                                                    cur = getattr(cur, "env", None)
+                                    except Exception:
+                                        pass
+                                else:
+                                    # 即使本轮没有调度更新，也尝试记录一个 representative wrapper 的当前值（一次即可）
+                                    if "wrapper_distance_weight" not in metrics_entry:
+                                        try:
+                                            if hasattr(env, "envs") and env.envs:  # type: ignore[attr-defined]
+                                                cur = env.envs[0]
+                                                for _ in range(8):
+                                                    if cur is None:
+                                                        break
+                                                    if cur.__class__.__name__.lower().startswith("mariorewardwrapper") and hasattr(cur, "get_distance_weight"):
+                                                        metrics_entry["wrapper_distance_weight"] = float(cur.get_distance_weight())  # type: ignore[attr-defined]
+                                                        break
+                                                    cur = getattr(cur, "env", None)
+                                        except Exception:
+                                            pass
                         except Exception as _adapt_e:
                             metrics_entry["adaptive_error"] = str(_adapt_e)[:120]
                 except Exception:

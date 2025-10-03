@@ -129,6 +129,14 @@ if [[ ! -x ${RUN_SCRIPT} ]]; then
 fi
 [[ -x ${RUN_SCRIPT} ]] || err "底层执行脚本 ${RUN_SCRIPT} 不存在或不可执行"
 
+# 依赖检查（仅进行一次）
+check_prereq() {
+  command -v python >/dev/null 2>&1 || err "未找到 python，可在虚拟环境下运行或安装依赖"
+  # 简单验证 train.py 存在
+  [[ -f train.py ]] || err "根目录下缺少 train.py"
+}
+check_prereq
+
 # 复制 checkpoint 到下一阶段目录（如果下一阶段目录不存在或为空）
 # 参数: src_run dst_run target_updates
 copy_checkpoint() {
@@ -179,7 +187,7 @@ run_phase() {
     "REWARD_DISTANCE_WEIGHT=$dw" "REWARD_SCALE_START=$scale_start" "REWARD_SCALE_FINAL=$scale_final" "REWARD_SCALE_ANNEAL_STEPS=$anneal" \
     "ENABLE_RAM_X_PARSE=1" \
     "AUTO_MEM=$AUTO_MEM" "OVERLAP_COLLECT=$OVERLAP" "PER=$PER" \
-    "LOG_DIR=$BASE_LOG_DIR" \
+    "LOG_DIR=$BASE_LOG_DIR" "SAVE_ROOT=$BASE_SAVE_ROOT" \
     "BOOTSTRAP=$bootstrap_env" \
     "AUTO_BOOTSTRAP_THRESHOLD=${AUTO_BOOTSTRAP_THRESHOLD}" \
     "AUTO_BOOTSTRAP_FRAMES=${AUTO_BOOTSTRAP_FRAMES}" \
@@ -195,9 +203,7 @@ run_phase() {
     Phase3) [[ -n "${PHASE3_EXTRA:-}" ]] && cmd=(env "${env_export[@]}" ${PHASE3_EXTRA} bash "$RUN_SCRIPT");;
   esac
 
-  if [[ -n "$script_seq" ]]; then
-    cmd+=( SCRIPTED_SEQUENCE="$script_seq" )
-  fi
+  # 仅使用环境变量传递 SCRIPTED_SEQUENCE，不再以额外参数方式追加，避免被底层脚本误判参数
 
   if [[ ${DRY_RUN} -eq 1 ]]; then
     # 仅运行底层脚本 dry-run 获取最终命令，不进入自动显存尝试逻辑
@@ -269,4 +275,14 @@ if ((${#PHASE_SUMMARY[@]} > 0)); then
     IFS='|' read -r pn rn upd dw sc an scseq <<<"$row"
     printf '  %-7s | %-16s | %-8s | %-8s | %-13s | %-11s | %s\n' "$pn" "$rn" "$upd" "$dw" "$sc" "$an" "${scseq:-}" 
   done
+  # 输出 TSV 汇总文件，便于外部解析
+  summary_file="${BASE_SAVE_ROOT}/phase_summary.tsv"
+  {
+    echo -e "Phase\tRun\tUpdates\tDistanceW\tScale\tAnneal\tScript"
+    for row in "${PHASE_SUMMARY[@]}"; do
+      IFS='|' read -r pn rn upd dw sc an scseq <<<"$row"
+      echo -e "${pn}\t${rn}\t${upd}\t${dw}\t${sc}\t${an}\t${scseq}"
+    done
+  } > "${summary_file}"
+  log "阶段摘要写入 ${summary_file}"
 fi

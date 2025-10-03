@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from src.app_config import ModelConfig
+from src.config import ModelConfig
 from src.models import MarioActorCritic
 
 

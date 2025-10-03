@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from src.app_config import ModelConfig
+from src.config import ModelConfig
 
 from .layers import ImpalaBlock, NoisyLinear
 from .sequence import PositionalEncoding

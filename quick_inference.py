@@ -19,7 +19,7 @@ from typing import Any, List, Tuple
 
 import torch
 
-from src.app_config import ModelConfig
+from src.config import ModelConfig
 from src.envs.mario import MarioEnvConfig, MarioVectorEnvConfig, create_vector_env
 from src.models import MarioActorCritic
 

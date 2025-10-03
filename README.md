@@ -180,6 +180,8 @@ python train.py ... \
 日志新增: `adaptive_distance_weight`, `adaptive_entropy_beta`, `adaptive_ratio_avg`。
 建议：在冷启动机制已保证快速产生正向位移后再启用，避免早期震荡。
 
+实时写回 (2025-10-03 更新)：自适应 distance_weight 现在会即时调用 `MarioRewardWrapper.set_distance_weight()` 写入所有底层环境，使得后续 step 的 `env_shaping_raw_sum` 立刻反映新权重；指标 `adaptive_distance_weight_effective` 即为写回值。若同时配置退火 (`reward-distance-weight-final`) 则两者叠加，内部采用差分补偿方式，必要时可在未来版本加入“锁定退火”开关。
+
 
 ## 项目结构 | Project Structure
 - `src/envs/`：环境工厂、奖励塑形、帧处理、录像封装。<br>`src/envs/`: environment factories, reward shaping, frame processing, video wrappers.

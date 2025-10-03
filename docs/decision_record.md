@@ -4,12 +4,20 @@
 
 更新时间 | Updated: 2025-10-02
 
+2025-10-03 增补：自适应 distance_weight 实时注入、类型化阶段计划拆分。
 ---
-## 目录 | Index
-1. 环境构建可观测性增强 (Per-env instrumentation)
-2. 递归自动恢复策略 (Recursive auto-resume)
-3. Fused 观测预处理包装器 (Fused preprocessing wrapper)
-4. 优先经验回放抽样间隔 (PER sampling interval)
+
+## 25. 自适应 distance_weight 实时注入 (2025-10-03)
+- 问题 | Problem: 早期自适应调度仅记录 shadow distance_weight，不影响实时奖励塑形，导致调度曲线与实际 shaping 能量脱节。
+- 决策 | Decision: 为 `MarioRewardWrapper` 添加 `set_distance_weight()`，训练循环在获得新 `new_dw` 时遍历底层 env unwrap 写回。
+- 实施 | Implementation: `src/envs/wrappers.py` 新增 setter + 诊断快照；`train.py` 自适应分支写回并记录 `adaptive_distance_weight_effective`。
+- 验证 | Validation: 启用自适应配置运行若干 updates，metrics 中 distance_weight 变化同时 `env_shaping_raw_sum` 平均值同步增减（人工对比前后 20 updates 均值）。
+- 风险 | Risk: 频繁写回可能与退火 (distance_weight_anneal_steps) 发生叠加；当前策略：写回后退火差分仍按 wrapper 内部逻辑补差值，可接受；后续可加入“锁定退火”开关。
+
+## 26. 类型化与训练器拆分规划 (2025-10-03)
+- 问题 | Problem: `train.py` 体积 >3000 行，缺少类型提示导致 mypy 噪声高，测试难以对关键逻辑做细粒度覆盖。
+- 决策 | Decision: 分阶段：P1 提供 env wrappers / adaptive / replay 关键外部接口类型；P2 拆分训练主循环为 `trainer/loop.py`, `trainer/checkpoint.py`, `trainer/logging.py`; P3 在 CI 引入 `mypy --strict` 白名单逐步收紧。
+- 后续 | Next: 创建 `src/trainer/` 目录放置最小骨架并迁移 compute_returns 等纯函数；保证现有接口与 CLI 行为不变，逐段移动确保测试持续通过。
 5. 资源监控开销削减 (Resource monitor throttling)
 6. 双缓冲重叠采集 (Overlap rollout collection)
 7. 未来演进候选 (Future candidates)
