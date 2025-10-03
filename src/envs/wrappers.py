@@ -226,6 +226,7 @@ class MarioRewardWrapper(gym.Wrapper):
                     current_x is None
                     and self.config.distance_weight > 0
                     and self._dx_missed_warn < 5
+                    and self._step_counter >= 5
                 ):
                     import os
 

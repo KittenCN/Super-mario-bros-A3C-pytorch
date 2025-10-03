@@ -193,6 +193,7 @@ bash scripts/run_2080ti_resume.sh --dry-run
 - `pytest -k shaping_smoke -q`
 - `pytest -k adaptive_injection_integration -q`
 - `MARIO_SHAPING_DEBUG=1 python train.py --world 1 --stage 1 --num-envs 1 --total-updates 5 --log-interval 1 --scripted-forward-frames 32 --reward-distance-weight 0.05`（观察到 `env_shaping_raw_sum≈16.45`、`env_shaping_scaled_sum≈3.28`，ratio 已恢复正常）
+- `MARIO_SHAPING_DEBUG=1 python train.py --world 1 --stage 1 --num-envs 2 --total-updates 5 --log-interval 1 --scripted-forward-frames 32 --reward-distance-weight 0.05`（双环境验证：`env_shaping_raw_sum≈16.45` 每轮累积翻倍，`env_positive_dx_envs=2`，确认 batched shaping 解析逻辑稳定）
 
 ### 后续建议
 - 观察真实训练日志中 `adaptive_ratio_fallback` 触发频率，若持续出现需追加更细粒度的 dx 诊断（例如输出 per-env 最近一次 dx）。
