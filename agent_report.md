@@ -194,6 +194,13 @@ bash scripts/run_2080ti_resume.sh --dry-run
 - `pytest -k adaptive_injection_integration -q`
 - `MARIO_SHAPING_DEBUG=1 python train.py --world 1 --stage 1 --num-envs 1 --total-updates 5 --log-interval 1 --scripted-forward-frames 32 --reward-distance-weight 0.05`（观察到 `env_shaping_raw_sum≈16.45`、`env_shaping_scaled_sum≈3.28`，ratio 已恢复正常）
 - `MARIO_SHAPING_DEBUG=1 python train.py --world 1 --stage 1 --num-envs 2 --total-updates 5 --log-interval 1 --scripted-forward-frames 32 --reward-distance-weight 0.05`（双环境验证：`env_shaping_raw_sum≈16.45` 每轮累积翻倍，`env_positive_dx_envs=2`，确认 batched shaping 解析逻辑稳定）
+- `MARIO_SHAPING_DEBUG=1 python train.py --world 1 --stage 1 --num-envs 2 --total-updates 20 --log-interval 5 --scripted-forward-frames 32 --reward-distance-weight 0.05`（同步多轮）
+- `MARIO_SHAPING_DEBUG=1 python train.py --world 1 --stage 1 --num-envs 4 --total-updates 50 --log-interval 10 --scripted-forward-frames 32 --reward-distance-weight 0.05 --async-env --confirm-async --parent-prewarm --overlap-collect`（异步 50 更新压力测试，无 fallback）
+
+### 新增快捷脚本
+- `scripts/train_stable_sync.sh`：封装稳定的同步训练参数（num_envs=2 / scripted-forward-frames=32 / distance_weight=0.05），默认写入 `trained_models/<run_name>` 与 `tensorboard/.../<run_name>`。
+- `scripts/train_stable_async.sh`：异步向量环境预设（num_envs=4 / total_updates=50 / overlap + parent-prewarm），便于一键复现长程压力测试。
+- 两个脚本均支持 `RUN_NAME=xxx TOTAL_UPDATES=nn bash ...` 覆盖参数与 `--dry-run` 预览命令。
 
 ### 后续建议
 - 观察真实训练日志中 `adaptive_ratio_fallback` 触发频率，若持续出现需追加更细粒度的 dx 诊断（例如输出 per-env 最近一次 dx）。
