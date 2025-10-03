@@ -17,6 +17,7 @@
 ## 分阶段路线 | Phased Roadmap
 1. **第 0–2 周：基础设施升级**<br>**Weeks 0–2: Infrastructure upgrades**
    - 完成依赖升级与环境迁移，并重构日志/配置入口。<br>   Upgrade dependencies, complete the environment migration, and refactor logging/config entry points.
+   - 修复核心训练例程（GAE bootstrap、余弦调度步数、构建超时线程释放），并补 smoke/单测确保行为稳定。<br>   Patch the core training loop (GAE bootstrap, cosine scheduler steps, env timeout thread cleanup) and add smoke/unit tests to lock behaviour.
    - 以向量化环境替换手写多进程实现，验证稳定性。<br>   Replace the custom multiprocessing implementation with vector environments and validate stability.
 2. **第 3–6 周：算法增强**<br>**Weeks 3–6: Algorithm enhancements**
    - 集成编译优化、AMP、学习率调度；实验 ResNet/Impala/GTrXL 组合。<br>   Integrate compile optimisations, AMP, LR scheduling; experiment with ResNet/Impala/GTrXL combinations.
@@ -31,6 +32,10 @@
 ## 风险与缓解 | Risks & Mitigations
 - **依赖兼容性**：API 变化可能破坏现有流程；需配合适配层与单元测试。<br>**Dependency compatibility**: API changes may break flows; mitigate with adapters and unit tests.
 - **训练不稳定**：更复杂的模型/探索可能导致梯度爆炸；使用梯度裁剪、EMA、监控告警。<br>**Training instability**: richer models/exploration can cause gradient blow-ups; contain with gradient clipping, EMA, and alerting.
+- **学习率调度失效**：`CosineWithWarmup` 步数配置若与 update 不匹配，LR 将长期保持初值；需对齐步数并记录曲线验证。<br>**Scheduler drift**: if `CosineWithWarmup` steps do not match updates, LR stays near its initial value; align counts and log the curve for verification.
+- **GAE fallback 偏差**：非 V-trace 路径的 bootstrap bug 会污染优势/价值目标；修复后需补 smoke/单测防回归。<br>**GAE fallback bias**: the non V-trace bootstrap bug corrupts advantages/targets; fix it and add smoke/unit tests to prevent regressions.
+- **构建超时线程泄漏**：`call_with_timeout` 超时后线程仍运行，可能残留 env 构建；改用可取消的子进程或守护线程。<br>**Timeout leakage**: `call_with_timeout` threads keep running after timeout; switch to cancellable subprocesses or daemon threads.
+- **日志并发写入**：Monitor 与主线程同时写 JSONL 可能交错；增加写锁或拆分输出文件。<br>**Concurrent logging**: the monitor and main threads append to JSONL simultaneously; guard with locks or separate files.
 - **资源成本**：分布式搜索耗费算力；设置预算上限与自动停机策略。<br>**Resource cost**: distributed sweeps are resource-intensive; enforce budget caps and auto-shutdown policies.
 - **工程复杂度**：大幅重构增加维护门槛；保持模块化设计并同步更新文档。<br>**Engineering complexity**: broad refactors raise maintenance overhead; keep modules modular and update documentation in lockstep.
 

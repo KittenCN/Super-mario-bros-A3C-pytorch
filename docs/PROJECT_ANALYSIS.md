@@ -55,3 +55,10 @@
 - 推荐 Python 3.10/3.11、PyTorch ≥ 2.1、Gymnasium 0.28，并安装 `gymnasium-super-mario-bros` 或兼容版本。<br>Recommend Python 3.10/3.11, PyTorch ≥ 2.1, Gymnasium 0.28, and `gymnasium-super-mario-bros` or a compatible variant.
 - 系统需预装 FFmpeg 以录制视频；Docker 镜像已内置。<br>FFmpeg must be installed for video capture; the Docker image ships with it.
 - 针对 Python 3.12 + NumPy 2.x 的 `nes_py` 溢出问题，请参考 `docs/ENV_DEBUGGING_REPORT.md`。<br>For `nes_py` overflow issues on Python 3.12 + NumPy 2.x, consult `docs/ENV_DEBUGGING_REPORT.md`.
+
+## 已知问题与改进建议 | Known Issues & Suggested Fixes
+- **GAE fallback bootstrap 取值错误**：非 V-trace 模式下 `compute_returns` 对最后一步使用当前 `values[t]` 而非 `bootstrap_value`，会系统性低估优势与价值目标；需 hotfix 并为 `--no-vtrace` 路径补 smoke/单元测试。<br>**GAE fallback bootstrap bug**: when V-trace is disabled, `compute_returns` feeds `values[t]` instead of the bootstrap value for the final timestep, biasing advantages/targets; hotfix and add smoke/unit tests for the `--no-vtrace` path.
+- **余弦调度步数失配**：`CosineWithWarmup.total_steps` 以 env step 计算，而调度器按 update 递增，导致学习率几乎不衰减；应改为使用 update 计数并在日志中输出 LR 曲线确认。<br>**Cosine scheduler step mismatch**: `CosineWithWarmup.total_steps` is scaled by env steps while the scheduler increments per update, so LR barely decays; switch to update counts and log the LR curve for verification.
+- **环境构建超时的线程泄漏**：`call_with_timeout` 超时后线程继续执行，可能残留挂起的 `create_vector_env`；建议改用可取消的子进程或守护线程确保失败后完全收敛。<br>**Env timeout thread leak**: `call_with_timeout` threads keep running after timeout, leaving hanging env constructors; migrate to cancellable subprocesses or daemon threads to guarantee cleanup.
+- **metrics JSONL 并发写冲突**：Monitor 线程与训练主循环同时向同一 JSONL 追加，缺少锁保护，线上可能出现交错/截断；可引入写锁或拆分为独立监控文件。<br>**Concurrent JSONL writes**: the monitor and training threads append to the same JSONL without locks, risking interleaved/truncated lines; add write locks or split the outputs.
+- **PER push 性能瓶颈**：`PrioritizedReplay.push` 逐元素 `copy_`，大批量 push 时 CPU 开销显著；可考虑向量化写入或批处理搬运以降低耗时并提升吞吐。<br>**PER push throughput**: `PrioritizedReplay.push` issues per-sample `copy_` calls, causing high CPU cost for large batches; explore vectorised writes or batched transfers to improve throughput.
