@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Deque, Optional
 
 
@@ -26,6 +28,7 @@ class HeartbeatReporter:
         stall_timeout: float = 180.0,
         print_fn: Optional[Callable[[str], None]] = None,
         enabled: bool = True,
+        log_path: Optional[Path] = None,
     ) -> None:
         self._component = component
         self._interval = max(interval, 1.0)
@@ -36,6 +39,10 @@ class HeartbeatReporter:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._log_lock = threading.Lock()
+        self._log_path: Optional[Path] = None
+        if log_path is not None:
+            self.set_log_path(log_path)
 
         self._history: Deque[_ProgressSample] = deque(maxlen=8)
         now = time.time()
@@ -102,6 +109,14 @@ class HeartbeatReporter:
             return
         self._emit(force=True)
 
+    def set_log_path(self, path: Path) -> None:
+        with self._log_lock:
+            self._log_path = path
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
     def _run(self) -> None:
         while not self._stop_event.wait(self._interval):
             self._emit(force=False)
@@ -150,7 +165,39 @@ class HeartbeatReporter:
         if force or history:
             self._print(f"[{self._component}][hb] " + " ".join(status_bits))
 
+        self._append_log(
+            {
+                "timestamp": now,
+                "component": self._component,
+                "phase": last_phase,
+                "update": last_update,
+                "global_step": last_step,
+                "updates_per_sec": update_rate,
+                "steps_per_sec": step_rate,
+                "idle_seconds": since_progress,
+                "message": last_message,
+            }
+        )
+
         if since_progress >= self._stall_timeout:
             self._print(
                 f"[{self._component}][warn] 已连续 {since_progress_text} 无训练/评估进度，请检查环境是否卡死或线程阻塞。"
             )
+
+    def _append_log(self, payload: dict) -> None:
+        if not self._enabled:
+            return
+        path = None
+        with self._log_lock:
+            path = self._log_path
+        if path is None:
+            return
+        try:
+            with self._log_lock:
+                if self._log_path is None:
+                    return
+                self._log_path.parent.mkdir(parents=True, exist_ok=True)
+                with self._log_path.open("a", encoding="utf-8") as fp:
+                    fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass

@@ -18,10 +18,13 @@
 1. **第 0–2 周：基础设施升级**<br>**Weeks 0–2: Infrastructure upgrades**
    - 完成依赖升级与环境迁移，并重构日志/配置入口。<br>   Upgrade dependencies, complete the environment migration, and refactor logging/config entry points.
    - 修复核心训练例程（GAE bootstrap、余弦调度步数、构建超时线程释放），并补 smoke/单测确保行为稳定。*(已完成 2025-10-04)*<br>   Patch the core training loop (GAE bootstrap, cosine scheduler steps, env timeout thread cleanup) and add smoke/unit tests to lock behaviour. *(completed 2025-10-04)*
+   - 建立 checkpoint 回填流水线：脚本支持 checkpoint hint 并通过 `backfill-global-step` 手动工作流验证。*(已完成 2025-10-04)*<br>   Deliver checkpoint backfill workflow with checkpoint hints and a `backfill-global-step` manual CI dry-run. *(completed 2025-10-04)*
+   - 心跳 & 指标快照：Heartbeat JSONL 与 `metrics/latest.parquet` 输出，支撑快速健康度诊断。*(已完成 2025-10-04)*<br>   Heartbeat JSONL plus `metrics/latest.parquet` snapshot for rapid health diagnostics. *(completed 2025-10-04)*
    - 以向量化环境替换手写多进程实现，验证稳定性。<br>   Replace the custom multiprocessing implementation with vector environments and validate stability.
 2. **第 3–6 周：算法增强**<br>**Weeks 3–6: Algorithm enhancements**
    - 集成编译优化、AMP、学习率调度；实验 ResNet/Impala/GTrXL 组合。<br>   Integrate compile optimisations, AMP, LR scheduling; experiment with ResNet/Impala/GTrXL combinations.
    - 引入 V-trace、熵调度、PER，量化对收敛速度的影响。<br>   Add V-trace, entropy scheduling, and PER, measuring their impact on convergence speed.
+   - 交付 PER GPU 采样原型：`use_gpu_sampler` flag + torch searchsorted，验证 host->device 搬运下降。*(已完成 2025-10-04)*<br>   Ship the PER GPU sampler prototype (`use_gpu_sampler` flag via torch searchsorted) and validate reduced host→device transfer. *(completed 2025-10-04)*
 3. **第 7–9 周：探索与超参**<br>**Weeks 7–9: Exploration & hyper-parameters**
    - 启动 Optuna/PBT 搜索，覆盖学习率、隐藏维度、循环类型、熵系数等。<br>   Launch Optuna/PBT sweeps covering learning rate, hidden sizes, recurrent types, entropy coefficients, and more.
    - 实验随机关卡、观测扰动、参数噪声等泛化策略。<br>   Test random stage schedules, observation augmentations, and parameter-space noise strategies.

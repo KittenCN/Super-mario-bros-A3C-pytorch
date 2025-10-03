@@ -35,6 +35,30 @@ def test_prioritized_replay_push_sample():
     stats = per.stats()
     assert stats["size"] == 16
     assert 0 < stats["priority_mean"]
+    assert stats["gpu_sampler"] is False
+
+
+def test_prioritized_replay_gpu_sampler_cpu_path():
+    per = PrioritizedReplay(
+        capacity=64,
+        alpha=0.6,
+        beta_start=0.4,
+        beta_final=1.0,
+        beta_steps=1000,
+        device=torch.device("cpu"),
+        use_gpu_sampler=True,
+    )
+    obs = torch.rand(32, 4, 84, 84)
+    actions = torch.randint(0, 6, (32,))
+    vals = torch.randn(32)
+    adv = torch.randn(32)
+    per.push(obs, actions, vals, adv)
+    sample = per.sample(16)
+    assert sample is not None
+    detailed, timings = per.sample_detailed(16)
+    assert detailed is not None
+    assert "prior" in timings and timings["prior"] >= 0.0
+    assert per.stats()["gpu_sampler"] is True
 
 
 def test_checkpoint_metadata_replay_field(tmp_path):

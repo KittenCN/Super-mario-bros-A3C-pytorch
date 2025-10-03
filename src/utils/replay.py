@@ -48,6 +48,8 @@ class PrioritizedReplay:
         beta_final: float,
         beta_steps: int,
         device: torch.device,
+        *,
+        use_gpu_sampler: bool = False,
     ) -> None:
         self.requested_capacity = capacity
         self.capacity = capacity  # 可被自适应调整
@@ -56,6 +58,11 @@ class PrioritizedReplay:
         self.beta_final = beta_final
         self.beta_steps = beta_steps
         self.device = device
+        self._sampler_device = device if device.type == "cuda" else torch.device("cpu")
+        self._use_gpu_sampler = bool(use_gpu_sampler)
+        if self._use_gpu_sampler and device.type == "cpu":
+            # 在无 GPU 时退化为 CPU Tensor 仍测试逻辑
+            self._sampler_device = torch.device("cpu")
 
         # 压缩控制
         self._compress = os.environ.get("MARIO_PER_COMPRESS", "1").lower() not in {
@@ -75,6 +82,7 @@ class PrioritizedReplay:
         self.target_values: Optional[torch.Tensor] = None  # float32 (capacity,)
         self.advantages: Optional[torch.Tensor] = None  # float32 (capacity,)
         self.priorities = np.zeros((self.capacity,), dtype=np.float32)
+        self._priority_tensor: Optional[torch.Tensor] = None
         self.pos = 0
         self.size = 0
         self.step = 0
@@ -88,6 +96,11 @@ class PrioritizedReplay:
         self._fp16_scalars = os.environ.get(
             "MARIO_PER_FP16_SCALARS", "1"
         ).lower() not in {"0", "false", "off"}
+
+        if self._use_gpu_sampler:
+            self._priority_tensor = torch.zeros(
+                (self.capacity,), device=self._sampler_device, dtype=torch.float32
+            )
 
     def stats(self) -> dict:
         """返回环形缓冲统计信息 + 优先级分布指标。
@@ -131,6 +144,7 @@ class PrioritizedReplay:
             "priority_p50": prio_p50,
             "priority_p90": prio_p90,
             "priority_p99": prio_p99,
+            "gpu_sampler": bool(self._use_gpu_sampler),
         }
 
     # ----------------- 内部工具 -----------------
@@ -188,6 +202,73 @@ class PrioritizedReplay:
             )
 
     # ----------------- 公共 API -----------------
+
+    def _update_priority_tensor(self, indices: np.ndarray) -> None:
+        if self._priority_tensor is None:
+            return
+        if indices.size == 0:
+            return
+        values = torch.as_tensor(
+            self.priorities[indices], device=self._sampler_device, dtype=torch.float32
+        )
+        self._priority_tensor.index_copy_(0, torch.as_tensor(indices, device=self._sampler_device), values)
+
+    def _priority_view(self) -> Optional[torch.Tensor]:
+        if self._priority_tensor is None:
+            return None
+        return self._priority_tensor[: self.size]
+
+    def _draw_indices(
+        self,
+        batch_size: int,
+        timings: Optional[dict[str, float]] = None,
+    ) -> Optional[tuple[np.ndarray, torch.Tensor, int]]:
+        if self.size < batch_size:
+            return None
+        valid = self.size
+        import time as _time
+
+        if self._use_gpu_sampler and self._priority_tensor is not None:
+            t_prior = _time.time()
+            priorities_t = self._priority_tensor[:valid]
+            scaled = priorities_t.pow(self.alpha)
+            denom = scaled.sum()
+            if denom.item() <= 0:
+                probs_t = torch.full(
+                    (valid,), 1.0 / valid, device=self._sampler_device
+                )
+            else:
+                probs_t = scaled / denom
+            if timings is not None:
+                timings["prior"] = (_time.time() - t_prior) * 1000.0
+            t_choice = _time.time()
+            cumulative = torch.cumsum(probs_t, dim=0)
+            rand = torch.rand(batch_size, device=self._sampler_device)
+            rand = rand.clamp(max=1.0 - 1e-8)
+            indices_t = torch.searchsorted(cumulative, rand, right=True)
+            indices_t = torch.clamp(indices_t, max=valid - 1)
+            if timings is not None:
+                timings["choice"] = (_time.time() - t_choice) * 1000.0
+            selected_probs = probs_t[indices_t].clamp(min=1e-12)
+            return indices_t.cpu().numpy(), selected_probs.to(self.device), valid
+
+        t_prior = _time.time()
+        priorities = self.priorities[:valid]
+        scaled = priorities**self.alpha
+        denom = scaled.sum()
+        if denom <= 0:
+            probs = np.full(valid, 1.0 / valid, dtype=np.float32)
+        else:
+            probs = scaled / denom
+        if timings is not None:
+            timings["prior"] = (_time.time() - t_prior) * 1000.0
+        t_choice = _time.time()
+        indices = np.random.choice(valid, batch_size, p=probs)
+        if timings is not None:
+            timings["choice"] = (_time.time() - t_choice) * 1000.0
+        probs_sel = torch.from_numpy(probs[indices]).to(self.device)
+        return indices.astype(np.int64), probs_sel.clamp(min=1e-12), valid
+
     def __len__(self) -> int:  # pragma: no cover
         return self.size
 
@@ -240,6 +321,7 @@ class PrioritizedReplay:
             self.advantages.index_copy_(0, indices, adv_cpu)  # type: ignore[arg-type]
             indices_np = indices.cpu().numpy()
             self.priorities[indices_np] = prio.astype(np.float32) + 1e-5
+            self._update_priority_tensor(indices_np)
             self.pos = int((int(self.pos) + B) % self.capacity)
             self.size = min(self.size + B, self.capacity)
             self.push_total += B
@@ -247,18 +329,14 @@ class PrioritizedReplay:
     def sample(self, batch_size: int) -> Optional[ReplaySample]:
         if self.size < batch_size or self.obs_storage is None:
             return None
-        valid = self.size
-        priorities = self.priorities[:valid]
-        scaled = priorities**self.alpha
-        denom = scaled.sum()
-        if denom <= 0:
-            probs = np.full(valid, 1.0 / valid, dtype=np.float32)
-        else:
-            probs = scaled / denom
-        indices = np.random.choice(valid, batch_size, p=probs)
+        drawn = self._draw_indices(batch_size)
+        if drawn is None:
+            return None
+        indices, probs_sel, valid = drawn
         beta = self.beta()
-        weights = (valid * probs[indices]) ** (-beta)
+        weights = (valid * probs_sel) ** (-beta)
         weights = weights / weights.max()
+        weights_t = weights.to(self.device, dtype=torch.float32)
         obs_raw = self.obs_storage[indices]  # type: ignore[index]
         if self._compress:
             obs = obs_raw.float().div_(255.0).to(self.device)
@@ -267,7 +345,6 @@ class PrioritizedReplay:
         actions = self.actions[indices].to(self.device)  # type: ignore[index]
         target_values = self.target_values[indices].to(self.device).to(torch.float32)  # type: ignore[index]
         advantages = self.advantages[indices].to(self.device).to(torch.float32)  # type: ignore[index]
-        weights_t = torch.tensor(weights, device=self.device, dtype=torch.float32)
         self.step += 1
         unique = len(set(int(x) for x in indices.tolist()))
         self.sample_calls += 1
@@ -294,22 +371,13 @@ class PrioritizedReplay:
         import time as _time
 
         t0 = _time.time()
-        valid = self.size
-        p_start = _time.time()
-        priorities = self.priorities[:valid]
-        scaled = priorities**self.alpha
-        denom = scaled.sum()
-        if denom <= 0:
-            probs = np.full(valid, 1.0 / valid, dtype=np.float32)
-        else:
-            probs = scaled / denom
-        timings["prior"] = (_time.time() - p_start) * 1000.0
-        c_start = _time.time()
-        indices = np.random.choice(valid, batch_size, p=probs)
-        timings["choice"] = (_time.time() - c_start) * 1000.0
+        drawn = self._draw_indices(batch_size, timings)
+        if drawn is None:
+            return None, timings
+        indices, probs_sel, valid = drawn
         w_start = _time.time()
         beta = self.beta()
-        weights = (valid * probs[indices]) ** (-beta)
+        weights = (valid * probs_sel) ** (-beta)
         weights = weights / weights.max()
         timings["weight"] = (_time.time() - w_start) * 1000.0
         d_start = _time.time()
@@ -323,7 +391,7 @@ class PrioritizedReplay:
         actions = self.actions[indices].to(self.device)  # type: ignore[index]
         target_values = self.target_values[indices].to(self.device).to(torch.float32)  # type: ignore[index]
         advantages = self.advantages[indices].to(self.device).to(torch.float32)  # type: ignore[index]
-        weights_t = torch.tensor(weights, device=self.device, dtype=torch.float32)
+        weights_t = weights.to(self.device, dtype=torch.float32)
         timings["tensor"] = (_time.time() - t_start) * 1000.0
         timings["total"] = (_time.time() - t0) * 1000.0
         # 统计更新（与 sample 一致）
@@ -339,12 +407,15 @@ class PrioritizedReplay:
         return sample, timings
 
     def update_priorities(self, indices: np.ndarray, priorities: torch.Tensor):
-        np_prior = priorities.detach().cpu().numpy().flatten()
-        for i, idx in enumerate(indices):
-            if idx < self.capacity:
-                self.priorities[idx] = (
-                    float(np_prior[min(i, np_prior.shape[0] - 1)]) + 1e-5
-                )
+        np_prior = priorities.detach().cpu().numpy().astype(np.float32).flatten()
+        if np_prior.size == 0 or indices.size == 0:
+            return
+        valid = indices < self.capacity
+        if not np.all(valid):
+            indices = indices[valid]
+            np_prior = np_prior[: indices.size]
+        self.priorities[indices] = np_prior + 1e-5
+        self._update_priority_tensor(indices)
         # 防止全部衰减为 0
         if np.all(self.priorities[: self.size] <= 0):
             self.priorities[: self.size] += 1e-5

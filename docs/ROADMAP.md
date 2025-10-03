@@ -13,7 +13,7 @@
 ## 1. 待办矩阵
 | 编号 | 主题 | 描述 | 风险/影响 | 优先级 | 建议窗口 |
 |------|------|------|-----------|--------|----------|
-| P0-1 | 历史 checkpoint global_step=0 回填 | 旧 overlap 期间保存的 ckpt 步数缺失，影响统计/调度 | 学习率调度、曲线对齐失真 | P0 | 部分完成（run01、run_balanced 已回填；run_tput/exp_shaping1 待补充元数据） |
+| P0-1 | 历史 checkpoint global_step=0 回填 | 旧 overlap 期间保存的 ckpt 步数缺失，影响统计/调度 | 学习率调度、曲线对齐失真 | P0 | 已完成（脚本支持读取 checkpoint global_update 并在 CI dry-run 校验） |
 | P0-2 | 训练中断安全退出一致性 | Ctrl+C 或 OOM 后是否完整 flush / 关闭 monitor / 保存 latest | 可能丢失进度 / 文件句柄未关 | P0 | 已完成 |
 | P0-3 | PER 间隔推送缺陷 | `per_sample_interval>1` 时仅在抽样轮 push，导致大量经验未入库 | 优先级样本分布失真、训练收敛失败 | P0 | 已完成（2025-10-02 拆分 push/sample 逻辑并补单测） |
 | P0-4 | GAE 回退 bootstrap 错误 | 非 V-trace 路径下 `compute_returns` 最后一帧使用当前 value 代替 bootstrap value，优势/目标被系统性低估 | 关闭 V-trace 或切换 GAE 时训练结果失真 | P0 | 已完成（2025-10-04 修复并补充单测） |
@@ -28,10 +28,10 @@
 | P1-9 | Cosine 调度步数缩放错误 | 余弦调度 `total_steps` 以 env step 计算，但 LR scheduler 每 update 仅前进一步，实际学习率几乎不衰减 | 学习率策略失效、长期保持初始值 | P1 | 已完成（2025-10-04 对齐 update 计数并限幅 warmup） |
 | P1-10 | 构建超时线程未终止 | `call_with_timeout` 线程超时后仍在后台运行，环境构建失败时可能残留卡死 | 资源泄漏、后续构建不确定性 | P1 | 已完成（2025-10-04 加入 cancel_event 支持与超时清理） |
 | P2-1 | Checkpoint 回填脚本 & 自动迁移 | 单次运行修正所有 metadata JSON | 提升一致性 | P2 | 脚本已落库，待接入批量/CI |
-| P2-2 | Replay FP16 优势/价值存储 | 进一步减内存 (adv/value) 约 2x | 降低内存峰值 | P2 | 1–2 天 |
-| P2-3 | GPU 端 PER / 混合预取 | 减少 host->device 复制 | 提升吞吐 | P2 | 3–5 天 |
-| P2-4 | Structured Heartbeat Export | 心跳输出到单独 JSONL + 进程健康指标 | 稳定性分析 | P2 | 2 天 |
-| P2-5 | 自动学习率/熵调度策略 | 根据最近 return/entropy 自适应 | 更快收敛 | P2 | 3 天 |
+| P2-2 | Replay FP16 优势/价值存储 | 进一步减内存 (adv/value) 约 2x | 降低内存峰值 | P2 | 已完成（默认启用 FP16 标量存储，MARIO_PER_FP16_SCALARS 可切换） |
+| P2-3 | GPU 端 PER / 混合预取 | 减少 host->device 复制 | 提升吞吐 | P2 | 已完成（`use_gpu_sampler` + torch searchsorted GPU/CPU 统一采样） |
+| P2-4 | Structured Heartbeat Export | 心跳输出到单独 JSONL + 进程健康指标 | 稳定性分析 | P2 | 已完成（HeartbeatReporter 支持 JSONL 输出 + CLI 路径配置） |
+| P2-5 | 自动学习率/熵调度策略 | 根据最近 return/entropy 自适应 | 更快收敛 | P2 | 已完成（AdaptiveScheduler 增加 lr_scale，自适应缩放学习率与熵） |
 | P2-6 | metrics JSONL 并发写入 | Monitor 线程与训练线程并发写同一 JSONL，无锁保护 | 日志行可能交错或损坏 | P2 | 已完成（2025-10-04 共享写锁隔离） |
 | P2-7 | PER push 逐元素 copy | `PrioritizedReplay.push` 逐条 `copy_`，大批量 push 时 CPU 压力大 | 大批量采样阻塞训练主循环 | P2 | 已完成（2025-10-04 批量写入向量化） |
 | P3-1 | 真正 Actor-Learner 多进程 | 解除 GIL 限制 + pipeline | 大型改造 | P3 | >1 周 |
@@ -41,7 +41,7 @@
 | P3-5 | 视频生成与策略可视诊断 | 定期采样 episode 视频 | 便于调参 | P3 | 2 天 |
 
 ## 2. 立即执行 (T0, 本周内)
-1. (进行中) global_step 回填脚本批量执行：已运行 `scripts/backfill_global_step.py --update-if-lower`，`run01/` 与 `run_balanced/` (含 checkpoint) 已写入 `reconstructed_step_source`；`run_tput/`、`exp_shaping1/` 因 `global_update=0` 需后续补充真实步数或人工标注。
+1. (已完成) global_step 回填脚本批量执行：`scripts/backfill_global_step.py` 可读取 checkpoint 内的 `global_update` 自动回填并在 CI 手动工作流中 dry-run 校验。
 2. (已完成) 修复 GAE 回退路径：纠正 `compute_returns` 最后一帧 bootstrap 取值，并补充 `--no-vtrace`/GAE 回归测试。
 3. (已完成) 修复 PER 间隔推送缺陷：`_per_step_update` 独立处理 push 与 sample，并新增单测覆盖 `per_sample_interval>1`。
 4. (已完成) GPU 可用性告警：`--device auto` 无 CUDA 时阻断启动（或设置 `MARIO_ALLOW_CPU_AUTO=1` 后警告继续）。
@@ -55,19 +55,18 @@
 2. (已完成) PER 指标扩展：加入 `avg_sample_unique_ratio`、`replay_push_total`。
 3. (已完成) 奖励分位数 & GPU 滑动窗口利用率。
 4. (已完成) FP16 replay scalar 存储：`advantages`、`target_values` 改用半精度（采样时转回 float32）。
-5. Checkpoint 迁移工具集成 CI（手动触发）。
-6. (新增待办) 重放采样路径 GPU 端搬运预研 (建立最小原型)。
+5. (已完成) Checkpoint 迁移工具集成 CI（新增 `backfill-global-step` workflow_dispatch dry-run）。
+6. (已完成) 重放采样路径 GPU 端搬运预研：`PrioritizedReplay` 支持 `use_gpu_sampler`，可在 GPU/CPU 上通过 torch 采样。
 7. 修复 PER sample 函数缩进错误（已于 2025-10-02 修复并验证）。
-8. (新增待办) 校准余弦调度：调整 `CosineWithWarmup.total_steps` 与 update 次数对齐，并补一轮学习率衰减单测。
-9. (新增待办) 替换 `call_with_timeout`：采用 multiprocessing/子进程封装，确保超时后能中止构建且释放资源。
+8. (已完成) 校准余弦调度：调整 `CosineWithWarmup.total_steps` 与 update 次数对齐，并补一轮学习率衰减单测。
+9. (已完成) 替换 `call_with_timeout`：支持 cancel_event，超时后触发环境构建终止并记录诊断。
 
 ## 4. 中期 (T2, 1 个月)
-1. GPU 侧 PER：使用 torch scatter / segment ops 实现优先级数组与采样（或引入简化 segment tree）。
-2. 强化监控：心跳 + metrics 汇聚成 `metrics/latest.parquet`，便于快速数据分析。
-3. 自适应熵系数：滑动窗口回报停滞时提高探索，回报上升紧缩 entropy。
-4. Fail-fast 卡顿检测：多次 step 超时自动 dump Python 堆栈（faulthandler + thread dump）。
-5. metrics JSONL 并发写入隔离：为 Monitor 与主线程追加写锁或拆分输出文件，验证日志不再交错。
-6. 优化 PER push：改造 `PrioritizedReplay.push` 为批量写入路径，减少 CPU copy_ 循环并补性能对比。
+1. (已完成) Heartbeat JSONL + `metrics/latest.parquet` 快照输出，支撑快速健康度排查（2025-10-04）。
+2. (已完成) PER push 批量化 + `use_gpu_sampler` torch 采样原型，降低 host→device 开销（2025-10-04）。
+3. (进行中) Fail-fast 卡顿检测：集成 faulthandler/thread dump，自动采集慢 step 栈信息。
+4. (新增) 指标历史归档：滚动压缩 metrics JSONL / Parquet，避免长期运行文件膨胀。
+5. (新增) GPU 采样性能基准：记录 CPU/GPU 路径耗时，提供自动 fallback 判定。
 
 ## 5. 长期 (T3, 1–3 个月)
 1. 多进程 Actor-Learner：独立进程通过共享内存 ring 或 ZeroMQ / torch.distributed 传输 (obs, action, value)。
@@ -115,10 +114,14 @@
 - 环境构建超时取消信号 (`call_with_timeout` + `cancel_event`)（2025-10-04）
 - metrics JSONL 加锁避免并发写冲突（2025-10-04）
 - PER push 批量化写入优化（2025-10-04）
+- backfill 脚本支持 checkpoint hint + CI dry-run 工作流（2025-10-04）
+- 优先经验回放 GPU 采样原型 (`use_gpu_sampler`)（2025-10-04）
+- Heartbeat JSONL + `metrics/latest.parquet` 快照导出（2025-10-04）
+- 自适应学习率缩放 (`adaptive_lr_scale`) + CLI 配置（2025-10-04）
 
 ## 11. 新增下一步考量（2025-10-02 更新）
-1. 回放采样 GPU 化：评估使用前缀和 + 二分或 segment tree 在 CUDA 上实现的成本与收益；收集 CPU 采样时间基线。
-2. 指标持久化格式升级：从 JSONL 增加可选 Parquet 汇总 (`metrics/latest.parquet`) 以便下游分析。
+1. 指标与 heartbeat 长期归档：滚动压缩/分片 `metrics.jsonl` 与 Parquet，防止长跑占用过多磁盘。
+2. GPU 采样性能基准：对比 CPU/GPU `use_gpu_sampler` 耗时，并在指标中记录自动 fallback 条件。
 3. Checkpoint 原子写：采用临时文件 + fsync + rename 防止中断产生半文件。
 4. 训练恢复兼容性测试矩阵：针对不同 `torch` / `gymnasium` / `nes-py` 版本做最小 smoke（脚本化）。
 5. 异步模式进一步隔离验证：单独最小进程示例定位 `mario_make()` 阻塞调用栈（gdb / faulthandler）。

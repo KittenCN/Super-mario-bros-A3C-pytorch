@@ -6,6 +6,8 @@ gym-super-mario-bros>=7.4.0
 nes-py>=8.2.1
 opencv-python>=4.8.0
 numpy>=1.24.0
+pandas>=2.1.0
+pyarrow>=13.0.0
 
 # Monitoring & logging
 tensorboard>=2.14.0

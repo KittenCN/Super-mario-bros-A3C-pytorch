@@ -31,12 +31,14 @@ def test_adaptive_low_phase():
         ent_high=0.4,
         ent_lr=0.5,
     )
-    sched = AdaptiveScheduler(cfg, base_distance_weight=0.01, base_entropy_beta=0.005)
+    sched = AdaptiveScheduler(
+        cfg, base_distance_weight=0.01, base_entropy_beta=0.005, base_lr_scale=1.0
+    )
 
     updates_dw = []
     updates_ent = []
     for _ in range(12):
-        ndw, ne, metrics = sched.step(0.0)  # 极低 ratio
+        ndw, ne, _, metrics = sched.step(0.0)  # 极低 ratio
         if ndw is not None:
             updates_dw.append(ndw)
         if ne is not None:
@@ -67,7 +69,9 @@ def test_adaptive_high_phase():
         ent_high=0.4,
         ent_lr=0.5,
     )
-    sched = AdaptiveScheduler(cfg, base_distance_weight=0.04, base_entropy_beta=0.015)
+    sched = AdaptiveScheduler(
+        cfg, base_distance_weight=0.04, base_entropy_beta=0.015, base_lr_scale=1.0
+    )
 
     for _ in range(10):
         sched.step(0.9)  # 极高 ratio
@@ -92,7 +96,12 @@ def test_adaptive_stable_band():
     )
     base_dw = 0.02
     base_ent = 0.01
-    sched = AdaptiveScheduler(cfg, base_distance_weight=base_dw, base_entropy_beta=base_ent)
+    sched = AdaptiveScheduler(
+        cfg,
+        base_distance_weight=base_dw,
+        base_entropy_beta=base_ent,
+        base_lr_scale=1.0,
+    )
 
     # 先几步进入稳态（中间带）
     for _ in range(20):
@@ -121,7 +130,7 @@ def test_adaptive_ema_direction_consistency():
     ema_values = []
     avg_values = []
     for _ in range(15):
-        _, _, metrics = sched.step(0.0)  # 推向上限
+        _, _, _, metrics = sched.step(0.0)  # 推向上限
         ema_values.append(metrics["adaptive_ratio_ema"])
         avg_values.append(metrics["adaptive_ratio_avg"])
 
@@ -130,3 +139,32 @@ def test_adaptive_ema_direction_consistency():
     assert all(avg_values[i] >= avg_values[i + 1] - 1e-9 for i in range(len(avg_values) - 1))
     assert ema_values[-1] < 0.05
     assert avg_values[-1] < 0.05
+
+
+def test_adaptive_lr_scale_low_ratio_increase():
+    cfg = AdaptiveConfig(
+        window=4,
+        dw_max=0.05,
+        dw_min=0.005,
+        dw_low=0.2,
+        dw_high=0.4,
+        dw_lr=0.5,
+        lr_scale_max=1.5,
+        lr_scale_min=0.5,
+        lr_lr=0.5,
+    )
+    sched = AdaptiveScheduler(
+        cfg, base_distance_weight=0.02, base_entropy_beta=0.01, base_lr_scale=1.0
+    )
+
+    scales = []
+    for _ in range(6):
+        _, _, new_scale, metrics = sched.step(0.0)
+        if new_scale is not None:
+            scales.append(new_scale)
+        if "adaptive_lr_scale" in metrics:
+            scales.append(metrics["adaptive_lr_scale"])
+
+    assert scales  # should have updates
+    assert all(sc >= 1.0 for sc in scales)
+    assert sched.lr_scale <= cfg.lr_scale_max + 1e-6

@@ -40,6 +40,10 @@ class AdaptiveConfig:
     ent_low: float = 0.05
     ent_high: float = 0.30
     ent_lr: float = 0.10
+    # Learning rate scale bounds
+    lr_scale_max: Optional[float] = None
+    lr_scale_min: Optional[float] = None
+    lr_lr: float = 0.05
     # EMA smoothing
     ema_alpha: Optional[float] = None  # if None => 2/(window+1)
 
@@ -51,13 +55,18 @@ class AdaptiveScheduler:
     """
 
     def __init__(
-        self, cfg: AdaptiveConfig, base_distance_weight: float, base_entropy_beta: float
+        self,
+        cfg: AdaptiveConfig,
+        base_distance_weight: float,
+        base_entropy_beta: float,
+        base_lr_scale: float = 1.0,
     ) -> None:
         self.cfg = cfg
         self._ratios: deque[float] = deque(maxlen=max(5, cfg.window))
         self._ema: Optional[float] = None
         self._distance_weight = base_distance_weight
         self._entropy_beta = base_entropy_beta
+        self._lr_scale = base_lr_scale
         if self.cfg.ema_alpha is None:
             self._alpha = 2.0 / (cfg.window + 1.0)
         else:
@@ -72,11 +81,15 @@ class AdaptiveScheduler:
             self.cfg.ent_max is not None
             and self.cfg.ent_min is not None
             and self.cfg.ent_max > self.cfg.ent_min
+        ) or (
+            self.cfg.lr_scale_max is not None
+            and self.cfg.lr_scale_min is not None
+            and self.cfg.lr_scale_max > self.cfg.lr_scale_min
         )
 
     def step(
         self, ratio: float
-    ) -> tuple[Optional[float], Optional[float], Dict[str, Any]]:
+    ) -> tuple[Optional[float], Optional[float], Optional[float], Dict[str, Any]]:
         """提交一次新的推进占比并返回可能更新后的参数与指标。
 
         Returns:
@@ -94,6 +107,7 @@ class AdaptiveScheduler:
 
         new_dw: Optional[float] = None
         new_ent: Optional[float] = None
+        new_lr_scale: Optional[float] = None
 
         # Distance weight adaptive
         if (
@@ -140,6 +154,29 @@ class AdaptiveScheduler:
                 self._entropy_beta = ent_t
                 new_ent = ent_t
 
+        if (
+            self.cfg.lr_scale_max is not None
+            and self.cfg.lr_scale_min is not None
+            and self.cfg.lr_scale_max > self.cfg.lr_scale_min
+        ):
+            lr_target = self._lr_scale
+            if avg_ratio < self.cfg.dw_low:
+                lr_target = (
+                    self._lr_scale
+                    + (self.cfg.lr_scale_max - self._lr_scale) * self.cfg.lr_lr
+                )
+            elif avg_ratio > self.cfg.dw_high:
+                lr_target = (
+                    self._lr_scale
+                    + (self.cfg.lr_scale_min - self._lr_scale) * self.cfg.lr_lr
+                )
+            lr_target = max(
+                self.cfg.lr_scale_min, min(self.cfg.lr_scale_max, lr_target)
+            )
+            if abs(lr_target - self._lr_scale) > 1e-12:
+                self._lr_scale = lr_target
+                new_lr_scale = lr_target
+
         metrics = {
             "adaptive_ratio_avg": round(avg_ratio, 4),
             "adaptive_ratio_ema": round(self._ema, 4),
@@ -148,7 +185,9 @@ class AdaptiveScheduler:
             metrics["adaptive_distance_weight"] = new_dw
         if new_ent is not None:
             metrics["adaptive_entropy_beta"] = new_ent
-        return new_dw, new_ent, metrics
+        if new_lr_scale is not None:
+            metrics["adaptive_lr_scale"] = new_lr_scale
+        return new_dw, new_ent, new_lr_scale, metrics
 
     @property
     def distance_weight(self) -> float:
@@ -157,6 +196,10 @@ class AdaptiveScheduler:
     @property
     def entropy_beta(self) -> float:
         return self._entropy_beta
+
+    @property
+    def lr_scale(self) -> float:
+        return self._lr_scale
 
 
 __all__ = ["AdaptiveConfig", "AdaptiveScheduler"]

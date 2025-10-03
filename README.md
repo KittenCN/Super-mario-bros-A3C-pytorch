@@ -71,6 +71,7 @@ If the sidecar metadata JSON is missing, `test.py` will reconstruct it from the 
 - Gymnasium `RecordVideo` 默认将 MP4 写入 `output/eval/`。<br>Gymnasium’s `RecordVideo` writes MP4 files to `output/eval/` by default.
 - TensorBoard 记录损失、熵、学习率、奖励，W&B 可镜像同样的指标。<br>TensorBoard tracks loss, entropy, learning rate, and rewards; W&B can mirror the same metrics.
 - `src/utils/monitor.py`（配合 CLI 开关）在后台采集 CPU/GPU 资源使用。<br>`src/utils/monitor.py`, together with CLI switches, gathers background CPU/GPU utilisation.
+- HeartbeatReporter 默认写入 `run_dir/heartbeat.jsonl`（`--heartbeat-path` 可自定义），并在每次 log 周期刷新 `metrics/latest.parquet`，便于外部快速读取最新指标。<br>HeartbeatReporter writes to `run_dir/heartbeat.jsonl` (override via `--heartbeat-path`) and refreshes `metrics/latest.parquet` for fast analytics.
 
 ## 高级用法 | Advanced Usage
 - **Optuna 搜索**：`scripts/optuna_search.py` 运行短程实验，返回最佳 `avg_return`。<br>**Optuna search**: `scripts/optuna_search.py` runs short experiments and returns the best `avg_return`.
@@ -83,7 +84,7 @@ If the sidecar metadata JSON is missing, `test.py` will reconstruct it from the 
 	python scripts/benchmark_overlap.py --num-envs 4 8 --rollout-steps 32 64 --updates 300 --warmup-fraction 0.3
 	```
 	输出 CSV `benchmarks/bench_overlap_*.csv`，字段含义见首行表头。
-- **PER 优先级分析**：训练日志新增 `replay_priority_mean/p50/p90/p99` 与采样唯一率 `replay_avg_unique_ratio`；用于监控优先级分布是否塌缩。
+- **PER 优先级分析**：训练日志新增 `replay_priority_mean/p50/p90/p99` 与采样唯一率 `replay_avg_unique_ratio`；用于监控优先级分布是否塌缩；`--per-gpu-sample` 可启用 torch searchsorted 采样，在 GPU/CPU 上统一执行减轻 host→device 开销。
 - **FP16 标量存储**：设置环境变量 `MARIO_PER_FP16_SCALARS=0` 可关闭默认的 FP16 advantages/target_values 压缩（若需严格数值一致性对比）。
 - **Docker**：`docker build -t mario-a3c .` 后通过 `docker run --gpus all mario-a3c` 启动训练。<br>**Docker**: build with `docker build -t mario-a3c .` then launch via `docker run --gpus all mario-a3c`.
 - **Conda**：`conda env create -f environment.yml && conda activate mario-a3c`。<br>**Conda**: run `conda env create -f environment.yml && conda activate mario-a3c`.
@@ -188,6 +189,8 @@ python train.py ... \
 日志新增: `adaptive_distance_weight`, `adaptive_entropy_beta`, `adaptive_ratio_avg`。
 建议：在冷启动机制已保证快速产生正向位移后再启用，避免早期震荡。
 
+学习率缩放：若配置 `--adaptive-lr-scale-max/--adaptive-lr-scale-min/--adaptive-lr-scale-lr`，调度器会在相同阈值下对学习率乘以 `lr_scale`，并在指标中记录 `adaptive_lr_scale` 与最终 `learning_rate`，便于观察自适应效果。
+
 实时写回 (2025-10-03 更新)：自适应 distance_weight 现在会即时调用 `MarioRewardWrapper.set_distance_weight()` 写入所有底层环境，使得后续 step 的 `env_shaping_raw_sum` 立刻反映新权重；指标 `adaptive_distance_weight_effective` 即为写回值。若同时配置退火 (`reward-distance-weight-final`) 则两者叠加，内部采用差分补偿方式，必要时可在未来版本加入“锁定退火”开关。
 
 
@@ -236,8 +239,9 @@ PYTHONPATH=. python train.py --world 1 --stage 1 --num-envs 8 --total-updates 50
 
 1. Fused 观测预处理：将灰度、缩放、归一化、帧堆叠合并为单一 wrapper，减少多次函数调用。<br>Fused observation preprocessing to cut multiple Python calls.
 2. PER 抽样间隔：新增 `--per-sample-interval N`，允许每 N 轮才做一次 PER 样本/优先级更新。<br>`--per-sample-interval N` reduces frequency of PER sampling.
-3. 监控节流：降低外部 GPU 查询频率，为后续 NVML 方案预留接口。<br>Throttled external GPU metric polling.
-4. 双缓冲重叠采集（实验特性）：`--overlap-collect` 在同步向量环境下启用后台线程采集下一批 rollout，与当前批学习重叠。<br>Experimental `--overlap-collect` flag: background thread collects next rollout while learning current one (sync env only).
+3. PER GPU 采样原型：`--per-gpu-sample` 激活 torch 驱动的优先级抽样（GPU/CPU 通用），减少 host->device 搬运瓶颈。<br>PER GPU sampler prototype (`--per-gpu-sample`) uses a torch-based priority draw to cut host→device overhead.
+4. 监控节流：降低外部 GPU 查询频率，为后续 NVML 方案预留接口。<br>Throttled external GPU metric polling.
+5. 双缓冲重叠采集（实验特性）：`--overlap-collect` 在同步向量环境下启用后台线程采集下一批 rollout，与当前批学习重叠。<br>Experimental `--overlap-collect` flag: background thread collects next rollout while learning current one (sync env only).
 
 使用建议 | Usage tips:
 ```bash

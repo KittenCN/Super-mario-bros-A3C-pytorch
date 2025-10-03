@@ -1,0 +1,43 @@
+name: backfill-global-step
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "scripts/backfill_global_step.py"
+      - "tests/test_backfill_script.py"
+      - ".github/workflows/backfill_check.yml"
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Prepare sample metadata
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import json
+
+          root = Path('ci_backfill_root')
+          root.mkdir(exist_ok=True)
+          meta = {
+              "save_state": {"global_step": 0, "global_update": 12},
+              "vector_env": {"num_envs": 8}
+          }
+          (root / 'a3c_world1_stage1_0000012.json').write_text(
+              json.dumps(meta, ensure_ascii=False, indent=2),
+              encoding='utf-8'
+          )
+          PY
+
+      - name: Dry-run global_step backfill
+        run: |
+          python scripts/backfill_global_step.py --root ci_backfill_root --dry-run --assume-rollout-steps 64

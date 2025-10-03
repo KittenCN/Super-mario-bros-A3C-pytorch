@@ -32,6 +32,34 @@
 - 实施 | Implementation: 测试复用 `MarioRewardWrapper` 诊断快照；脚本封装常用环境变量、支持 `--dry-run` 和 `RUN_NAME/TOTAL_UPDATES` 覆盖，内部固定启用 `--enable-ram-x-parse`、`--sync-env` 或 `--async-env --confirm-async --overlap-collect`。
 - 验证 | Validation: `pytest -k shaping_smoke -q`、`pytest -k adaptive_injection_integration -q` 皆通过；脚本 `bash scripts/train_stable_{sync,async}.sh --dry-run` 输出全参命令，实跑 50 updates（异步）及 20 updates（同步）指标符合预期。
 - 影响 | Impact: 快速检测奖励链路回归、简化重训流程，配合新指标提供即开即用的验证路径。
+
+## 29. global_step 回填脚本 checkpoint 提示与 CI Dry-run (2025-10-04)
+- 问题 | Problem: 部分旧 checkpoint（如 `run_tput/`, `exp_shaping1/`）的 metadata `global_update=0`，脚本无法推导 `global_step` 导致修复停滞。
+- 决策 | Decision: 脚本加载同名 `.pt` checkpoint，如果 metadata 缺失则读取内部 `global_update`，并将来源写入 `reconstructed_step_source.checkpoint_global_update`。同步在 CI 新增 `backfill-global-step` workflow_dispatch，用 dry-run 校验脚本健康。
+- 实施 | Implementation: `scripts/backfill_global_step.py` 引入 `_load_checkpoint_metadata`，在 dry-run 模式下亦可记入来源；`tests/test_backfill_script.py` 覆盖 checkpoint 提示分支；`.github/workflows/backfill_check.yml` 提供手动触发。
+- 验证 | Validation: 新增测试通过；GitHub Actions 手动触发成功，脚本在示例目录生成 `would_update` 输出。
+- 影响 | Impact: P0-1 完整关闭，后续新增 checkpoint 亦可依赖 CI 监控脚本行为。
+
+## 30. PER GPU 采样原型 (2025-10-04)
+- 问题 | Problem: CPU 侧 `np.random.choice` + numpy 概率在大 batch 情况下成为瓶颈，且 host->device 复制概率数组增加开销。
+- 决策 | Decision: 在 `PrioritizedReplay` 内新增 `use_gpu_sampler`，利用 torch `pow` + `searchsorted` 计算概率并直接在目标 device 上抽样；保持 CPU 回退逻辑。
+- 实施 | Implementation: 新增 `_priority_tensor`、向量化 push/更新路径、`_draw_indices` 抽样助手，`train.py` CLI 支持 `--per-gpu-sample`；`stats()` 报告 `gpu_sampler` 标志；`tests/test_replay_basic.py` 覆盖。
+- 验证 | Validation: 单元测试覆盖 CPU fall-back 及 GPU 开关；metrics 中写入 `replay_gpu_sampler` 字段，手动运行 `python train.py --per --per-gpu-sample` 观察抽样耗时显著下降。
+- 风险 | Risk: torch `searchsorted` 需要排序累计数组；当前按概率累加即可，长远需关注优先级爆炸导致的数值稳定性。
+
+## 31. Heartbeat JSONL 与 Parquet 快照 (2025-10-04)
+- 问题 | Problem: 先前心跳仅打印 stdout，缺乏结构化记录；metrics.jsonl 读取成本高，无法快速提取最新指标。
+- 决策 | Decision: 为 HeartbeatReporter 添加 JSONL 写入能力（CLI `--heartbeat-path`），并在每次 log_interval 将最新指标写入 `metrics/latest.parquet`。
+- 实施 | Implementation: HeartbeatReporter 引入 `set_log_path` 与线程锁，训练启动后默认输出至 `run_dir/heartbeat.jsonl`；新增 `src/utils/metrics_export.py` 使用 pandas+pyarrow 写 parquet。
+- 验证 | Validation: 新增 `tests/test_heartbeat.py` 和 `tests/test_metrics_export.py`；手动运行训练可实时查看 heartbeat JSON 行与 Parquet 中的最新记录。
+- 风险 | Risk: pandas/pyarrow 依赖增加包体积；后续需评估长跑场景中的频繁写入开销。
+
+## 32. 自适应学习率缩放 (2025-10-04)
+- 问题 | Problem: 之前只调整 distance_weight/entropy，学习率保持固定调度，长时间停滞时缺少自动调节。
+- 决策 | Decision: 在 `AdaptiveScheduler` 内新增 `lr_scale` 通道，通过正向推进比动态调整学习率缩放（CLI `--adaptive-lr-scale-*`）。
+- 实施 | Implementation: Scheduler 记录并返回 `adaptive_lr_scale`，训练循环在每次 `scheduler.step()` 后应用缩放，metrics 中写入 `adaptive_lr_scale` 与真实学习率。
+- 验证 | Validation: `tests/test_adaptive_scheduler.py` 新增用例验证缩放单调性；`pytest` 通过；实跑可看到 learning_rate 曲线与 scale 变化。
+- 风险 | Risk: 与外部调参器（Optuna）叠加时需注意边界；未来可能需要冷却窗口或返回率判定策略。
 5. 资源监控开销削减 (Resource monitor throttling)
 6. 双缓冲重叠采集 (Overlap rollout collection)
 7. 未来演进候选 (Future candidates)

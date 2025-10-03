@@ -93,6 +93,7 @@ from src.utils import (  # noqa: E402
 from src.utils.adaptive import AdaptiveConfig, AdaptiveScheduler  # noqa: E402
 from src.utils.heartbeat import HeartbeatReporter  # noqa: E402
 from src.utils.monitor import Monitor  # noqa: E402
+from src.utils.metrics_export import write_latest_metrics  # noqa: E402
 
 try:  # optional dependency for resource monitoring
     import psutil  # type: ignore
@@ -211,6 +212,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=1,
         help="PER 抽样更新间隔（>=1）。例如 4 表示每4次更新做一次 PER batch",
     )
+    parser.add_argument(
+        "--per-gpu-sample",
+        action="store_true",
+        help="在支持时启用 GPU 侧优先级采样以减少 host->device 开销",
+    )
     parser.add_argument("--project", type=str, default="mario-a3c")
     parser.add_argument(
         "--device",
@@ -284,6 +290,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=float,
         default=300.0,
         help="无进展告警阈值（秒），<=0 则自动按间隔推算",
+    )
+    parser.add_argument(
+        "--heartbeat-path",
+        type=str,
+        default=None,
+        help="Heartbeat JSONL 输出路径，未指定则写入 run_dir/heartbeat.jsonl",
     )
     parser.add_argument(
         "--overlap-collect",
@@ -562,6 +574,24 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=0.10,
         help="entropy_beta 自适应更新步长 (相对插值系数)",
     )
+    parser.add_argument(
+        "--adaptive-lr-scale-max",
+        type=float,
+        default=None,
+        help="自适应学习率缩放上限（需同时设置下限）",
+    )
+    parser.add_argument(
+        "--adaptive-lr-scale-min",
+        type=float,
+        default=None,
+        help="自适应学习率缩放下限",
+    )
+    parser.add_argument(
+        "--adaptive-lr-scale-lr",
+        type=float,
+        default=0.05,
+        help="学习率缩放自适应插值步长",
+    )
     return parser.parse_args(argv)
 
 
@@ -689,6 +719,10 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
         train_cfg.replay,
         per_sample_interval=max(1, getattr(args, "per_sample_interval", 1)),
     )
+    train_cfg.replay = dataclasses.replace(
+        train_cfg.replay,
+        use_gpu_sampler=bool(getattr(args, "per_gpu_sample", False)),
+    )
     train_cfg.device = args.device
     train_cfg.metrics_path = args.metrics_path
     # 记录自适应范围到 cfg 以便后续引用（存入 model/optimizer config 简单方案：附加属性）
@@ -707,8 +741,12 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
             ent_low=getattr(args, "adaptive_entropy_ratio_low", 0.05),
             ent_high=getattr(args, "adaptive_entropy_ratio_high", 0.30),
             ent_lr=getattr(args, "adaptive_entropy_lr", 0.10),
+            lr_scale_max=getattr(args, "adaptive_lr_scale_max", None),
+            lr_scale_min=getattr(args, "adaptive_lr_scale_min", None),
+            lr_lr=getattr(args, "adaptive_lr_scale_lr", 0.05),
         ),
     )
+    setattr(train_cfg, "heartbeat_path", args.heartbeat_path)
     return train_cfg
 
 
@@ -1301,11 +1339,18 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     if hb_timeout <= 0:
         base_interval = hb_interval if hb_interval > 0 else 30.0
         hb_timeout = max(base_interval * 4.0, 120.0)
+    heartbeat_path_cfg = getattr(cfg, "heartbeat_path", None)
+    heartbeat_log_path = (
+        Path(str(heartbeat_path_cfg)).expanduser()
+        if heartbeat_path_cfg
+        else None
+    )
     heartbeat = HeartbeatReporter(
         component="train",
         interval=hb_interval if hb_interval > 0 else 30.0,
         stall_timeout=hb_timeout,
         enabled=hb_interval > 0,
+        log_path=heartbeat_log_path,
     )
     heartbeat.start()
     heartbeat.notify(phase="初始化", message="配置随机种子", progress=False)
@@ -1687,6 +1732,23 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     except Exception:
         scaler = torch.cuda.amp.GradScaler(enabled=cfg.mixed_precision)
 
+    def _refresh_effective_lr() -> float:
+        try:
+            base_lr_value = float(scheduler.get_last_lr()[0])
+        except Exception:
+            base_lr_value = float(cfg.optimizer.learning_rate)
+        adaptive_scale = float(globals().get("adaptive_lr_scale_val", 1.0))
+        effective = base_lr_value * adaptive_scale
+        try:
+            for group in optimizer.param_groups:
+                group["lr"] = effective
+        except Exception:
+            pass
+        globals()["adaptive_effective_lr"] = effective
+        return effective
+
+    _refresh_effective_lr()
+
     resume_path: Optional[Path] = None
     resume_metadata: Optional[Dict[str, Any]] = None
     if cfg.resume_from:
@@ -1756,6 +1818,11 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 pass
     except Exception:
         pass
+    if heartbeat_log_path is None and hb_interval > 0:
+        try:
+            heartbeat.set_log_path(Path(run_dir) / "heartbeat.jsonl")
+        except Exception:
+            pass
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
     maybe_save_config(cfg, args.config_out)
     heartbeat.notify(phase="日志", message="日志与保存目录已就绪", progress=False)
@@ -1813,6 +1880,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             beta_final=cfg.replay.priority_beta_final,
             beta_steps=cfg.replay.priority_beta_steps,
             device=device,
+            use_gpu_sampler=cfg.replay.use_gpu_sampler,
         )
     hidden_state, cell_state = model.initial_state(cfg.env.num_envs, device)
     optimizer.zero_grad(set_to_none=True)
@@ -1879,6 +1947,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     last_log_time = time.time()
     last_log_step = global_step
     last_log_update = global_update
+
+    globals()["adaptive_lr_scale_val"] = 1.0
+    globals()["adaptive_effective_lr"] = float(cfg.optimizer.learning_rate)
 
     if resume_path is not None:
         print(f"[train] Loading checkpoint for resume: {resume_path}")
@@ -2879,16 +2950,19 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
-                    try:
-                        scheduler.step()
-                    except Exception:
-                        pass
                 except Exception:
                     # If optimizer step failed, still zero grads to avoid stale grads
                     try:
                         optimizer.zero_grad(set_to_none=True)
                     except Exception:
                         pass
+                else:
+                    try:
+                        scheduler.step()
+                    except Exception:
+                        pass
+                    finally:
+                        _refresh_effective_lr()
 
             learn_duration = time.time() - learn_start
             total_update_time = time.time() - update_wall_start
@@ -2905,7 +2979,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 loss_value = float(value_loss.item())
                 loss_per = float(per_loss.item())
                 entropy_val = float(entropy.item())
-                lr_value = float(scheduler.get_last_lr()[0])
+                try:
+                    base_lr_current = float(scheduler.get_last_lr()[0])
+                except Exception:
+                    base_lr_current = float(cfg.optimizer.learning_rate)
+                lr_scale = float(globals().get("adaptive_lr_scale_val", 1.0))
+                lr_value = base_lr_current * lr_scale
+                globals()["adaptive_effective_lr"] = lr_value
                 recent_returns = completed_returns[-100:] if completed_returns else []
                 avg_return = float(np.mean(recent_returns)) if recent_returns else 0.0
                 return_std = float(np.std(recent_returns)) if recent_returns else 0.0
@@ -3057,11 +3137,16 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                 except Exception:
                                     pass
                                 globals()["adaptive_scheduler_obj"] = AdaptiveScheduler(
-                                    adaptive_cfg, base_dw, cfg.optimizer.beta_entropy
+                                    adaptive_cfg,
+                                    base_dw,
+                                    cfg.optimizer.beta_entropy,
+                                    globals().get("adaptive_lr_scale_val", 1.0),
                                 )
                         sched = globals().get("adaptive_scheduler_obj")
                         if sched and sched.enabled():
-                            new_dw, new_ent, adapt_metrics = sched.step(progress_ratio)
+                            new_dw, new_ent, new_lr_scale, adapt_metrics = sched.step(
+                                progress_ratio
+                            )
                             metrics_entry.update(adapt_metrics)
                             if new_ent is not None:
                                 cfg.optimizer = dataclasses.replace(
@@ -3109,6 +3194,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                                 cur = getattr(cur, "env", None)
                                     except Exception:
                                         pass
+                            if new_lr_scale is not None:
+                                globals()["adaptive_lr_scale_val"] = float(new_lr_scale)
+                                _refresh_effective_lr()
                     except Exception as _adapt_e:
                         metrics_entry["adaptive_error"] = str(_adapt_e)[:120]
                 except Exception:
@@ -3245,6 +3333,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 # 静态配置：per_sample_interval 直接写入，便于外部解析
                 metrics_entry["replay_per_sample_interval"] = (
                     int(cfg.replay.per_sample_interval) if per_buffer is not None else 0
+                )
+                metrics_entry["replay_gpu_sampler"] = (
+                    1 if (per_buffer is not None and cfg.replay.use_gpu_sampler) else 0
                 )
 
                 # PER stats (if enabled)
@@ -3473,6 +3564,12 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     with metrics_lock:
                         with metrics_file.open("a", encoding="utf-8") as fp:
                             fp.write(json.dumps(metrics_entry, ensure_ascii=False) + "\n")
+                except Exception:
+                    pass
+                try:
+                    write_latest_metrics(
+                        metrics_entry, metrics_file.with_name("latest.parquet")
+                    )
                 except Exception:
                     pass
 

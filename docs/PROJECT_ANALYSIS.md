@@ -44,6 +44,7 @@
 - `scripts/train_stable_sync.sh` / `scripts/train_stable_async.sh` 提供稳态训练入口：前者针对同步调试（num_envs=2），后者默认启用 `--async-env --confirm-async --overlap-collect --parent-prewarm` 并输出独立日志/保存路径，均支持 `--dry-run` 与环境变量覆盖。<br>`scripts/train_stable_sync.sh` and `scripts/train_stable_async.sh` deliver stable launchers for sync and async regimes, supporting `--dry-run` and environment overrides while defaulting to isolated log/save directories.
 - `requirements.txt`、`environment.yml`、`Dockerfile` 覆盖 pip、conda、Docker 三种环境搭建方式。<br>`requirements.txt`, `environment.yml`, and the `Dockerfile` cover pip, conda, and Docker workflows.
 - `src/utils/monitor.py`（与 CLI 开关配合）提供 CPU/GPU 监控，日志写入 TensorBoard 或 JSONL。<br>`src/utils/monitor.py`, together with CLI switches, provides CPU/GPU monitoring with outputs to TensorBoard or JSONL.
+- HeartbeatReporter 支持结构化 JSONL 输出（`--heartbeat-path`），训练同时生成 `metrics/latest.parquet` 供数据分析。<br>HeartbeatReporter now emits JSONL heartbeats (`--heartbeat-path`) and each logging step refreshes `metrics/latest.parquet` for downstream analytics.
 
 ## 数据流概览 | Data Flow Summary
 1. 环境返回 `(num_envs, stack, 84, 84)` 观测 -> 模型前向获取 logits/value/隐藏状态。<br>Environment yields `(num_envs, stack, 84, 84)` observations → model forward pass produces logits, values, and hidden states.
@@ -62,3 +63,9 @@
 - ✅ **环境构建可取消**：`call_with_timeout` 支持 `cancel_event`，配合 `create_vector_env(..., cancel_event=...)` 判停，超时会立即发出取消信号。<br>**Cancellable env construction**: `call_with_timeout` propagates a `cancel_event`, and `create_vector_env(..., cancel_event=...)` honours cancellation when timeouts occur.
 - ✅ **metrics JSONL 加锁**：训练主线程与监控线程共享写锁，避免并发写入交错。<br>**Locked metrics JSONL**: a shared write-lock prevents interleaved log lines between the training loop and monitor thread.
 - ✅ **PER push 批量化**：`PrioritizedReplay.push` 使用向量化索引批量写入，显著降低 CPU `copy_` 开销。<br>**Vectorised PER push**: `PrioritizedReplay.push` now uses batched index writes, cutting CPU `copy_` overhead.
+- ✅ **PER GPU 采样原型**：`PrioritizedReplay` 新增 `use_gpu_sampler` 开关，使用 torch `searchsorted` 在 GPU/CPU 上统一采样并保持统计。<br>**PER GPU sampler**: `PrioritizedReplay` exposes a `use_gpu_sampler` flag leveraging torch `searchsorted` for consistent GPU/CPU sampling.
+- ✅ **global_step 回填流水线**：回填脚本可读取 checkpoint `global_update`，并通过 GitHub Actions (`backfill-global-step`) 手动 dry-run 校验。<br>**Backfill pipeline**: the script now reads checkpoint `global_update`, with a `backfill-global-step` GitHub Action for manual dry-run validation.
+- ✅ **Heartbeat & 指标快照**：默认在 `run_dir/heartbeat.jsonl` 写入心跳状态，并同步更新 `metrics/latest.parquet` 方便可视化。<br>**Heartbeat & metrics snapshot**: heartbeats write to `run_dir/heartbeat.jsonl` while every log refreshes `metrics/latest.parquet` for visualisation.
+- ✅ **学习率缩放自适应**：`AdaptiveScheduler` 新增 `lr_scale` 通道，结合正向推进比自动调整优化器学习率。<br>**Adaptive LR scaling**: `AdaptiveScheduler` now manages an `lr_scale` channel that adapts the optimiser learning rate from progress ratios.
+- ✅ **PER GPU 采样原型**：`PrioritizedReplay` 新增 `use_gpu_sampler` 开关，使用 torch `searchsorted` 在 GPU/CPU 上统一采样并保持统计。<br>**PER GPU sampler**: `PrioritizedReplay` exposes a `use_gpu_sampler` flag leveraging torch `searchsorted` for consistent GPU/CPU sampling.
+- ✅ **global_step 回填流水线**：回填脚本可读取 checkpoint `global_update`，并通过 GitHub Actions (`backfill-global-step`) 手动 dry-run 校验。<br>**Backfill pipeline**: the script now reads checkpoint `global_update`, with a `backfill-global-step` GitHub Action for manual dry-run validation.

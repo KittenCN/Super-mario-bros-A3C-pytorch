@@ -18,3 +18,5 @@ dependencies:
       - optuna>=3.3
       - wandb>=0.16
       - ffmpeg-python>=0.2
+      - pandas>=2.1
+      - pyarrow>=13.0

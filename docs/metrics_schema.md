@@ -16,8 +16,11 @@ Replay (PER): replay_size, replay_capacity, replay_fill_rate, replay_last_unique
 - replay_sample_time_ms: 单次 PER 采样耗时（毫秒，包含 CPU 采样与数据拷贝），用于评估 GPU 化潜在收益（2025-10-02 新增）。
  - replay_sample_split_prior_ms / choice_ms / weight_ms / decode_ms / tensor_ms / total_ms: 采样细分阶段耗时（仅在触发抽样轮记录，其他轮默认为 0）。
  - replay_per_sample_interval: 当前训练配置的 PER 抽样间隔（静态配置写入每条 metrics 方便外部解析）。
+ - replay_gpu_sampler: 1 表示启用 `use_gpu_sampler`（torch searchsorted 路径），0 表示传统 numpy 采样。（2025-10-04 新增）
  - model_compiled: 1 表示当前运行模型是 torch.compile 产物（含 `_orig_mod`），0 表示未编译或已 unwrap（2025-10-02 新增）。
  - state_dict_load_issues.log: 若恢复时出现 missing/unexpected 键，会将完整列表追加写入该文件，仅在首次或有差异时更新；metrics 行内不重复膨胀内容。
+
+额外 artefact：每次 log interval 还会刷新 `metrics/latest.parquet`（单行 DataFrame），方便直接用 pandas/pyarrow 快速读取最近一次指标。
 
 原子写保证: 自 2025-10-02 起 checkpoint `.pt` 与对应 `.json` 元数据使用临时文件 + `os.replace` 原子落盘，减少中断产生半文件风险。
 

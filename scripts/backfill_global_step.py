@@ -16,6 +16,7 @@ global_step = global_update * num_envs * rollout_steps
 `reconstructed_step_source` 记录：方法、假设的 rollout_steps、公式、时间戳，以便后续审计。
 
 特性：
+- checkpoint 提示：若 metadata 中 `global_update=0` 会尝试读取同名 `.pt` 的 `global_update`。
 - 幂等：若已存在 `reconstructed_step_source` 或 global_step>0 则跳过。
 - 备份：默认为每个要修改的 JSON 生成同名 `.bak` 文件；已存在备份不会覆盖。
 - 递归：扫描指定根目录（默认 trained_models/）。
@@ -32,7 +33,12 @@ import argparse
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional
+
+try:
+    import torch
+except Exception:  # pragma: no cover - optional dependency when only dry-run
+    torch = None  # type: ignore[assignment]
 
 
 def iter_metadata_files(root: Path) -> List[Path]:
@@ -54,6 +60,32 @@ def dump_json(path: Path, data: dict) -> None:
     path.write_text(payload, encoding="utf-8")
 
 
+def _load_checkpoint_metadata(json_path: Path) -> Optional[dict]:
+    if torch is None:
+        return None
+    ckpt_path = json_path.with_suffix(".pt")
+    if not ckpt_path.exists():
+        # allow latest checkpoint naming pattern
+        if json_path.stem.endswith(".json"):
+            alt = json_path.parent / (json_path.stem[:-5] + ".pt")
+            if alt.exists():
+                ckpt_path = alt
+            else:
+                return None
+        else:
+            return None
+    try:
+        try:
+            payload = torch.load(ckpt_path, map_location="cpu", weights_only=True)  # type: ignore[call-arg]
+        except TypeError:
+            payload = torch.load(ckpt_path, map_location="cpu")  # type: ignore[call-arg]
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
 def backfill_file(
     path: Path,
     rollout_steps: int,
@@ -65,6 +97,14 @@ def backfill_file(
     save_state = meta.get("save_state", {})
     global_step = int(save_state.get("global_step", 0) or 0)
     global_update = int(save_state.get("global_update", 0) or 0)
+    checkpoint_hint = None
+    if global_update <= 0:
+        payload = _load_checkpoint_metadata(path)
+        if payload is not None:
+            checkpoint_hint = int(payload.get("global_update", 0) or 0)
+            if checkpoint_hint > 0:
+                global_update = checkpoint_hint
+                save_state["global_update"] = global_update
     if global_update <= 0:
         return False, "no_update_info"
     # 提取 num_envs；无则失败
@@ -81,12 +121,16 @@ def backfill_file(
     if "reconstructed_step_source" in meta and not update_if_lower:
         return False, "already_reconstructed"
     meta["save_state"]["global_step"] = int(new_global_step)
-    meta["reconstructed_step_source"] = {
+    source = {
         "method": "assumed_rollout_steps",
         "rollout_steps": rollout_steps,
         "formula": "global_update * num_envs * rollout_steps",
         "computed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
     }
+    if checkpoint_hint is not None:
+        source["checkpoint_global_update"] = checkpoint_hint
+        source["method"] = "checkpoint_plus_rollout"
+    meta["reconstructed_step_source"] = source
     if dry_run:
         return True, f"would_update:{new_global_step}"
     if backup:
