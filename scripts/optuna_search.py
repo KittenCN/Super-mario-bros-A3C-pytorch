@@ -31,7 +31,9 @@ def objective(trial: optuna.Trial) -> float:
     args.hidden_size = trial.suggest_int("hidden_size", 256, 768, step=128)
     args.num_res_blocks = trial.suggest_int("num_res_blocks", 2, 4)
     args.base_channels = trial.suggest_categorical("base_channels", [32, 48, 64])
-    args.recurrent_type = trial.suggest_categorical("recurrent_type", ["gru", "lstm", "none"])
+    args.recurrent_type = trial.suggest_categorical(
+        "recurrent_type", ["gru", "lstm", "none"]
+    )
     args.use_noisy_linear = trial.suggest_categorical("noisy", [False, True])
     args.entropy_beta = trial.suggest_float("entropy_beta", 0.001, 0.02, log=True)
 
@@ -51,7 +53,12 @@ def main():
     parser.add_argument("--storage", type=str, default=None, help="Optuna storage URL")
     args = parser.parse_args()
 
-    study = optuna.create_study(direction="maximize", study_name=args.study_name, storage=args.storage, load_if_exists=True)
+    study = optuna.create_study(
+        direction="maximize",
+        study_name=args.study_name,
+        storage=args.storage,
+        load_if_exists=True,
+    )
     study.optimize(objective, n_trials=args.trials)
     print("Best trial:")
     print(study.best_trial)

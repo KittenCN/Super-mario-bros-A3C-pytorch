@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+import io
+import sys
 from typing import Any, Callable, Dict, Optional
-
-import sys, io
 
 # Temporarily silence stderr during imports that may emit Gym migration notices
 _saved_stderr = sys.stderr
@@ -53,15 +53,19 @@ class MarioRewardWrapper(gym.Wrapper):
         # RAM 解析相关（训练脚本可在创建后通过属性启用）
         self.enable_ram_x_parse: bool = False
         self.ram_addr_high: int = 0x006D  # NES SMB 常见地址 (高字节)
-        self.ram_addr_low: int = 0x0086   # NES SMB 常见地址 (低字节)
+        self.ram_addr_low: int = 0x0086  # NES SMB 常见地址 (低字节)
         self._ram_failure: int = 0
         self._ram_success: int = 0
         self._ram_last_x: int = 0
-        self._first_progress_pending: bool = True  # 首次读取进度时允许把 current_x 记作正增量
+        self._first_progress_pending: bool = (
+            True  # 首次读取进度时允许把 current_x 记作正增量
+        )
         # 调试输出计数（需放在 __init__ 内，否则模块导入时引用 self 抛 NameError 导致静默退出）
         self._ram_debug_prints: int = 0  # 限制调试输出次数
 
-    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+    def reset(
+        self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
+    ):
         observation, info = self.env.reset(seed=seed, options=options)
         # fc_emulator backend 可能将信息放在 metrics 子字典中
         metrics = info.get("metrics") if isinstance(info, dict) else None
@@ -138,20 +142,32 @@ class MarioRewardWrapper(gym.Wrapper):
             # 尝试基于 RAM fallback
             try:
                 ram_buf = None
-                base = getattr(self.env, 'unwrapped', self.env)
-                if hasattr(base, '_ram_buffer') and callable(getattr(base, '_ram_buffer')):
+                base = getattr(self.env, "unwrapped", self.env)
+                if hasattr(base, "_ram_buffer") and callable(
+                    getattr(base, "_ram_buffer")
+                ):
                     ram_buf = base._ram_buffer()
-                elif hasattr(base, 'ram'):
+                elif hasattr(base, "ram"):
                     ram_buf = base.ram
                 if ram_buf is not None:
                     arr = np.asarray(ram_buf)
-                    hi = int(arr[self.ram_addr_high]) if self.ram_addr_high < len(arr) else 0
-                    lo = int(arr[self.ram_addr_low]) if self.ram_addr_low < len(arr) else 0
+                    hi = (
+                        int(arr[self.ram_addr_high])
+                        if self.ram_addr_high < len(arr)
+                        else 0
+                    )
+                    lo = (
+                        int(arr[self.ram_addr_low])
+                        if self.ram_addr_low < len(arr)
+                        else 0
+                    )
                     parsed_x = (hi << 8) | lo
                     current_x = parsed_x
                     self._ram_success += 1
                     if self._ram_debug_prints < 10:
-                        print(f"[reward][ram-debug] step={self._step_counter} hi=0x{hi:02X} lo=0x{lo:02X} parsed_x={parsed_x} prev_x={self._prev_x}")
+                        print(
+                            f"[reward][ram-debug] step={self._step_counter} hi=0x{hi:02X} lo=0x{lo:02X} parsed_x={parsed_x} prev_x={self._prev_x}"
+                        )
                         self._ram_debug_prints += 1
                 else:
                     self._ram_failure += 1
@@ -167,7 +183,11 @@ class MarioRewardWrapper(gym.Wrapper):
             if dx > 0:
                 shaped_reward += self.config.distance_weight * dx
             self._prev_x = float(current_x)
-            self._ram_last_x = int(current_x) if isinstance(current_x, (int, float)) else self._ram_last_x
+            self._ram_last_x = (
+                int(current_x)
+                if isinstance(current_x, (int, float))
+                else self._ram_last_x
+            )
         else:
             dx = 0.0
 
@@ -175,7 +195,10 @@ class MarioRewardWrapper(gym.Wrapper):
         self._step_counter += 1
         if self.config.scale_anneal_steps > 0:
             t = min(1.0, self._step_counter / float(self.config.scale_anneal_steps))
-            dyn_scale = self.config.scale_start + (self.config.scale_final - self.config.scale_start) * t
+            dyn_scale = (
+                self.config.scale_start
+                + (self.config.scale_final - self.config.scale_start) * t
+            )
         else:
             dyn_scale = self.config.scale
         # 若用户未修改默认 scale_start/scale_final，则保持与 scale 一致
@@ -183,16 +206,30 @@ class MarioRewardWrapper(gym.Wrapper):
             dyn_scale = self.config.scale_start
 
         # 距离权重动态退火（可选）
-        if self.config.distance_weight_final is not None and self.config.distance_weight_anneal_steps > 0:
-            t_dw = min(1.0, self._step_counter / float(self.config.distance_weight_anneal_steps))
-            eff_distance_weight = self.config.distance_weight + (self.config.distance_weight_final - self.config.distance_weight) * t_dw
+        if (
+            self.config.distance_weight_final is not None
+            and self.config.distance_weight_anneal_steps > 0
+        ):
+            t_dw = min(
+                1.0,
+                self._step_counter / float(self.config.distance_weight_anneal_steps),
+            )
+            eff_distance_weight = (
+                self.config.distance_weight
+                + (self.config.distance_weight_final - self.config.distance_weight)
+                * t_dw
+            )
         else:
             eff_distance_weight = self.config.distance_weight
 
         # 将上面使用的 shaped_reward 中 distance_weight（对 dx>0 时添加）调整：我们之前已用 distance_weight 计算在 shaped_reward 里；
         # 为避免重算，这里只在 dx>0 且有差异时补差值（差分法），避免复制逻辑。
         try:
-            if eff_distance_weight != self.config.distance_weight and isinstance(dx, (int, float)) and dx > 0:
+            if (
+                eff_distance_weight != self.config.distance_weight
+                and isinstance(dx, (int, float))
+                and dx > 0
+            ):
                 delta_extra = (eff_distance_weight - self.config.distance_weight) * dx
                 shaped_reward += delta_extra
         except Exception:
@@ -221,7 +258,9 @@ class MarioRewardWrapper(gym.Wrapper):
 
         # 调试：首次出现正向位移时打印一次（不依赖 RAM debug 次数）
         if dx > 0 and getattr(self, "_printed_first_dx", False) is False:
-            print(f"[reward][dx] first_positive_dx step={self._step_counter} dx={dx:.2f} distance_weight={self.config.distance_weight}")
+            print(
+                f"[reward][dx] first_positive_dx step={self._step_counter} dx={dx:.2f} distance_weight={self.config.distance_weight}"
+            )
             setattr(self, "_printed_first_dx", True)
 
         if terminated or truncated:
@@ -236,8 +275,19 @@ class MarioRewardWrapper(gym.Wrapper):
                     and self.config.death_penalty_final is not None
                     and self.config.death_penalty_anneal_steps > 0
                 ):
-                    t_dp = min(1.0, self._step_counter / float(self.config.death_penalty_anneal_steps))
-                    dp_eff = self.config.death_penalty_start + (self.config.death_penalty_final - self.config.death_penalty_start) * t_dp
+                    t_dp = min(
+                        1.0,
+                        self._step_counter
+                        / float(self.config.death_penalty_anneal_steps),
+                    )
+                    dp_eff = (
+                        self.config.death_penalty_start
+                        + (
+                            self.config.death_penalty_final
+                            - self.config.death_penalty_start
+                        )
+                        * t_dp
+                    )
                 else:
                     dp_eff = dp_base
                 shaped_reward += dp_eff
@@ -253,7 +303,9 @@ class ProgressInfoWrapper(gym.Wrapper):
         super().__init__(env)
         self._max_distance = 0
 
-    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+    def reset(
+        self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
+    ):
         observation, info = self.env.reset(seed=seed, options=options)
         metrics = info.get("metrics") if isinstance(info, dict) else None
         x_pos = info.get("x_pos", 0)
@@ -332,4 +384,3 @@ __all__ = [
     "TransformObservation",
     "TransformReward",
 ]
-

@@ -15,7 +15,14 @@ class HiddenState:
 
 
 class RolloutBuffer:
-    def __init__(self, num_steps: int, num_envs: int, obs_shape: Tuple[int, ...], device: torch.device, pin_memory: bool = True) -> None:
+    def __init__(
+        self,
+        num_steps: int,
+        num_envs: int,
+        obs_shape: Tuple[int, ...],
+        device: torch.device,
+        pin_memory: bool = True,
+    ) -> None:
         self.num_steps = num_steps
         self.num_envs = num_envs
         self.target_device = device
@@ -41,11 +48,20 @@ class RolloutBuffer:
         return self
 
     def reset(self):
-        for tensor in (self.obs, self.actions, self.rewards, self.dones, self.behaviour_log_probs, self.values):
+        for tensor in (
+            self.obs,
+            self.actions,
+            self.rewards,
+            self.dones,
+            self.behaviour_log_probs,
+            self.values,
+        ):
             tensor.zero_()
         self.initial_hidden = HiddenState(None, None)
 
-    def set_initial_hidden(self, hidden: Optional[torch.Tensor], cell: Optional[torch.Tensor]):
+    def set_initial_hidden(
+        self, hidden: Optional[torch.Tensor], cell: Optional[torch.Tensor]
+    ):
         hidden_detached = hidden.detach().cpu() if hidden is not None else None
         cell_detached = cell.detach().cpu() if cell is not None else None
         self.initial_hidden = HiddenState(hidden_detached, cell_detached)
@@ -70,7 +86,9 @@ class RolloutBuffer:
     def set_next_obs(self, obs: torch.Tensor):
         self.obs[-1].copy_(obs)
 
-    def get_sequences(self, device: Optional[torch.device] = None, non_blocking: bool = True):
+    def get_sequences(
+        self, device: Optional[torch.device] = None, non_blocking: bool = True
+    ):
         data = {
             "obs": self.obs[:-1],
             "next_obs": self.obs[-1],
@@ -90,7 +108,9 @@ class RolloutBuffer:
             return t.to(device, **kwargs)
 
         initial_hidden = self.initial_hidden
-        hidden = _to(initial_hidden.hidden) if initial_hidden.hidden is not None else None
+        hidden = (
+            _to(initial_hidden.hidden) if initial_hidden.hidden is not None else None
+        )
         cell = _to(initial_hidden.cell) if initial_hidden.cell is not None else None
 
         return {

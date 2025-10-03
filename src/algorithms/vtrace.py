@@ -53,9 +53,12 @@ def vtrace_returns(
         acc = deltas[t] + discounts[t] * cs[t] * acc
         vs[t] = values[t] + acc
 
-    advantages = clipped_rhos * (rewards + discounts * torch.cat([vs[1:], bootstrap_value.unsqueeze(0)], dim=0) - values)
+    advantages = clipped_rhos * (
+        rewards
+        + discounts * torch.cat([vs[1:], bootstrap_value.unsqueeze(0)], dim=0)
+        - values
+    )
     return vs, advantages
 
 
 __all__ = ["vtrace_returns"]
-

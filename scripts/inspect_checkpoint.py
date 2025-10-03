@@ -13,16 +13,24 @@
   python scripts/inspect_checkpoint.py --ckpt trained_models/run01/a3c_world1_stage1_latest.pt
 """
 from __future__ import annotations
-import argparse, json, sys, os
-from pathlib import Path
+
+import argparse
+import json
+import sys
 from collections import Counter
+from pathlib import Path
+
 import torch
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Inspect Mario A3C checkpoint")
     p.add_argument("--ckpt", required=True, help="Path to .pt checkpoint file")
-    p.add_argument("--full-params", action="store_true", help="List every parameter name")
+    p.add_argument(
+        "--full-params", action="store_true", help="List every parameter name"
+    )
     return p.parse_args()
+
 
 def load_payload(path: Path):
     try:
@@ -30,6 +38,7 @@ def load_payload(path: Path):
     except Exception as e:
         print(f"[inspect][error] failed to torch.load: {e}")
         return {}
+
 
 def try_metadata(path: Path):
     meta_path = path.with_suffix(".json")
@@ -39,6 +48,7 @@ def try_metadata(path: Path):
         except Exception as e:
             print(f"[inspect][warn] metadata parse failed: {e}")
     return None, meta_path
+
 
 def summarize_state_dict(sd: dict):
     dtypes = Counter()
@@ -61,6 +71,7 @@ def summarize_state_dict(sd: dict):
         "compiled_format": compiled_saved,
     }
 
+
 def main():
     args = parse_args()
     ckpt_path = Path(args.ckpt)
@@ -79,10 +90,18 @@ def main():
         replay_meta = meta.get("replay", {})
         save_state = meta.get("save_state", {})
         print("[inspect] metadata summary:")
-        print(f"  world={meta.get('world')} stage={meta.get('stage')} action_type={meta.get('action_type')} frame_stack={meta.get('frame_stack')} frame_skip={meta.get('frame_skip')}")
-        print(f"  num_envs={env_meta.get('num_envs')} async={env_meta.get('asynchronous')} base_seed={env_meta.get('base_seed')}")
-        print(f"  per_sample_interval={replay_meta.get('per_sample_interval')} replay_capacity={replay_meta.get('capacity')} enable={replay_meta.get('enable')}")
-        print(f"  save_state: update={save_state.get('global_update')} step={save_state.get('global_step')} type={save_state.get('type')}")
+        print(
+            f"  world={meta.get('world')} stage={meta.get('stage')} action_type={meta.get('action_type')} frame_stack={meta.get('frame_stack')} frame_skip={meta.get('frame_skip')}"
+        )
+        print(
+            f"  num_envs={env_meta.get('num_envs')} async={env_meta.get('asynchronous')} base_seed={env_meta.get('base_seed')}"
+        )
+        print(
+            f"  per_sample_interval={replay_meta.get('per_sample_interval')} replay_capacity={replay_meta.get('capacity')} enable={replay_meta.get('enable')}"
+        )
+        print(
+            f"  save_state: update={save_state.get('global_update')} step={save_state.get('global_step')} type={save_state.get('type')}"
+        )
     model_sd = payload.get("model") if isinstance(payload, dict) else None
     if isinstance(model_sd, dict):
         summary = summarize_state_dict(model_sd)
@@ -96,7 +115,10 @@ def main():
     else:
         print("[inspect][warn] payload missing 'model' key")
     # 查找加载 issues 日志
-    issues_files = [ckpt_path.parent / "state_dict_load_issues.log", ckpt_path.parent / "eval_state_dict_load_issues.log"]
+    issues_files = [
+        ckpt_path.parent / "state_dict_load_issues.log",
+        ckpt_path.parent / "eval_state_dict_load_issues.log",
+    ]
     for f in issues_files:
         if f.exists():
             try:
@@ -106,6 +128,7 @@ def main():
                     print(f"  {line}")
             except Exception:
                 pass
+
 
 if __name__ == "__main__":
     main()

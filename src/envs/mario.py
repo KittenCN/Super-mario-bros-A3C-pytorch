@@ -3,25 +3,26 @@
 from __future__ import annotations
 
 import dataclasses
+import io
 import itertools
-import tempfile
-from collections import deque
-from pathlib import Path
-import time
 import os
 import random
+import sys
+import tempfile
+import time
+from collections import deque
+from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
-
-import sys, io
 
 # Temporarily silence stderr during imports that may emit Gym migration notices
 _saved_stderr = sys.stderr
 try:
     sys.stderr = io.StringIO()
+    import errno
+
     import gymnasium as gym
     import numpy as np
     from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
-    import errno
 finally:
     sys.stderr = _saved_stderr
 
@@ -46,7 +47,7 @@ try:
 except Exception:
     # If wrapping fails, don't prevent module import — fallback to original behaviour
     pass
-import multiprocessing
+import multiprocessing  # noqa: E402 (import ordering constrained by stderr suppression)
 
 _MARIO_PACKAGE = None
 
@@ -54,25 +55,36 @@ _MARIO_PACKAGE = None
 # Some legacy packages print migration notices to stderr when imported.
 # Temporarily silence stderr while attempting to import these optional
 # dependencies so the startup does not emit noisy migration messages.
-import sys, io
+import io  # noqa: E402
+import sys  # noqa: E402
 
 _saved_stderr = sys.stderr
 try:
     sys.stderr = io.StringIO()
     try:
         from gymnasium_super_mario_bros import make as mario_make  # type: ignore
+        from gymnasium_super_mario_bros._roms import (
+            rom_path as mario_rom_path,  # type: ignore
+        )
         from gymnasium_super_mario_bros.actions import (  # type: ignore
+            COMPLEX_MOVEMENT,
             RIGHT_ONLY,
             SIMPLE_MOVEMENT,
-            COMPLEX_MOVEMENT,
         )
-        from gymnasium_super_mario_bros._roms import rom_path as mario_rom_path  # type: ignore
+
         _MARIO_PACKAGE = "gymnasium-super-mario-bros"
     except ImportError:
         try:
             from gym_super_mario_bros import make as mario_make  # type: ignore
-            from gym_super_mario_bros.actions import RIGHT_ONLY, SIMPLE_MOVEMENT, COMPLEX_MOVEMENT  # type: ignore
-            from gym_super_mario_bros._roms import rom_path as mario_rom_path  # type: ignore
+            from gym_super_mario_bros._roms import (
+                rom_path as mario_rom_path,  # type: ignore
+            )
+            from gym_super_mario_bros.actions import (  # type: ignore
+                COMPLEX_MOVEMENT,
+                RIGHT_ONLY,
+                SIMPLE_MOVEMENT,
+            )
+
             _MARIO_PACKAGE = "gym-super-mario-bros"
         except ImportError:
             # 不再立即抛出：允许 fc_emulator-only 模式; 具体缺失在后续需要创建 nes_py 版环境时再报错
@@ -92,8 +104,9 @@ except Exception:
     JoypadSpace = None  # type: ignore
 
 try:  # Optional modern emulator toolkit
-    from fc_emulator.rl_env import NESGymEnv  # type: ignore
     from fc_emulator.actions import DiscreteActionWrapper  # type: ignore
+    from fc_emulator.rl_env import NESGymEnv  # type: ignore
+
     _HAS_FC_EMULATOR = True
 except Exception:  # pragma: no cover - optional dependency
     NESGymEnv = None  # type: ignore
@@ -116,7 +129,9 @@ def _patch_legacy_nes_py_uint8() -> None:
 
     # Try to find the ROM class under a couple of likely names across nes_py versions
     rom_cls = getattr(nes_rom, "NESRom", None) or getattr(nes_rom, "ROM", None)
-    if rom_cls is None or getattr(rom_cls, "_uint8_patch_applied", False):  # pragma: no cover
+    if rom_cls is None or getattr(
+        rom_cls, "_uint8_patch_applied", False
+    ):  # pragma: no cover
         return
 
     def _to_int(value):
@@ -172,7 +187,14 @@ def _patch_legacy_nes_py_uint8() -> None:
             pass
 
     # Patch known numeric ROM metadata that may be numpy uint8 on older nes_py
-    for name in ("prg_rom_size", "chr_rom_size", "mapper", "submapper", "prg_rom_start", "prg_rom_stop"):
+    for name in (
+        "prg_rom_size",
+        "chr_rom_size",
+        "mapper",
+        "submapper",
+        "prg_rom_start",
+        "prg_rom_stop",
+    ):
         try:
             _wrap_name(name)
         except Exception:
@@ -217,8 +239,13 @@ def _patch_nes_py_ram_dtype() -> None:
 
 _patch_nes_py_ram_dtype()
 
-from .wrappers import MarioRewardWrapper, ProgressInfoWrapper, RewardConfig, TransformObservation, TransformReward
-
+from .wrappers import (  # noqa: E402
+    MarioRewardWrapper,
+    ProgressInfoWrapper,
+    RewardConfig,
+    TransformObservation,
+    TransformReward,
+)
 
 EXTENDED_MOVEMENT: Optional[Sequence[Sequence[str]]] = None
 try:
@@ -337,7 +364,9 @@ class _SimpleFrameStack(gym.Wrapper):
         obs_space: gym.spaces.Box = env.observation_space
         low = np.repeat(obs_space.low[None, ...], self.stack_size, axis=0)
         high = np.repeat(obs_space.high[None, ...], self.stack_size, axis=0)
-        self.observation_space = gym.spaces.Box(low=low, high=high, dtype=obs_space.dtype)
+        self.observation_space = gym.spaces.Box(
+            low=low, high=high, dtype=obs_space.dtype
+        )
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):  # type: ignore[override]
         obs, info = self.env.reset(seed=seed, options=options)
@@ -370,7 +399,9 @@ class FusedPreprocessWrapper(gym.Wrapper):
     仅在输入观测是图像 (H, W, C) 或 (C, H, W) 且后续需要同样处理时启用。
     """
 
-    def __init__(self, env: "gym.Env", frame_stack: int = 4, size: Tuple[int, int] = (84, 84)) -> None:
+    def __init__(
+        self, env: "gym.Env", frame_stack: int = 4, size: Tuple[int, int] = (84, 84)
+    ) -> None:
         super().__init__(env)
         self.frame_stack = frame_stack
         self.size = size
@@ -440,10 +471,16 @@ class FusedPreprocessWrapper(gym.Wrapper):
         return self._stack(), reward, terminated, truncated, info
 
 
-def list_available_stages(max_world: int = 8, max_stage: int = 4) -> List[Tuple[int, int]]:
+def list_available_stages(
+    max_world: int = 8, max_stage: int = 4
+) -> List[Tuple[int, int]]:
     """List all available world-stage combinations."""
 
-    return [(world, stage) for world in range(1, max_world + 1) for stage in range(1, max_stage + 1)]
+    return [
+        (world, stage)
+        for world in range(1, max_world + 1)
+        for stage in range(1, max_stage + 1)
+    ]
 
 
 def _make_fc_emulator_env(config: MarioEnvConfig) -> "gym.Env":
@@ -456,8 +493,16 @@ def _make_fc_emulator_env(config: MarioEnvConfig) -> "gym.Env":
         _FC_BACKEND_LOGGED = True
 
     if (config.world, config.stage) != (1, 1) and not _FC_STAGE_WARNING_EMITTED:
-        suppress = os.environ.get("MARIO_SUPPRESS_FC_STAGE_WARN", "0").lower() in {"1", "true", "on"}
-        strict = os.environ.get("MARIO_FC_STRICT_STAGE", "0").lower() in {"1", "true", "on"}
+        suppress = os.environ.get("MARIO_SUPPRESS_FC_STAGE_WARN", "0").lower() in {
+            "1",
+            "true",
+            "on",
+        }
+        strict = os.environ.get("MARIO_FC_STRICT_STAGE", "0").lower() in {
+            "1",
+            "true",
+            "on",
+        }
         msg = (
             f"fc_emulator backend currently spawns at world 1-1; requested stage "
             f"{config.world}-{config.stage} will start from 1-1"
@@ -476,13 +521,17 @@ def _make_fc_emulator_env(config: MarioEnvConfig) -> "gym.Env":
         if env_rom and Path(env_rom).exists():
             return env_rom
         # 尝试安装包提供的 rom 路径
-        if 'mario_rom_path' in globals() and callable(mario_rom_path):  # type: ignore[name-defined]
+        if "mario_rom_path" in globals() and callable(mario_rom_path):  # type: ignore[name-defined]
             try:
                 return mario_rom_path(False, "vanilla")  # type: ignore[operator]
             except Exception:
                 pass
         # 常见本地路径
-        for cand in ["./roms/smb.nes", "./roms/SuperMarioBros.nes", "./SuperMarioBros.nes"]:
+        for cand in [
+            "./roms/smb.nes",
+            "./roms/SuperMarioBros.nes",
+            "./SuperMarioBros.nes",
+        ]:
             if Path(cand).exists():
                 return cand
         raise RuntimeError(
@@ -514,7 +563,7 @@ def _make_fc_emulator_env(config: MarioEnvConfig) -> "gym.Env":
             arr = arr[..., None]
         return arr
 
-    float_space = gym.spaces.Box(low=0.0, high=255.0, shape=(84, 84, 1), dtype=np.float32)
+    # Removed unused float_space variable (was a Box spec) per lint.
     env = TransformObservation(env, _to_float)
     env = TransformReward(env, float)
     env = _apply_frame_stack(env, config.frame_stack)
@@ -532,13 +581,16 @@ def _make_single_env(
     allow_dummy_in_main: bool = True,
 ):
     actions = _select_actions(config.action_type)
+
     # Dummy environment returned when creating a single instance in the main
     # process for space inspection. Real NES env will be created in worker
     # processes where the process name is not 'MainProcess'.
     class _DummyEnv(gym.Env):
         def __init__(self, obs_shape, n_actions):
             super().__init__()
-            self.observation_space = gym.spaces.Box(0.0, 1.0, shape=obs_shape, dtype=np.float32)
+            self.observation_space = gym.spaces.Box(
+                0.0, 1.0, shape=obs_shape, dtype=np.float32
+            )
             self.action_space = gym.spaces.Discrete(n_actions)
 
         def reset(self, seed=None, options=None):
@@ -552,13 +604,18 @@ def _make_single_env(
     def thunk():
         # 仅在异步模式（worker 进程会真正创建 env）时、且允许的情况下在 MainProcess 返回 Dummy
         # 同步模式 (SyncVectorEnv) 下 env_fns 永远在主进程运行，不能返回 Dummy，否则训练得到全 0 奖励/永不 done。
-        if allow_dummy_in_main and multiprocessing.current_process().name == "MainProcess":
+        if (
+            allow_dummy_in_main
+            and multiprocessing.current_process().name == "MainProcess"
+        ):
             obs_shape = (config.frame_stack, 84, 84)
             return _DummyEnv(obs_shape, len(actions))
         # Prepare a simple diagnostics file so worker startup progress can be
         # inspected by the parent if construction times out.
         try:
-            _diag_base = Path(diag_dir) if diag_dir is not None else Path(tempfile.gettempdir())
+            _diag_base = (
+                Path(diag_dir) if diag_dir is not None else Path(tempfile.gettempdir())
+            )
             _diag_base.mkdir(parents=True, exist_ok=True)
             _diag_file = _diag_base / f"env_init_idx{idx}_pid{os.getpid()}.log"
         except Exception:
@@ -633,7 +690,9 @@ def _make_single_env(
             except Exception as e:
                 _diag(f"import_gsm_error:{repr(e)}")
                 if mario_make is None:
-                    raise RuntimeError("缺少 gym-super-mario-bros 包且 fc_emulator 初始化失败，无法创建环境。") from e
+                    raise RuntimeError(
+                        "缺少 gym-super-mario-bros 包且 fc_emulator 初始化失败，无法创建环境。"
+                    ) from e
 
             lock_fd = None
             try:
@@ -701,7 +760,9 @@ def _make_single_env(
             env = gym.wrappers.FrameSkip(env, config.frame_skip)
             _diag("frameskip_done")
             # 使用融合 wrapper 取代多层包装
-            env = FusedPreprocessWrapper(env, frame_stack=config.frame_stack, size=(84, 84))
+            env = FusedPreprocessWrapper(
+                env, frame_stack=config.frame_stack, size=(84, 84)
+            )
             _diag("fused_preprocess_done")
             env = TransformReward(env, float)
             _diag("transform_reward_done")
@@ -748,7 +809,9 @@ def create_vector_env(config: MarioVectorEnvConfig):
 
     env_fns = []
     # Diagnostic directory to capture per-worker init progress
-    diag_dir = str(Path(tempfile.gettempdir()) / f"mario_env_diag_{os.getpid()}_{int(time.time())}")
+    diag_dir = str(
+        Path(tempfile.gettempdir()) / f"mario_env_diag_{os.getpid()}_{int(time.time())}"
+    )
     print(f"[env] diagnostic dir: {diag_dir}")
 
     ctx_obj = None
@@ -763,7 +826,11 @@ def create_vector_env(config: MarioVectorEnvConfig):
             # passed to vector env constructors where supported. Avoid
             # passing a string name as some VectorEnv implementations expect
             # the real context object.
-            ctx_obj = multiprocessing.get_context(current_method) if current_method else multiprocessing.get_context()
+            ctx_obj = (
+                multiprocessing.get_context(current_method)
+                if current_method
+                else multiprocessing.get_context()
+            )
         except Exception:
             try:
                 ctx_obj = multiprocessing.get_context()
@@ -784,11 +851,17 @@ def create_vector_env(config: MarioVectorEnvConfig):
         def _inner():
             start = time.time()
             try:
-                print(f"[env] constructing env {i + 1}/{config.num_envs} ...", flush=True)
+                print(
+                    f"[env] constructing env {i + 1}/{config.num_envs} ...", flush=True
+                )
                 return fn()
             finally:
                 end = time.time()
-                print(f"[env] env {i + 1}/{config.num_envs} constructed in {end - start:.2f}s", flush=True)
+                print(
+                    f"[env] env {i + 1}/{config.num_envs} constructed in {end - start:.2f}s",
+                    flush=True,
+                )
+
         return _inner
 
     for idx in range(config.num_envs):
@@ -841,7 +914,7 @@ def create_vector_env(config: MarioVectorEnvConfig):
     vector_kwargs: dict[str, Any] = {}
     try:
         if vector_cls is AsyncVectorEnv:
-            context_name: Optional[str] = None
+            # context_name variable removed (unused)
             # Provide the start-method name (string) rather than passing the
             # context object itself. multiprocessing.get_context expects a
             # method name (str) when called by AsyncVectorEnv internals.

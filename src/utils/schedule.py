@@ -13,6 +13,7 @@ class CosineWithWarmup:
     def __call__(self, step: int) -> float:
         if step < self.warmup_steps:
             return float(step) / float(max(1, self.warmup_steps))
-        progress = (step - self.warmup_steps) / float(max(1, self.total_steps - self.warmup_steps))
+        progress = (step - self.warmup_steps) / float(
+            max(1, self.total_steps - self.warmup_steps)
+        )
         return 0.5 * (1.0 + math.cos(math.pi * progress))
-

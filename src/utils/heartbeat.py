@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Deque, Optional, Tuple
+from typing import Callable, Deque, Optional
 
 
 @dataclass(frozen=True)
@@ -51,7 +51,9 @@ class HeartbeatReporter:
         if self._thread is not None:
             return
         self._stop_event.clear()
-        thread = threading.Thread(target=self._run, name=f"{self._component}-heartbeat", daemon=True)
+        thread = threading.Thread(
+            target=self._run, name=f"{self._component}-heartbeat", daemon=True
+        )
         self._thread = thread
         thread.start()
 
@@ -88,7 +90,11 @@ class HeartbeatReporter:
             if progress and (update_idx is not None or global_step is not None):
                 self._last_progress_ts = now
                 self._history.append(
-                    _ProgressSample(timestamp=now, update_idx=self._last_update, global_step=self._last_step)
+                    _ProgressSample(
+                        timestamp=now,
+                        update_idx=self._last_update,
+                        global_step=self._last_step,
+                    )
                 )
 
     def heartbeat_now(self) -> None:
@@ -119,9 +125,15 @@ class HeartbeatReporter:
             sample_start = history[0]
             sample_end = history[-1]
             dt = max(sample_end.timestamp - sample_start.timestamp, 1e-6)
-            if sample_start.update_idx is not None and sample_end.update_idx is not None:
+            if (
+                sample_start.update_idx is not None
+                and sample_end.update_idx is not None
+            ):
                 update_rate = (sample_end.update_idx - sample_start.update_idx) / dt
-            if sample_start.global_step is not None and sample_end.global_step is not None:
+            if (
+                sample_start.global_step is not None
+                and sample_end.global_step is not None
+            ):
                 step_rate = (sample_end.global_step - sample_start.global_step) / dt
 
         status_bits = [f"phase={last_phase}"]

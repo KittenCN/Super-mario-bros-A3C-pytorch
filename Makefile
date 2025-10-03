@@ -9,10 +9,14 @@ setup:
 	$(PIP) install -r $(REQ)
 
 fmt:
-	@echo "(placeholder) add black/ruff later"
+	@echo "[fmt] black & ruff format" && \
+	black --quiet src tests scripts train.py *.py || true && \
+	ruff check --select I --fix . || true
 
 lint:
-	@echo "(placeholder) lint step - add ruff/mypy later"
+	@echo "[lint] ruff + mypy" && \
+	ruff check . && \
+	mypy --strict --ignore-missing-imports src || true
 
 test:
 	PYTHONPATH=. pytest -q

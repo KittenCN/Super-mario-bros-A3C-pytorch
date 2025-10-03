@@ -7,9 +7,8 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from src.config import ModelConfig
+from src.app_config import ModelConfig
 
 from .layers import ImpalaBlock, NoisyLinear
 from .sequence import PositionalEncoding
@@ -37,7 +36,9 @@ class MarioActorCritic(nn.Module):
         self.config = config
         channels = config.base_channels
         self.stem = nn.Sequential(
-            nn.Conv2d(config.input_channels, channels, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(
+                config.input_channels, channels, kernel_size=3, stride=1, padding=1
+            ),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
         )
@@ -59,9 +60,13 @@ class MarioActorCritic(nn.Module):
         )
 
         if config.recurrent_type == "gru":
-            self.recurrent = nn.GRU(config.hidden_size, config.hidden_size, batch_first=False)
+            self.recurrent = nn.GRU(
+                config.hidden_size, config.hidden_size, batch_first=False
+            )
         elif config.recurrent_type == "lstm":
-            self.recurrent = nn.LSTM(config.hidden_size, config.hidden_size, batch_first=False)
+            self.recurrent = nn.LSTM(
+                config.hidden_size, config.hidden_size, batch_first=False
+            )
         elif config.recurrent_type == "transformer":
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=config.hidden_size,
@@ -71,8 +76,12 @@ class MarioActorCritic(nn.Module):
                 dropout=config.dropout,
                 activation="gelu",
             )
-            self.recurrent = nn.TransformerEncoder(encoder_layer, num_layers=config.transformer_layers)
-            self.pos_encoding = PositionalEncoding(config.hidden_size, dropout=config.dropout)
+            self.recurrent = nn.TransformerEncoder(
+                encoder_layer, num_layers=config.transformer_layers
+            )
+            self.pos_encoding = PositionalEncoding(
+                config.hidden_size, dropout=config.dropout
+            )
         else:
             self.recurrent = None
 
@@ -89,7 +98,9 @@ class MarioActorCritic(nn.Module):
             flat = self.flatten(features)
         return flat.shape[-1]
 
-    def initial_state(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def initial_state(
+        self, batch_size: int, device: torch.device
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         hidden = torch.zeros((1, batch_size, self.config.hidden_size), device=device)
         if isinstance(self.recurrent, nn.LSTM):
             cell = torch.zeros((1, batch_size, self.config.hidden_size), device=device)
@@ -123,7 +134,9 @@ class MarioActorCritic(nn.Module):
             next_hidden, next_cell = hidden_state, cell_state
         else:
             if hidden_state is None:
-                hidden_state, cell_state = self.initial_state(batch_size, features.device)
+                hidden_state, cell_state = self.initial_state(
+                    batch_size, features.device
+                )
             # Ensure hidden / cell states match the dtype of features (handles autocast mixed precision)
             target_dtype = features.dtype
             if hidden_state is not None and hidden_state.dtype != target_dtype:
@@ -132,7 +145,9 @@ class MarioActorCritic(nn.Module):
                 cell_state = cell_state.to(dtype=target_dtype)
 
             if isinstance(self.recurrent, nn.LSTM):
-                core_output, (next_hidden, next_cell) = self.recurrent(features, (hidden_state, cell_state))
+                core_output, (next_hidden, next_cell) = self.recurrent(
+                    features, (hidden_state, cell_state)
+                )
             else:
                 core_output, next_hidden = self.recurrent(features, hidden_state)
                 next_cell = cell_state
@@ -148,4 +163,10 @@ class MarioActorCritic(nn.Module):
             values = values.squeeze(0)
 
         aux["features"] = core_output
-        return ModelOutput(logits=logits, value=values, hidden_state=next_hidden, cell_state=next_cell, aux=aux)
+        return ModelOutput(
+            logits=logits,
+            value=values,
+            hidden_state=next_hidden,
+            cell_state=next_cell,
+            aux=aux,
+        )

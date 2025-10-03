@@ -6,12 +6,12 @@ Usage (invoked by run_async_regression.py):
 This script intentionally avoids writing to files so the parent can capture stdout
 and append the JSON line to the shared report file.
 """
+
 from __future__ import annotations
 
 import json
 import sys
 import time
-from pathlib import Path
 
 try:
     num_envs = int(sys.argv[1])
@@ -35,7 +35,9 @@ entry = {
 }
 start = time.time()
 try:
-    cfg = MarioVectorEnvConfig(num_envs=num_envs, asynchronous=True, stage_schedule=((1,1),), base_seed=seed)
+    cfg = MarioVectorEnvConfig(
+        num_envs=num_envs, asynchronous=True, stage_schedule=((1, 1),), base_seed=seed
+    )
     # attempt construction and reset; leave relatively short so parent can time out
     env = create_vector_env(cfg)
     construct_time = time.time() - start

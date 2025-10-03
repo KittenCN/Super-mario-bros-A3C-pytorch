@@ -102,3 +102,17 @@ python scripts/inspect_metrics.py --path tmp_metrics.jsonl --tail 20
 - avg_env_positive_dx_ratio_recent：最近窗口推进环境占比均值；<0.1 说明探索受阻，可提高 distance_weight / 启用 scripted。
 - secondary_triggered：已触发 plateau 二次脚本；若仍无增长，调大 frames 或阈值策略。
 - first_positive_distance_update：首个 distance_delta_sum>0 的 update；过晚表示 cold start 困难需加大 early shaping。
+
+### 自适应调度字段 (Adaptive Scheduling Fields)
+当启用 `--adaptive-*` 参数后，metrics 可能包含：
+- adaptive_ratio_avg: 滑动窗口简单平均推进占比 (SMA)。
+- adaptive_ratio_ema: 指数滑动平均 (EMA) 去抖结果，α = 2/(window+1) 或用户指定。
+- adaptive_distance_weight: 最新一次 distance_weight 调整目标值（调度器内部 shadow，未必等于即时 wrapper 内真实权重；真实奖励仍受退火与 early shaping 差分影响）。
+- adaptive_entropy_beta: 最新一次策略熵系数实际写回值。
+- adaptive_distance_weight_effective: 训练循环为分析而记录的 shadow distance_weight（与 wrapper 原值对比可评估自适应力度）。
+- adaptive_error: 自适应过程中出现的异常截断信息（不影响主循环）。
+
+调参指引：
+1. 若 adaptive_ratio_ema 长期 < low 阈值且 distance_weight 频繁触顶，说明推进极难，可提高 scripted 或扩大 dw_max。
+2. 若 adaptive_ratio_ema 长期 > high 阈值且 entropy_beta 已降至下限仍波动大，可减小 dw_lr / ent_lr 或收紧上下限差距。
+3. 观察 adaptive_ratio_avg 与 adaptive_ratio_ema 差值，大幅偏离说明窗口过小或环境阶段性剧烈跳变。

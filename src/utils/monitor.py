@@ -24,8 +24,12 @@ def _get_resource_stats_once():
         if torch.cuda.is_available():
             stats["gpu_count"] = torch.cuda.device_count()
             for gi in range(torch.cuda.device_count()):
-                stats[f"gpu_{gi}_mem_alloc_bytes"] = float(torch.cuda.memory_allocated(gi))
-                stats[f"gpu_{gi}_mem_reserved_bytes"] = float(torch.cuda.memory_reserved(gi))
+                stats[f"gpu_{gi}_mem_alloc_bytes"] = float(
+                    torch.cuda.memory_allocated(gi)
+                )
+                stats[f"gpu_{gi}_mem_reserved_bytes"] = float(
+                    torch.cuda.memory_reserved(gi)
+                )
     except Exception:
         pass
 
@@ -37,7 +41,7 @@ def _get_resource_stats_once():
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
         if res.returncode == 0 and res.stdout.strip():
-            lines = [l for l in res.stdout.strip().splitlines() if l.strip()]
+            lines = [line_var for line_var in res.stdout.strip().splitlines() if line_var.strip()]
             for idx, line in enumerate(lines):
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) >= 3:

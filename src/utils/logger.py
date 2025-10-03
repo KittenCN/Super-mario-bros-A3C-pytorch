@@ -28,7 +28,9 @@ def create_logger(
 
     wandb_run = None
     if project and wandb is not None:
-        wandb_run = wandb.init(project=project, name=run_name, dir=str(path), resume=resume)
+        wandb_run = wandb.init(
+            project=project, name=run_name, dir=str(path), resume=resume
+        )
 
     if not enable_tb:
         # Provide a minimal no-op writer with the same interface we use but backed by the run directory.
@@ -50,4 +52,3 @@ def create_logger(
 
     writer = SummaryWriter(run_path)
     return writer, wandb_run, run_path
-

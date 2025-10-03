@@ -81,7 +81,9 @@ class ImpalaBlock(nn.Module):
 
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, stride=1, padding=1
+        )
         self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.res1 = ImpalaResidualBlock(out_channels)
         self.res2 = ImpalaResidualBlock(out_channels)
@@ -94,7 +96,9 @@ class ImpalaBlock(nn.Module):
         return x
 
 
-def compute_conv_output_size(input_shape: Tuple[int, int, int], base_channels: int, num_blocks: int) -> int:
+def compute_conv_output_size(
+    input_shape: Tuple[int, int, int], base_channels: int, num_blocks: int
+) -> int:
     c = base_channels
     h, w = input_shape[1:]
     for _ in range(num_blocks):
@@ -104,5 +108,9 @@ def compute_conv_output_size(input_shape: Tuple[int, int, int], base_channels: i
     return c * h * w
 
 
-__all__ = ["ImpalaBlock", "ImpalaResidualBlock", "NoisyLinear", "compute_conv_output_size"]
-
+__all__ = [
+    "ImpalaBlock",
+    "ImpalaResidualBlock",
+    "NoisyLinear",
+    "compute_conv_output_size",
+]

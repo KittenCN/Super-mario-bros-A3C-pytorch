@@ -6,13 +6,13 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import torch
 from torch.distributions import Categorical
 
-from src.config import EvaluationConfig, ModelConfig
+from src.app_config import EvaluationConfig, ModelConfig
 from src.envs import MarioEnvConfig, create_eval_env
 from src.models import MarioActorCritic
 from src.utils.heartbeat import HeartbeatReporter
@@ -20,16 +20,53 @@ from src.utils.heartbeat import HeartbeatReporter
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a trained Mario policy")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to the trained model checkpoint (.pt)")
-    parser.add_argument("--episodes", type=int, default=5, help="Number of evaluation episodes")
-    parser.add_argument("--render", action="store_true", help="Render the environment during evaluation")
-    parser.add_argument("--video-dir", type=str, default=None, help="Directory to store evaluation videos (defaults to metadata)")
-    parser.add_argument("--no-video", action="store_true", help="Disable video recording even if metadata enables it")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--heartbeat-interval", type=float, default=15.0, help="心跳打印间隔（秒），<=0 表示关闭")
-    parser.add_argument("--heartbeat-timeout", type=float, default=60.0, help="无进展告警阈值（秒），<=0 时自动按间隔推算")
-    parser.add_argument("--step-timeout", type=float, default=8.0, help="单次 env.step 超过该秒数即提示可能卡顿，<=0 关闭")
-    parser.add_argument("--progress-interval", type=int, default=50, help="每隔多少步输出一次评估进度")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to the trained model checkpoint (.pt)",
+    )
+    parser.add_argument(
+        "--episodes", type=int, default=5, help="Number of evaluation episodes"
+    )
+    parser.add_argument(
+        "--render", action="store_true", help="Render the environment during evaluation"
+    )
+    parser.add_argument(
+        "--video-dir",
+        type=str,
+        default=None,
+        help="Directory to store evaluation videos (defaults to metadata)",
+    )
+    parser.add_argument(
+        "--no-video",
+        action="store_true",
+        help="Disable video recording even if metadata enables it",
+    )
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=15.0,
+        help="心跳打印间隔（秒），<=0 表示关闭",
+    )
+    parser.add_argument(
+        "--heartbeat-timeout",
+        type=float,
+        default=60.0,
+        help="无进展告警阈值（秒），<=0 时自动按间隔推算",
+    )
+    parser.add_argument(
+        "--step-timeout",
+        type=float,
+        default=8.0,
+        help="单次 env.step 超过该秒数即提示可能卡顿，<=0 关闭",
+    )
+    parser.add_argument(
+        "--progress-interval", type=int, default=50, help="每隔多少步输出一次评估进度"
+    )
     return parser.parse_args()
 
 
@@ -42,18 +79,18 @@ def _infer_from_filename(path: Path) -> Optional[Dict]:
     stem = path.stem
     # crude parse
     # split by '_' expecting tokens like a3c, world1, stage1, ...
-    parts = stem.split('_')
+    parts = stem.split("_")
     world = None
     stage = None
     for p in parts:
-        if p.startswith('world'):
+        if p.startswith("world"):
             try:
-                world = int(p.replace('world',''))
+                world = int(p.replace("world", ""))
             except Exception:
                 pass
-        if p.startswith('stage'):
+        if p.startswith("stage"):
             try:
-                stage = int(p.replace('stage',''))
+                stage = int(p.replace("stage", ""))
             except Exception:
                 pass
     if world is None or stage is None:
@@ -96,40 +133,68 @@ def load_checkpoint_metadata(checkpoint_path: Path) -> Dict:
         return json.loads(metadata_path.read_text(encoding="utf-8"))
     # Fallback: inspect checkpoint payload to reconstruct minimal metadata
     try:
-        payload = torch.load(checkpoint_path, map_location='cpu')
+        payload = torch.load(checkpoint_path, map_location="cpu")
     except Exception:
         payload = {}
     meta_from_ckpt = None
     if isinstance(payload, dict):
         # training pipeline saved 'config' or we can introspect partial fields
-        if 'config' in payload and isinstance(payload['config'], dict):
-            meta_from_ckpt = payload['config'].get('env') or None
+        if "config" in payload and isinstance(payload["config"], dict):
+            meta_from_ckpt = payload["config"].get("env") or None
         # try to build unified metadata when full training config present
-        if 'config' in payload:
-            cfg_all = payload['config']
+        if "config" in payload:
+            cfg_all = payload["config"]
             try:
-                env_cfg = cfg_all.get('env', {})
-                model_cfg = cfg_all.get('model', {})
+                env_cfg = cfg_all.get("env", {})
+                model_cfg = cfg_all.get("model", {})
                 reconstructed = {
-                    "world": env_cfg.get('env', {}).get('world', 1) if isinstance(env_cfg.get('env'), dict) else cfg_all.get('env', {}).get('env', {}).get('world', 1),
-                    "stage": env_cfg.get('env', {}).get('stage', 1) if isinstance(env_cfg.get('env'), dict) else cfg_all.get('env', {}).get('env', {}).get('stage', 1),
-                    "action_type": env_cfg.get('env', {}).get('action_type', 'complex') if isinstance(env_cfg.get('env'), dict) else 'complex',
-                    "frame_skip": env_cfg.get('env', {}).get('frame_skip', 4) if isinstance(env_cfg.get('env'), dict) else 4,
-                    "frame_stack": env_cfg.get('env', {}).get('frame_stack', 4) if isinstance(env_cfg.get('env'), dict) else 4,
-                    "video_dir": env_cfg.get('env', {}).get('video_dir', 'output/videos') if isinstance(env_cfg.get('env'), dict) else 'output/videos',
-                    "record_video": env_cfg.get('env', {}).get('record_video', False) if isinstance(env_cfg.get('env'), dict) else False,
+                    "world": (
+                        env_cfg.get("env", {}).get("world", 1)
+                        if isinstance(env_cfg.get("env"), dict)
+                        else cfg_all.get("env", {}).get("env", {}).get("world", 1)
+                    ),
+                    "stage": (
+                        env_cfg.get("env", {}).get("stage", 1)
+                        if isinstance(env_cfg.get("env"), dict)
+                        else cfg_all.get("env", {}).get("env", {}).get("stage", 1)
+                    ),
+                    "action_type": (
+                        env_cfg.get("env", {}).get("action_type", "complex")
+                        if isinstance(env_cfg.get("env"), dict)
+                        else "complex"
+                    ),
+                    "frame_skip": (
+                        env_cfg.get("env", {}).get("frame_skip", 4)
+                        if isinstance(env_cfg.get("env"), dict)
+                        else 4
+                    ),
+                    "frame_stack": (
+                        env_cfg.get("env", {}).get("frame_stack", 4)
+                        if isinstance(env_cfg.get("env"), dict)
+                        else 4
+                    ),
+                    "video_dir": (
+                        env_cfg.get("env", {}).get("video_dir", "output/videos")
+                        if isinstance(env_cfg.get("env"), dict)
+                        else "output/videos"
+                    ),
+                    "record_video": (
+                        env_cfg.get("env", {}).get("record_video", False)
+                        if isinstance(env_cfg.get("env"), dict)
+                        else False
+                    ),
                     "vector_env": {
-                        "num_envs": env_cfg.get('num_envs', 1),
-                        "asynchronous": env_cfg.get('asynchronous', False),
-                        "stage_schedule": env_cfg.get('stage_schedule', [[1,1]]),
-                        "random_start_stage": env_cfg.get('random_start_stage', False),
-                        "base_seed": env_cfg.get('base_seed', 42),
+                        "num_envs": env_cfg.get("num_envs", 1),
+                        "asynchronous": env_cfg.get("asynchronous", False),
+                        "stage_schedule": env_cfg.get("stage_schedule", [[1, 1]]),
+                        "random_start_stage": env_cfg.get("random_start_stage", False),
+                        "base_seed": env_cfg.get("base_seed", 42),
                     },
                     "model": model_cfg,
                     "save_state": {
-                        "global_step": payload.get('global_step', 0),
-                        "global_update": payload.get('global_update', 0),
-                        "type": 'latest'
+                        "global_step": payload.get("global_step", 0),
+                        "global_update": payload.get("global_update", 0),
+                        "type": "latest",
                     },
                 }
                 meta_from_ckpt = reconstructed
@@ -138,10 +203,14 @@ def load_checkpoint_metadata(checkpoint_path: Path) -> Dict:
     if meta_from_ckpt is None:
         meta_from_ckpt = _infer_from_filename(checkpoint_path)
     if meta_from_ckpt is None:
-        raise FileNotFoundError(f"Metadata file not found and unable to reconstruct: {metadata_path}")
+        raise FileNotFoundError(
+            f"Metadata file not found and unable to reconstruct: {metadata_path}"
+        )
     # Write a sidecar so后续评估可重用
     try:
-        metadata_path.write_text(json.dumps(meta_from_ckpt, indent=2, ensure_ascii=False), encoding='utf-8')
+        metadata_path.write_text(
+            json.dumps(meta_from_ckpt, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
         print(f"[eval] Reconstructed metadata written to {metadata_path}")
     except Exception:
         pass
@@ -169,10 +238,14 @@ def build_eval_config(args: argparse.Namespace, metadata: Dict) -> EvaluationCon
     )
 
 
-def load_model(checkpoint_path: Path, metadata: Dict, device: torch.device) -> MarioActorCritic:
+def load_model(
+    checkpoint_path: Path, metadata: Dict, device: torch.device
+) -> MarioActorCritic:
     model_data = metadata.get("model")
     if not isinstance(model_data, dict):
-        raise ValueError("Checkpoint metadata is missing required 'model' configuration.")
+        raise ValueError(
+            "Checkpoint metadata is missing required 'model' configuration."
+        )
 
     # Load raw payload first to allow inferring action space before constructing model
     payload = torch.load(checkpoint_path, map_location=device)
@@ -182,7 +255,11 @@ def load_model(checkpoint_path: Path, metadata: Dict, device: torch.device) -> M
         model_state_candidate = payload
 
     # Infer action_space & hidden_size if missing (metadata reconstruction path)
-    inferred_action = None if model_data.get("action_space") in (None, 0) else model_data.get("action_space")
+    inferred_action = (
+        None
+        if model_data.get("action_space") in (None, 0)
+        else model_data.get("action_space")
+    )
     inferred_hidden = None
     if isinstance(model_state_candidate, dict):
         for k, v in model_state_candidate.items():
@@ -220,7 +297,9 @@ def load_model(checkpoint_path: Path, metadata: Dict, device: torch.device) -> M
     model_cfg = ModelConfig(**model_data)
     model = MarioActorCritic(model_cfg).to(device)
     model_state = model_state_candidate
-    if isinstance(model_state_candidate, dict) and any(key.startswith("_orig_mod.") for key in model_state_candidate.keys()):
+    if isinstance(model_state_candidate, dict) and any(
+        key.startswith("_orig_mod.") for key in model_state_candidate.keys()
+    ):
         model_state = {
             key.split("_orig_mod.", 1)[1]: value
             for key, value in model_state_candidate.items()
@@ -230,11 +309,15 @@ def load_model(checkpoint_path: Path, metadata: Dict, device: torch.device) -> M
         # 灵活加载：如果目标模型键需要 _orig_mod 但 state 不含，则直接尝试；若 state 含 _orig_mod 已在上文剥离
         missing, unexpected = model.load_state_dict(model_state, strict=False)
         if missing or unexpected:
-            print(f"[eval][warn] load_state partial: missing={len(missing)} unexpected={len(unexpected)}")
+            print(
+                f"[eval][warn] load_state partial: missing={len(missing)} unexpected={len(unexpected)}"
+            )
             try:
                 issues_path = checkpoint_path.parent / "eval_state_dict_load_issues.log"
                 with issues_path.open("a", encoding="utf-8") as fp:
-                    fp.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} checkpoint={checkpoint_path}\n")
+                    fp.write(
+                        f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} checkpoint={checkpoint_path}\n"
+                    )
                     for m in missing:
                         fp.write(f"missing:{m}\n")
                     for u in unexpected:
@@ -277,7 +360,12 @@ def evaluate(
     try:
         for episode in range(cfg.episodes):
             if heartbeat is not None:
-                heartbeat.notify(update_idx=episode, phase="episode", message=f"开始第{episode + 1}集", progress=False)
+                heartbeat.notify(
+                    update_idx=episode,
+                    phase="episode",
+                    message=f"开始第{episode + 1}集",
+                    progress=False,
+                )
             obs, info = env.reset()
             obs = torch.from_numpy(obs).to(device, dtype=torch.float32)
             hidden_state, cell_state = model.initial_state(1, device)
@@ -308,13 +396,20 @@ def evaluate(
                 step_duration = time.time() - step_start
                 if step_timeout is not None and step_duration > step_timeout:
                     now_warn = time.time()
-                    if slow_step_cooldown is None or now_warn - last_slow_step_warn >= slow_step_cooldown:
+                    if (
+                        slow_step_cooldown is None
+                        or now_warn - last_slow_step_warn >= slow_step_cooldown
+                    ):
                         print(
                             f"[eval][warn] Episode {episode + 1} step {step_count}: env.step {step_duration:.1f}s "
                             f"(阈值 {step_timeout:.1f}s)"
                         )
                         if heartbeat is not None:
-                            heartbeat.notify(phase="step", message=f"env.step {step_duration:.1f}s", progress=False)
+                            heartbeat.notify(
+                                phase="step",
+                                message=f"env.step {step_duration:.1f}s",
+                                progress=False,
+                            )
                         last_slow_step_warn = now_warn
 
                 done = bool(terminated or truncated)
@@ -357,7 +452,9 @@ def evaluate(
     avg_reward = float(np.mean(total_rewards)) if total_rewards else 0.0
     print(f"[eval] Average reward over {cfg.episodes} episodes: {avg_reward:.2f}")
     if heartbeat is not None:
-        heartbeat.notify(phase="总结", message=f"平均回报 {avg_reward:.2f}", progress=False)
+        heartbeat.notify(
+            phase="总结", message=f"平均回报 {avg_reward:.2f}", progress=False
+        )
 
 
 def main():
@@ -390,7 +487,9 @@ def main():
         hb_desc = f"{hb_interval:.0f}s" if hb_interval > 0 else "off"
         timeout_desc = f"{step_timeout:.1f}s" if step_timeout is not None else "off"
 
-        print(f"[eval] checkpoint={checkpoint_path} episodes={args.episodes} render={args.render}")
+        print(
+            f"[eval] checkpoint={checkpoint_path} episodes={args.episodes} render={args.render}"
+        )
         world = metadata.get("world")
         stage = metadata.get("stage")
         action_type = metadata.get("action_type", "complex")
@@ -399,7 +498,9 @@ def main():
             f"heartbeat={hb_desc} step_timeout={timeout_desc} progress_every={progress_interval} steps"
         )
 
-        heartbeat.notify(phase="评估", message=f"准备评估 {args.episodes} 集", progress=False)
+        heartbeat.notify(
+            phase="评估", message=f"准备评估 {args.episodes} 集", progress=False
+        )
         heartbeat.heartbeat_now()
 
         evaluate(

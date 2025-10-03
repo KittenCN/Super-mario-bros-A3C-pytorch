@@ -5,6 +5,7 @@ from __future__ import annotations
 # Set multiprocessing start method at the very top to avoid fork-related
 # deadlocks when native extensions or thread pools are initialised later.
 import multiprocessing as _mp
+
 # Choose a safe multiprocessing start method if one hasn't been set yet.
 # Avoid forcing `fork` early as it can cause deadlocks when other threads
 # or native extensions are initialised. Prefer `forkserver` then `spawn`.
@@ -24,10 +25,13 @@ except Exception as e:
 # Suppress the legacy Gym startup notice that prints to stderr when gym is
 # installed alongside gymnasium. We temporarily replace sys.stderr around the
 # import of gym-related packages to avoid noisy migration messages.
-import sys
 import io
+import sys
+
 _stderr_orig = sys.stderr
 _suppress_stderr = False
+
+
 def _suppress_gym_notice(enable: bool = True):
     global _stderr_orig, _suppress_stderr
     if enable and not _suppress_stderr:
@@ -37,50 +41,57 @@ def _suppress_gym_notice(enable: bool = True):
         sys.stderr = _stderr_orig
         _suppress_stderr = False
 
+
 _suppress_gym_notice(True)
 
-import argparse
-import multiprocessing as _mp
+import argparse  # noqa: E402
+import contextlib  # noqa: E402
 
 # Ensure we don't attempt to override an already-initialised start method
 # later in the module; the selection above is sufficient.
+import dataclasses  # noqa: E402
+import json  # noqa: E402
+import multiprocessing as _mp  # noqa: E402
+import os  # noqa: E402
+import subprocess  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+import warnings  # noqa: E402
+from datetime import UTC, datetime  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any, Dict, List, Optional, Sequence, Tuple  # noqa: E402
 
-import dataclasses
-import json
-import contextlib
-import os
-import math
-from datetime import datetime, UTC
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+import torch.nn as nn  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
+from torch.distributions import Categorical  # noqa: E402
+from torch.optim import AdamW  # noqa: E402
+from torch.optim.lr_scheduler import LambdaLR  # noqa: E402
 
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import subprocess
-import time
-import threading
-import warnings
-from torch.distributions import Categorical
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
+from src.algorithms import vtrace_returns  # noqa: E402
+from src.app_config import TrainingConfig, create_default_stage_schedule  # noqa: E402
 
-from src.algorithms import vtrace_returns
-from src.config import (
-    EvaluationConfig,
-    ModelConfig,
-    TrainingConfig,
-    create_default_stage_schedule,
-)
-from src.envs.mario import MarioEnvConfig, MarioVectorEnvConfig, create_vector_env
 # Import patch utilities to allow parent process to prewarm and patch nes_py
-from src.envs.mario import _patch_legacy_nes_py_uint8, _patch_nes_py_ram_dtype
+from src.envs.mario import (  # noqa: E402
+    MarioEnvConfig,
+    MarioVectorEnvConfig,
+    _patch_legacy_nes_py_uint8,
+    _patch_nes_py_ram_dtype,
+    create_vector_env,
+)
+
 _suppress_gym_notice(False)
-from src.models import MarioActorCritic
-from src.utils import CosineWithWarmup, PrioritizedReplay, RolloutBuffer, create_logger
-from src.utils.heartbeat import HeartbeatReporter
-from src.utils.monitor import Monitor
+from src.models import MarioActorCritic  # noqa: E402
+from src.utils import (  # noqa: E402
+    CosineWithWarmup,
+    PrioritizedReplay,
+    RolloutBuffer,
+    create_logger,
+)
+from src.utils.adaptive import AdaptiveConfig, AdaptiveScheduler  # noqa: E402
+from src.utils.heartbeat import HeartbeatReporter  # noqa: E402
+from src.utils.monitor import Monitor  # noqa: E402
 
 try:  # optional dependency for resource monitoring
     import psutil  # type: ignore
@@ -89,22 +100,39 @@ except ImportError:  # pragma: no cover
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a Mario agent with modernised A3C")
+    parser = argparse.ArgumentParser(
+        description="Train a Mario agent with modernised A3C"
+    )
     parser.add_argument("--world", type=int, default=1)
     parser.add_argument("--stage", type=int, default=1)
-    parser.add_argument("--action-type", type=str, default="complex", choices=["right", "simple", "complex", "extended"])
+    parser.add_argument(
+        "--action-type",
+        type=str,
+        default="complex",
+        choices=["right", "simple", "complex", "extended"],
+    )
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--frame-skip", type=int, default=4)
     parser.add_argument("--frame-stack", type=int, default=4)
     parser.add_argument("--random-stage", action="store_true")
-    parser.add_argument("--stage-span", type=int, default=4, help="Number of consecutive stages in schedule")
+    parser.add_argument(
+        "--stage-span",
+        type=int,
+        default=4,
+        help="Number of consecutive stages in schedule",
+    )
     parser.add_argument("--total-updates", type=int, default=100_000)
     parser.add_argument("--rollout-steps", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--base-channels", type=int, default=32)
     parser.add_argument("--num-res-blocks", type=int, default=3)
-    parser.add_argument("--recurrent-type", type=str, default="gru", choices=["gru", "lstm", "transformer", "none"])
+    parser.add_argument(
+        "--recurrent-type",
+        type=str,
+        default="gru",
+        choices=["gru", "lstm", "transformer", "none"],
+    )
     parser.add_argument("--transformer-layers", type=int, default=2)
     parser.add_argument("--transformer-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -115,8 +143,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=1.0)
     parser.add_argument("--clip-grad", type=float, default=0.5)
-    parser.add_argument("--sync-env", action="store_true", help="Use synchronous vector env")
-    parser.add_argument("--async-env", action="store_true", help="Force asynchronous vector env")
+    parser.add_argument(
+        "--sync-env", action="store_true", help="Use synchronous vector env"
+    )
+    parser.add_argument(
+        "--async-env", action="store_true", help="Force asynchronous vector env"
+    )
     parser.add_argument(
         "--confirm-async",
         action="store_true",
@@ -126,11 +158,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "set environment variable MARIO_ENABLE_ASYNC=1 or pass this flag to opt in."
         ),
     )
-    parser.add_argument("--force-sync", action="store_true", help="Force synchronous vector env (overrides async heuristic)")
+    parser.add_argument(
+        "--force-sync",
+        action="store_true",
+        help="Force synchronous vector env (overrides async heuristic)",
+    )
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--use-noisy-linear", action="store_true")
-    parser.add_argument("--log-dir", type=str, default="tensorboard/a3c_super_mario_bros")
+    parser.add_argument(
+        "--log-dir", type=str, default="tensorboard/a3c_super_mario_bros"
+    )
     parser.add_argument("--save-dir", type=str, default="trained_models")
     parser.add_argument("--eval-interval", type=int, default=5_000)
     parser.add_argument("--checkpoint-interval", type=int, default=1_000)
@@ -138,23 +176,97 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--config-out", type=str, default=None, help="Persist effective config to JSON")
-    parser.add_argument("--per", action="store_true", help="Enable prioritized replay (hybrid)")
-    parser.add_argument("--per-sample-interval", type=int, default=1, help="PER 抽样更新间隔（>=1）。例如 4 表示每4次更新做一次 PER batch")
+    parser.add_argument(
+        "--config-out", type=str, default=None, help="Persist effective config to JSON"
+    )
+    parser.add_argument(
+        "--per", action="store_true", help="Enable prioritized replay (hybrid)"
+    )
+    parser.add_argument(
+        "--per-sample-interval",
+        type=int,
+        default=1,
+        help="PER 抽样更新间隔（>=1）。例如 4 表示每4次更新做一次 PER batch",
+    )
     parser.add_argument("--project", type=str, default="mario-a3c")
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Device to run training on")
-    parser.add_argument("--metrics-path", type=str, default=None, help="Path to JSONL file for periodic metrics dump")
-    parser.add_argument("--env-reset-timeout", type=float, default=None, help="Timeout (s) for environment construction/reset before fallback; if unset a heuristic is used")
-    parser.add_argument("--no-prewarm", action="store_true", default=False, help="Disable prewarming ROMs before training")
-    parser.add_argument("--no-monitor", action="store_true", default=False, help="Disable background resource monitor")
-    parser.add_argument("--monitor-interval", type=float, default=10.0, help="Monitor interval in seconds")
-    parser.add_argument("--enable-tensorboard", action="store_true", default=False, help="Enable TensorBoard logging (disabled by default)")
-    parser.add_argument("--parent-prewarm", action="store_true", default=False, help="Run a parent-process prewarm of the environment before launching workers")
-    parser.add_argument("--parent-prewarm-all", action="store_true", default=False, help="Sequentially prewarm each env configuration in the parent before launching workers (slower, safer)")
-    parser.add_argument("--worker-start-delay", type=float, default=0.2, help="Stagger delay (s) between worker initialisations when using async vector env")
-    parser.add_argument("--heartbeat-interval", type=float, default=30.0, help="心跳打印间隔（秒），<=0 表示关闭")
-    parser.add_argument("--heartbeat-timeout", type=float, default=300.0, help="无进展告警阈值（秒），<=0 则自动按间隔推算")
-    parser.add_argument("--overlap-collect", action="store_true", help="启用采集-学习重叠：后台线程采集下一批 rollout")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Device to run training on",
+    )
+    parser.add_argument(
+        "--metrics-path",
+        type=str,
+        default=None,
+        help="Path to JSONL file for periodic metrics dump",
+    )
+    parser.add_argument(
+        "--env-reset-timeout",
+        type=float,
+        default=None,
+        help="Timeout (s) for environment construction/reset before fallback; if unset a heuristic is used",
+    )
+    parser.add_argument(
+        "--no-prewarm",
+        action="store_true",
+        default=False,
+        help="Disable prewarming ROMs before training",
+    )
+    parser.add_argument(
+        "--no-monitor",
+        action="store_true",
+        default=False,
+        help="Disable background resource monitor",
+    )
+    parser.add_argument(
+        "--monitor-interval",
+        type=float,
+        default=10.0,
+        help="Monitor interval in seconds",
+    )
+    parser.add_argument(
+        "--enable-tensorboard",
+        action="store_true",
+        default=False,
+        help="Enable TensorBoard logging (disabled by default)",
+    )
+    parser.add_argument(
+        "--parent-prewarm",
+        action="store_true",
+        default=False,
+        help="Run a parent-process prewarm of the environment before launching workers",
+    )
+    parser.add_argument(
+        "--parent-prewarm-all",
+        action="store_true",
+        default=False,
+        help="Sequentially prewarm each env configuration in the parent before launching workers (slower, safer)",
+    )
+    parser.add_argument(
+        "--worker-start-delay",
+        type=float,
+        default=0.2,
+        help="Stagger delay (s) between worker initialisations when using async vector env",
+    )
+    parser.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=30.0,
+        help="心跳打印间隔（秒），<=0 表示关闭",
+    )
+    parser.add_argument(
+        "--heartbeat-timeout",
+        type=float,
+        default=300.0,
+        help="无进展告警阈值（秒），<=0 则自动按间隔推算",
+    )
+    parser.add_argument(
+        "--overlap-collect",
+        action="store_true",
+        help="启用采集-学习重叠：后台线程采集下一批 rollout",
+    )
     parser.add_argument(
         "--step-timeout",
         type=float,
@@ -178,60 +290,262 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--rollout-progress-warmup-interval",
         type=int,
         default=1,
-        help="warmup 阶段的步进进度间隔 (>=1)，默认每步打印", 
+        help="warmup 阶段的步进进度间隔 (>=1)，默认每步打印",
     )
-    parser.add_argument("--slow-step-trace-threshold", type=int, default=5, help="在窗口内累计达到该慢 step 次数触发栈追踪")
-    parser.add_argument("--slow-step-trace-window", type=float, default=120.0, help="慢 step 统计时间窗口 (秒)")
+    parser.add_argument(
+        "--slow-step-trace-threshold",
+        type=int,
+        default=5,
+        help="在窗口内累计达到该慢 step 次数触发栈追踪",
+    )
+    parser.add_argument(
+        "--slow-step-trace-window",
+        type=float,
+        default=120.0,
+        help="慢 step 统计时间窗口 (秒)",
+    )
     # Reward shaping / environment control
-    parser.add_argument("--reward-distance-weight", type=float, default=1.0/80.0, help="位移奖励权重")
-    parser.add_argument("--reward-distance-weight-final", type=float, default=None, help="位移奖励权重最终值 (线性退火)，未指定则不退火")
-    parser.add_argument("--reward-distance-weight-anneal-steps", type=int, default=0, help="位移奖励权重退火步数 (wrapper 内 step)，0 不启用")
-    parser.add_argument("--reward-scale-start", type=float, default=0.2, help="动态缩放起始值")
-    parser.add_argument("--reward-scale-final", type=float, default=0.1, help="动态缩放最终值")
-    parser.add_argument("--reward-scale-anneal-steps", type=int, default=50_000, help="缩放线性退火步数 (env steps)")
-    parser.add_argument("--death-penalty-start", type=float, default=None, help="死亡惩罚退火起始值 (通常为 0，未指定则使用固定 death_penalty)")
-    parser.add_argument("--death-penalty-final", type=float, default=None, help="死亡惩罚退火最终值 (通常为负数)")
-    parser.add_argument("--death-penalty-anneal-steps", type=int, default=0, help="死亡惩罚退火步数 (wrapper 内 step 计数)，0 不启用")
-    parser.add_argument("--auto-start-frames", type=int, default=0, help="开局自动发送 START(+RIGHT) 的帧数，0 禁用")
-    parser.add_argument("--stagnation-warn-updates", type=int, default=20, help="连续若干 update 无 max_x 提升触发警告，<=0 关闭")
-    parser.add_argument("--scripted-forward-frames", type=int, default=0, help="训练起始阶段前 N*env_num 帧强制使用前进动作 (RIGHT 或 RIGHT+B)，用于 warmup 推进，0 表示关闭")
-    parser.add_argument("--forward-action-id", type=int, default=None, help="显式指定用于 scripted-forward 的离散动作 id；不指定则自动猜测 (优先含 RIGHT)" )
-    parser.add_argument("--probe-forward-actions", type=int, default=0, help=">0 时训练前对每个动作连续执行指定步数以探测前进效果")
-    parser.add_argument("--enable-ram-x-parse", action="store_true", help="启用 RAM 解析 x_pos 回退 (MarioRewardWrapper)")
-    parser.add_argument("--ram-x-high-addr", type=lambda x: int(x,0), default=0x006D, help="水平位置高字节 RAM 地址 (hex 或十进制)")
-    parser.add_argument("--ram-x-low-addr", type=lambda x: int(x,0), default=0x0086, help="水平位置低字节 RAM 地址 (hex 或十进制)")
-    parser.add_argument("--scripted-sequence", type=str, default=None, help="动作脚本: 逗号分隔 'NAME[:frames]'，NAME 为组合别名 (START,RIGHT,RIGHT+B,RIGHT+A,RIGHT+A+B,START+RIGHT,START+RIGHT+B)。未指定 frames 默认1")
-    parser.add_argument("--auto-bootstrap-threshold", type=int, default=0, help="若 >0 且在该 update 前距离增量始终为 0，则自动触发前进动作注入")
-    parser.add_argument("--auto-bootstrap-frames", type=int, default=0, help="自动前进触发后强制执行的总帧数 (按 env step)，需与阈值搭配使用")
-    parser.add_argument("--auto-bootstrap-action-id", type=int, default=None, help="自动前进阶段使用的动作 id，如未指定则尽量推断包含 RIGHT 的动作")
+    parser.add_argument(
+        "--reward-distance-weight", type=float, default=1.0 / 80.0, help="位移奖励权重"
+    )
+    parser.add_argument(
+        "--reward-distance-weight-final",
+        type=float,
+        default=None,
+        help="位移奖励权重最终值 (线性退火)，未指定则不退火",
+    )
+    parser.add_argument(
+        "--reward-distance-weight-anneal-steps",
+        type=int,
+        default=0,
+        help="位移奖励权重退火步数 (wrapper 内 step)，0 不启用",
+    )
+    parser.add_argument(
+        "--reward-scale-start", type=float, default=0.2, help="动态缩放起始值"
+    )
+    parser.add_argument(
+        "--reward-scale-final", type=float, default=0.1, help="动态缩放最终值"
+    )
+    parser.add_argument(
+        "--reward-scale-anneal-steps",
+        type=int,
+        default=50_000,
+        help="缩放线性退火步数 (env steps)",
+    )
+    parser.add_argument(
+        "--death-penalty-start",
+        type=float,
+        default=None,
+        help="死亡惩罚退火起始值 (通常为 0，未指定则使用固定 death_penalty)",
+    )
+    parser.add_argument(
+        "--death-penalty-final",
+        type=float,
+        default=None,
+        help="死亡惩罚退火最终值 (通常为负数)",
+    )
+    parser.add_argument(
+        "--death-penalty-anneal-steps",
+        type=int,
+        default=0,
+        help="死亡惩罚退火步数 (wrapper 内 step 计数)，0 不启用",
+    )
+    parser.add_argument(
+        "--auto-start-frames",
+        type=int,
+        default=0,
+        help="开局自动发送 START(+RIGHT) 的帧数，0 禁用",
+    )
+    parser.add_argument(
+        "--stagnation-warn-updates",
+        type=int,
+        default=20,
+        help="连续若干 update 无 max_x 提升触发警告，<=0 关闭",
+    )
+    parser.add_argument(
+        "--scripted-forward-frames",
+        type=int,
+        default=0,
+        help="训练起始阶段前 N*env_num 帧强制使用前进动作 (RIGHT 或 RIGHT+B)，用于 warmup 推进，0 表示关闭",
+    )
+    parser.add_argument(
+        "--forward-action-id",
+        type=int,
+        default=None,
+        help="显式指定用于 scripted-forward 的离散动作 id；不指定则自动猜测 (优先含 RIGHT)",
+    )
+    parser.add_argument(
+        "--probe-forward-actions",
+        type=int,
+        default=0,
+        help=">0 时训练前对每个动作连续执行指定步数以探测前进效果",
+    )
+    parser.add_argument(
+        "--enable-ram-x-parse",
+        action="store_true",
+        help="启用 RAM 解析 x_pos 回退 (MarioRewardWrapper)",
+    )
+    parser.add_argument(
+        "--ram-x-high-addr",
+        type=lambda x: int(x, 0),
+        default=0x006D,
+        help="水平位置高字节 RAM 地址 (hex 或十进制)",
+    )
+    parser.add_argument(
+        "--ram-x-low-addr",
+        type=lambda x: int(x, 0),
+        default=0x0086,
+        help="水平位置低字节 RAM 地址 (hex 或十进制)",
+    )
+    parser.add_argument(
+        "--scripted-sequence",
+        type=str,
+        default=None,
+        help="动作脚本: 逗号分隔 'NAME[:frames]'，NAME 为组合别名 (START,RIGHT,RIGHT+B,RIGHT+A,RIGHT+A+B,START+RIGHT,START+RIGHT+B)。未指定 frames 默认1",
+    )
+    parser.add_argument(
+        "--auto-bootstrap-threshold",
+        type=int,
+        default=0,
+        help="若 >0 且在该 update 前距离增量始终为 0，则自动触发前进动作注入",
+    )
+    parser.add_argument(
+        "--auto-bootstrap-frames",
+        type=int,
+        default=0,
+        help="自动前进触发后强制执行的总帧数 (按 env step)，需与阈值搭配使用",
+    )
+    parser.add_argument(
+        "--auto-bootstrap-action-id",
+        type=int,
+        default=None,
+        help="自动前进阶段使用的动作 id，如未指定则尽量推断包含 RIGHT 的动作",
+    )
     # Early shaping 强化窗口
-    parser.add_argument("--early-shaping-window", type=int, default=0, help=">0 表示前 N updates 使用更强 distance_weight 覆盖 (early-shaping)，之后恢复退火逻辑")
-    parser.add_argument("--early-shaping-distance-weight", type=float, default=None, help="early 窗口内 distance_weight 覆盖值；未提供则自动取当前 distance_weight * 2")
+    parser.add_argument(
+        "--early-shaping-window",
+        type=int,
+        default=0,
+        help=">0 表示前 N updates 使用更强 distance_weight 覆盖 (early-shaping)，之后恢复退火逻辑",
+    )
+    parser.add_argument(
+        "--early-shaping-distance-weight",
+        type=float,
+        default=None,
+        help="early 窗口内 distance_weight 覆盖值；未提供则自动取当前 distance_weight * 2",
+    )
     # 二次脚本注入（突破停滞）
-    parser.add_argument("--secondary-script-threshold", type=int, default=0, help=">0 时若 max_x 在该 update 之后仍未超过 plateau 值，执行二次短脚本注入")
-    parser.add_argument("--secondary-script-frames", type=int, default=0, help="二次脚本注入帧数 (按 env step，总帧=frames*num_envs)")
-    parser.add_argument("--secondary-script-forward-action-id", type=int, default=None, help="二次脚本使用的动作 id，未指定自动解析")
+    parser.add_argument(
+        "--secondary-script-threshold",
+        type=int,
+        default=0,
+        help=">0 时若 max_x 在该 update 之后仍未超过 plateau 值，执行二次短脚本注入",
+    )
+    parser.add_argument(
+        "--secondary-script-frames",
+        type=int,
+        default=0,
+        help="二次脚本注入帧数 (按 env step，总帧=frames*num_envs)",
+    )
+    parser.add_argument(
+        "--secondary-script-forward-action-id",
+        type=int,
+        default=None,
+        help="二次脚本使用的动作 id，未指定自动解析",
+    )
     # 里程碑奖励与强制截断
-    parser.add_argument("--milestone-interval", type=int, default=0, help=">0 时每当全局 max_x 超过上一个里程碑+interval 给予额外 shaping 奖励一次")
-    parser.add_argument("--milestone-bonus", type=float, default=0.0, help="里程碑奖励数值 (添加到 shaping_raw_sum & scaled_sum 前的 raw)")
-    parser.add_argument("--episode-timeout-steps", type=int, default=0, help=">0 时对单 env episode 达到该步数强制截断以产生回报")
+    parser.add_argument(
+        "--milestone-interval",
+        type=int,
+        default=0,
+        help=">0 时每当全局 max_x 超过上一个里程碑+interval 给予额外 shaping 奖励一次",
+    )
+    parser.add_argument(
+        "--milestone-bonus",
+        type=float,
+        default=0.0,
+        help="里程碑奖励数值 (添加到 shaping_raw_sum & scaled_sum 前的 raw)",
+    )
+    parser.add_argument(
+        "--episode-timeout-steps",
+        type=int,
+        default=0,
+        help=">0 时对单 env episode 达到该步数强制截断以产生回报",
+    )
     # 自适应调度：基于最近窗口 env_positive_dx_ratio 调整 entropy 与 distance 权重
-    parser.add_argument("--adaptive-positive-dx-window", type=int, default=50, help="计算正向位移比例的滑动窗口更新数，用于自适应调度 (>=10)")
-    parser.add_argument("--adaptive-distance-weight-max", type=float, default=None, help="自适应 distance_weight 上限，未设则不启用调度")
-    parser.add_argument("--adaptive-distance-weight-min", type=float, default=None, help="自适应 distance_weight 下限 (ratio 达到 high 阈值后趋近)" )
-    parser.add_argument("--adaptive-distance-ratio-low", type=float, default=0.05, help="正向位移比例低阈值 (<低阈值提升 distance_weight)")
-    parser.add_argument("--adaptive-distance-ratio-high", type=float, default=0.30, help="正向位移比例高阈值 (>高阈值衰减 distance_weight)")
-    parser.add_argument("--adaptive-distance-lr", type=float, default=0.05, help="distance_weight 自适应更新步长 (相对插值系数)")
-    parser.add_argument("--adaptive-entropy-beta-max", type=float, default=None, help="自适应 entropy_beta 上限；启用需同时设下限")
-    parser.add_argument("--adaptive-entropy-beta-min", type=float, default=None, help="自适应 entropy_beta 下限")
-    parser.add_argument("--adaptive-entropy-ratio-low", type=float, default=0.05, help="正向位移比例低阈值 (<低阈值=>提高 entropy_beta)")
-    parser.add_argument("--adaptive-entropy-ratio-high", type=float, default=0.30, help="正向位移比例高阈值 => 降低 entropy_beta")
-    parser.add_argument("--adaptive-entropy-lr", type=float, default=0.10, help="entropy_beta 自适应更新步长 (相对插值系数)")
+    parser.add_argument(
+        "--adaptive-positive-dx-window",
+        type=int,
+        default=50,
+        help="计算正向位移比例的滑动窗口更新数，用于自适应调度 (>=10)",
+    )
+    parser.add_argument(
+        "--adaptive-distance-weight-max",
+        type=float,
+        default=None,
+        help="自适应 distance_weight 上限，未设则不启用调度",
+    )
+    parser.add_argument(
+        "--adaptive-distance-weight-min",
+        type=float,
+        default=None,
+        help="自适应 distance_weight 下限 (ratio 达到 high 阈值后趋近)",
+    )
+    parser.add_argument(
+        "--adaptive-distance-ratio-low",
+        type=float,
+        default=0.05,
+        help="正向位移比例低阈值 (<低阈值提升 distance_weight)",
+    )
+    parser.add_argument(
+        "--adaptive-distance-ratio-high",
+        type=float,
+        default=0.30,
+        help="正向位移比例高阈值 (>高阈值衰减 distance_weight)",
+    )
+    parser.add_argument(
+        "--adaptive-distance-lr",
+        type=float,
+        default=0.05,
+        help="distance_weight 自适应更新步长 (相对插值系数)",
+    )
+    parser.add_argument(
+        "--adaptive-entropy-beta-max",
+        type=float,
+        default=None,
+        help="自适应 entropy_beta 上限；启用需同时设下限",
+    )
+    parser.add_argument(
+        "--adaptive-entropy-beta-min",
+        type=float,
+        default=None,
+        help="自适应 entropy_beta 下限",
+    )
+    parser.add_argument(
+        "--adaptive-entropy-ratio-low",
+        type=float,
+        default=0.05,
+        help="正向位移比例低阈值 (<低阈值=>提高 entropy_beta)",
+    )
+    parser.add_argument(
+        "--adaptive-entropy-ratio-high",
+        type=float,
+        default=0.30,
+        help="正向位移比例高阈值 => 降低 entropy_beta",
+    )
+    parser.add_argument(
+        "--adaptive-entropy-lr",
+        type=float,
+        default=0.10,
+        help="entropy_beta 自适应更新步长 (相对插值系数)",
+    )
     return parser.parse_args(argv)
 
 
 def build_training_config(args: argparse.Namespace) -> TrainingConfig:
-    stage_schedule = create_default_stage_schedule(args.world, args.stage, span=args.stage_span)
+    stage_schedule = create_default_stage_schedule(
+        args.world, args.stage, span=args.stage_span
+    )
     env_cfg = MarioEnvConfig(
         world=args.world,
         stage=args.stage,
@@ -242,20 +556,31 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     # 注入奖励配置
     try:
         env_cfg.reward_config.distance_weight = float(args.reward_distance_weight)
-        if getattr(args, 'reward_distance_weight_final', None) is not None:
-            env_cfg.reward_config.distance_weight_final = float(args.reward_distance_weight_final)
-            env_cfg.reward_config.distance_weight_anneal_steps = int(getattr(args, 'reward_distance_weight_anneal_steps', 0) or 0)
+        if getattr(args, "reward_distance_weight_final", None) is not None:
+            env_cfg.reward_config.distance_weight_final = float(
+                args.reward_distance_weight_final
+            )
+            env_cfg.reward_config.distance_weight_anneal_steps = int(
+                getattr(args, "reward_distance_weight_anneal_steps", 0) or 0
+            )
         env_cfg.reward_config.scale_start = float(args.reward_scale_start)
         env_cfg.reward_config.scale_final = float(args.reward_scale_final)
         env_cfg.reward_config.scale_anneal_steps = int(args.reward_scale_anneal_steps)
-        if getattr(args, 'death_penalty_start', None) is not None and getattr(args, 'death_penalty_final', None) is not None:
+        if (
+            getattr(args, "death_penalty_start", None) is not None
+            and getattr(args, "death_penalty_final", None) is not None
+        ):
             env_cfg.reward_config.death_penalty_start = float(args.death_penalty_start)
             env_cfg.reward_config.death_penalty_final = float(args.death_penalty_final)
-            env_cfg.reward_config.death_penalty_anneal_steps = int(getattr(args, 'death_penalty_anneal_steps', 0) or 0)
+            env_cfg.reward_config.death_penalty_anneal_steps = int(
+                getattr(args, "death_penalty_anneal_steps", 0) or 0
+            )
     except Exception:
         pass
     # 记录 auto-start 配置（扩展字段）
-    setattr(env_cfg, "auto_start_frames", max(0, int(getattr(args, "auto_start_frames", 0))))
+    setattr(
+        env_cfg, "auto_start_frames", max(0, int(getattr(args, "auto_start_frames", 0)))
+    )
     # Default to synchronous vector env unless the user explicitly requests async
     # and confirms they accept the instability risk. Priority:
     # force_sync -> explicit async flag + confirmation/env -> sync flag -> default sync
@@ -267,8 +592,10 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
         if getattr(args, "confirm_async", False) or env_allow:
             async_flag = True
         else:
-            print("[train] Async mode requested but not confirmed; defaulting to synchronous vector env. "
-                  "To enable async, set MARIO_ENABLE_ASYNC=1 or pass --confirm-async.")
+            print(
+                "[train] Async mode requested but not confirmed; defaulting to synchronous vector env. "
+                "To enable async, set MARIO_ENABLE_ASYNC=1 or pass --confirm-async."
+            )
             async_flag = False
     elif getattr(args, "sync_env", False):
         async_flag = False
@@ -292,7 +619,9 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     train_cfg = TrainingConfig()
     train_cfg.seed = args.seed
     train_cfg.total_updates = args.total_updates
-    train_cfg.rollout = dataclasses.replace(train_cfg.rollout, num_steps=args.rollout_steps, gamma=args.gamma, tau=args.tau)
+    train_cfg.rollout = dataclasses.replace(
+        train_cfg.rollout, num_steps=args.rollout_steps, gamma=args.gamma, tau=args.tau
+    )
     train_cfg.optimizer = dataclasses.replace(
         train_cfg.optimizer,
         learning_rate=args.lr,
@@ -301,7 +630,10 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
         value_loss_coef=args.value_coef,
         max_grad_norm=args.clip_grad,
     )
-    train_cfg.scheduler = dataclasses.replace(train_cfg.scheduler, total_steps=args.total_updates * args.rollout_steps * args.num_envs)
+    train_cfg.scheduler = dataclasses.replace(
+        train_cfg.scheduler,
+        total_steps=args.total_updates * args.rollout_steps * args.num_envs,
+    )
     train_cfg.env = vec_cfg
     train_cfg.model = dataclasses.replace(
         train_cfg.model,
@@ -326,33 +658,47 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     train_cfg.resume_from = args.resume
     train_cfg.replay = dataclasses.replace(train_cfg.replay, enable=args.per)
     # 将 per_sample_interval 写入 replay 配置
-    train_cfg.replay = dataclasses.replace(train_cfg.replay, per_sample_interval=max(1, getattr(args, 'per_sample_interval', 1)))
+    train_cfg.replay = dataclasses.replace(
+        train_cfg.replay,
+        per_sample_interval=max(1, getattr(args, "per_sample_interval", 1)),
+    )
     train_cfg.device = args.device
     train_cfg.metrics_path = args.metrics_path
     # 记录自适应范围到 cfg 以便后续引用（存入 model/optimizer config 简单方案：附加属性）
-    setattr(train_cfg, "adaptive_cfg", {
-        "dx_window": max(10, int(getattr(args, 'adaptive_positive_dx_window', 50))),
-        "dw_max": getattr(args, 'adaptive_distance_weight_max', None),
-        "dw_min": getattr(args, 'adaptive_distance_weight_min', None),
-        "dw_low": getattr(args, 'adaptive_distance_ratio_low', 0.05),
-        "dw_high": getattr(args, 'adaptive_distance_ratio_high', 0.30),
-        "dw_lr": getattr(args, 'adaptive_distance_lr', 0.05),
-        "ent_max": getattr(args, 'adaptive_entropy_beta_max', None),
-        "ent_min": getattr(args, 'adaptive_entropy_beta_min', None),
-        "ent_low": getattr(args, 'adaptive_entropy_ratio_low', 0.05),
-        "ent_high": getattr(args, 'adaptive_entropy_ratio_high', 0.30),
-        "ent_lr": getattr(args, 'adaptive_entropy_lr', 0.10),
-    })
+    setattr(
+        train_cfg,
+        "adaptive_cfg",
+        AdaptiveConfig(
+            window=max(10, int(getattr(args, "adaptive_positive_dx_window", 50))),
+            dw_max=getattr(args, "adaptive_distance_weight_max", None),
+            dw_min=getattr(args, "adaptive_distance_weight_min", None),
+            dw_low=getattr(args, "adaptive_distance_ratio_low", 0.05),
+            dw_high=getattr(args, "adaptive_distance_ratio_high", 0.30),
+            dw_lr=getattr(args, "adaptive_distance_lr", 0.05),
+            ent_max=getattr(args, "adaptive_entropy_beta_max", None),
+            ent_min=getattr(args, "adaptive_entropy_beta_min", None),
+            ent_low=getattr(args, "adaptive_entropy_ratio_low", 0.05),
+            ent_high=getattr(args, "adaptive_entropy_ratio_high", 0.30),
+            ent_lr=getattr(args, "adaptive_entropy_lr", 0.10),
+        ),
+    )
     return train_cfg
 
 
-def prepare_model(cfg: TrainingConfig, action_space: int, device: torch.device, compile_now: bool = True) -> MarioActorCritic:
+def prepare_model(
+    cfg: TrainingConfig,
+    action_space: int,
+    device: torch.device,
+    compile_now: bool = True,
+) -> MarioActorCritic:
     """构造并可选编译模型。
 
     当需要从 checkpoint 恢复时，先不编译（compile_now=False），待权重加载完再尝试 torch.compile，
     避免 `_orig_mod.` 前缀差异导致加载失败。
     """
-    model_cfg = dataclasses.replace(cfg.model, action_space=action_space, input_channels=cfg.model.input_channels)
+    model_cfg = dataclasses.replace(
+        cfg.model, action_space=action_space, input_channels=cfg.model.input_channels
+    )
     model = MarioActorCritic(model_cfg).to(device)
     if compile_now and cfg.compile_model and hasattr(torch, "compile"):
         try:
@@ -382,7 +728,11 @@ def _flex_load_state_dict(model: nn.Module, state: dict) -> list[str]:
     if model_prefixed and not state_prefixed:
         adj = {f"_orig_mod.{k}": v for k, v in state.items()}
     elif not model_prefixed and state_prefixed:
-        adj = {k[len("_orig_mod."):]: v for k, v in state.items() if k.startswith("_orig_mod.")}
+        adj = {
+            k[len("_orig_mod.") :]: v
+            for k, v in state.items()
+            if k.startswith("_orig_mod.")
+        }
     missing, unexpected = model.load_state_dict(adj, strict=False)
     issues: list[str] = list(missing)
     issues.extend([f"unexpected:{u}" for u in unexpected])
@@ -448,13 +798,17 @@ def _maybe_print_training_hints(update_idx: int, metrics: Dict[str, Any]) -> Non
     global_step_value = int(metrics.get("global_step", 0) or 0)
 
     if distance_delta == 0 and shaping_raw == 0 and global_step_value > 0:
-        hints.append("距离增量为 0，考虑提高 reward_distance_weight 或启用 scripted-forward 或设置 BOOTSTRAP=1。")
+        hints.append(
+            "距离增量为 0，考虑提高 reward_distance_weight 或启用 scripted-forward 或设置 BOOTSTRAP=1。"
+        )
 
     if avg_return <= 0.0 and update_idx >= 200:
         hints.append("avg_return 长期为 0，可检查奖励塑形或动作脚本是否生效。")
 
     if replay_fill < 0.05 and update_idx >= 100:
-        hints.append("经验回放填充率 <5%，建议延长预热或提高 per_sample_interval 以外的 push 频率。")
+        hints.append(
+            "经验回放填充率 <5%，建议延长预热或提高 per_sample_interval 以外的 push 频率。"
+        )
 
     if gpu_util >= 0 and gpu_util < 5.0 and update_idx >= 200:
         hints.append("GPU 利用率极低，确认是否使用 GPU 设备或提高并行度/rollout。")
@@ -527,7 +881,9 @@ def _per_step_update(
         per_values = per_output.value.squeeze(-1)
 
     per_log_probs = per_dist.log_prob(per_sample.actions)
-    per_policy_loss = -(per_log_probs * per_sample.advantages.detach() * per_sample.weights).mean()
+    per_policy_loss = -(
+        per_log_probs * per_sample.advantages.detach() * per_sample.weights
+    ).mean()
     td_error_raw = per_sample.target_values - per_values
     per_value_loss = (td_error_raw.pow(2) * per_sample.weights).mean()
     per_loss = per_policy_loss + cfg.optimizer.value_loss_coef * per_value_loss
@@ -572,7 +928,9 @@ def _build_checkpoint_metadata(
             "base_seed": vector_cfg.base_seed,
         },
         "model": dataclasses.asdict(cfg.model),
-        "replay": dataclasses.asdict(cfg.replay),  # 记录回放配置（含 per_sample_interval）
+        "replay": dataclasses.asdict(
+            cfg.replay
+        ),  # 记录回放配置（含 per_sample_interval）
         "save_state": {
             "global_step": int(global_step),
             "global_update": int(update_idx),
@@ -588,6 +946,7 @@ def _json_default(obj):  # noqa: D401 - 简短工具函数
     """JSON 序列化回退：转换 numpy / Path / 其它不可序列化对象。"""
     try:
         import numpy as _np  # 局部导入避免启动加重
+
         if isinstance(obj, (_np.integer,)):
             return int(obj)
         if isinstance(obj, (_np.floating,)):
@@ -605,7 +964,9 @@ def _json_default(obj):  # noqa: D401 - 简短工具函数
 def _write_metadata(base_path: Path, metadata: Dict[str, Any]) -> None:
     metadata_path = base_path.with_suffix(".json")
     payload = json.dumps(metadata, indent=2, ensure_ascii=False, default=_json_default)
-    tmp_path = metadata_path.with_suffix(metadata_path.suffix + f".tmp_{os.getpid()}_{int(time.time()*1000)}")
+    tmp_path = metadata_path.with_suffix(
+        metadata_path.suffix + f".tmp_{os.getpid()}_{int(time.time()*1000)}"
+    )
     try:
         with open(tmp_path, "w", encoding="utf-8") as fp:
             fp.write(payload)
@@ -647,9 +1008,15 @@ def _metadata_matches_config(metadata: Dict[str, Any], cfg: TrainingConfig) -> b
     vector_cfg = cfg.env
     if int(vector_meta.get("num_envs", vector_cfg.num_envs)) != vector_cfg.num_envs:
         return False
-    if bool(vector_meta.get("asynchronous", vector_cfg.asynchronous)) != vector_cfg.asynchronous:
+    if (
+        bool(vector_meta.get("asynchronous", vector_cfg.asynchronous))
+        != vector_cfg.asynchronous
+    ):
         return False
-    if bool(vector_meta.get("random_start_stage", vector_cfg.random_start_stage)) != vector_cfg.random_start_stage:
+    if (
+        bool(vector_meta.get("random_start_stage", vector_cfg.random_start_stage))
+        != vector_cfg.random_start_stage
+    ):
         return False
     if int(vector_meta.get("base_seed", vector_cfg.base_seed)) != vector_cfg.base_seed:
         return False
@@ -669,7 +1036,9 @@ def _metadata_matches_config(metadata: Dict[str, Any], cfg: TrainingConfig) -> b
     return True
 
 
-def find_matching_checkpoint(cfg: TrainingConfig) -> Optional[Tuple[Path, Dict[str, Any]]]:
+def find_matching_checkpoint(
+    cfg: TrainingConfig,
+) -> Optional[Tuple[Path, Dict[str, Any]]]:
     save_dir = Path(cfg.save_dir)
     if not save_dir.exists():
         return None
@@ -700,7 +1069,9 @@ def find_matching_checkpoint(cfg: TrainingConfig) -> Optional[Tuple[Path, Dict[s
     return path, metadata
 
 
-def find_matching_checkpoint_recursive(base_dir: Path, cfg: TrainingConfig, limit: int = 10000) -> Optional[Tuple[Path, Dict[str, Any]]]:
+def find_matching_checkpoint_recursive(
+    base_dir: Path, cfg: TrainingConfig, limit: int = 10000
+) -> Optional[Tuple[Path, Dict[str, Any]]]:
     """Recursively search under base_dir for the best matching checkpoint.
 
     选择策略 | Selection strategy:
@@ -766,7 +1137,9 @@ def save_checkpoint(
         "global_update": update_idx,
         "config": dataclasses.asdict(cfg),
     }
-    tmp_ckpt = checkpoint_path.with_suffix(checkpoint_path.suffix + f".tmp_{os.getpid()}_{int(time.time()*1000)}")
+    tmp_ckpt = checkpoint_path.with_suffix(
+        checkpoint_path.suffix + f".tmp_{os.getpid()}_{int(time.time()*1000)}"
+    )
     try:
         torch.save(payload, tmp_ckpt)
         try:
@@ -781,7 +1154,9 @@ def save_checkpoint(
                 tmp_ckpt.unlink()
         except Exception:
             pass
-    metadata = _build_checkpoint_metadata(cfg, global_step, update_idx, variant="checkpoint")
+    metadata = _build_checkpoint_metadata(
+        cfg, global_step, update_idx, variant="checkpoint"
+    )
     _write_metadata(checkpoint_path, metadata)
     return checkpoint_path
 
@@ -802,7 +1177,9 @@ def save_model_snapshot(
         "global_update": update_idx,
         "config": dataclasses.asdict(cfg),  # latest 同样带 config
     }
-    tmp_snap = snapshot_path.with_suffix(snapshot_path.suffix + f".tmp_{os.getpid()}_{int(time.time()*1000)}")
+    tmp_snap = snapshot_path.with_suffix(
+        snapshot_path.suffix + f".tmp_{os.getpid()}_{int(time.time()*1000)}"
+    )
     try:
         torch.save(snap_payload, tmp_snap)
         try:
@@ -817,7 +1194,9 @@ def save_model_snapshot(
                 tmp_snap.unlink()
         except Exception:
             pass
-    metadata = _build_checkpoint_metadata(cfg, global_step, update_idx, variant="latest")
+    metadata = _build_checkpoint_metadata(
+        cfg, global_step, update_idx, variant="latest"
+    )
     _write_metadata(snapshot_path, metadata)
     return snapshot_path
 
@@ -844,7 +1223,9 @@ def call_with_timeout(fn, timeout: float, *args, **kwargs):
     thread.start()
     thread.join(timeout)
     if thread.is_alive():
-        raise TimeoutError(f"Call to {getattr(fn, '__name__', repr(fn))} exceeded {timeout:.1f}s")
+        raise TimeoutError(
+            f"Call to {getattr(fn, '__name__', repr(fn))} exceeded {timeout:.1f}s"
+        )
     if error:
         raise error["error"]
     return result.get("value")
@@ -853,13 +1234,16 @@ def call_with_timeout(fn, timeout: float, *args, **kwargs):
 def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     # Device and performance tuning
     if cfg.device == "auto":
-        allow_cpu_auto = os.environ.get("MARIO_ALLOW_CPU_AUTO", "0").lower() in {"1", "true", "yes", "on"}
+        allow_cpu_auto = os.environ.get("MARIO_ALLOW_CPU_AUTO", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         if torch.cuda.is_available():
             device = torch.device("cuda")
         else:
-            message = (
-                "未检测到可用的 CUDA 设备；请显式传入 --device cpu (或设置 MARIO_ALLOW_CPU_AUTO=1 允许自动回退)"
-            )
+            message = "未检测到可用的 CUDA 设备；请显式传入 --device cpu (或设置 MARIO_ALLOW_CPU_AUTO=1 允许自动回退)"
             if not allow_cpu_auto:
                 raise SystemExit(f"[train][error] {message}")
             print(f"[train][warn] {message}")
@@ -881,13 +1265,19 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     heartbeat.start()
     heartbeat.notify(phase="初始化", message="配置随机种子", progress=False)
 
-    auto_bootstrap_threshold = max(0, int(getattr(args, "auto_bootstrap_threshold", 0) or 0))
+    auto_bootstrap_threshold = max(
+        0, int(getattr(args, "auto_bootstrap_threshold", 0) or 0)
+    )
     auto_bootstrap_frames = max(0, int(getattr(args, "auto_bootstrap_frames", 0) or 0))
     auto_bootstrap_action_override = getattr(args, "auto_bootstrap_action_id", None)
     auto_bootstrap_state = {
         "remaining": 0,
         "triggered": False,
-        "action_id": int(auto_bootstrap_action_override) if auto_bootstrap_action_override is not None else None,
+        "action_id": (
+            int(auto_bootstrap_action_override)
+            if auto_bootstrap_action_override is not None
+            else None
+        ),
         "announced_done": False,
         "announced_start": False,
     }
@@ -895,14 +1285,23 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     early_shaping_window = max(0, int(getattr(args, "early_shaping_window", 0) or 0))
     early_shaping_distance_weight = getattr(args, "early_shaping_distance_weight", None)
     # Secondary script 注入状态
-    secondary_script_threshold = max(0, int(getattr(args, "secondary_script_threshold", 0) or 0))
-    secondary_script_frames = max(0, int(getattr(args, "secondary_script_frames", 0) or 0))
-    secondary_script_action_id = getattr(args, "secondary_script_forward_action_id", None)
+    secondary_script_threshold = max(
+        0, int(getattr(args, "secondary_script_threshold", 0) or 0)
+    )
+    secondary_script_frames = max(
+        0, int(getattr(args, "secondary_script_frames", 0) or 0)
+    )
+    secondary_script_action_id = getattr(
+        args, "secondary_script_forward_action_id", None
+    )
     secondary_script_state = {"remaining": 0, "triggered": False, "plateau_baseline": 0}
     milestone_interval = max(0, int(getattr(args, "milestone_interval", 0) or 0))
     milestone_bonus = float(getattr(args, "milestone_bonus", 0.0) or 0.0)
     episode_timeout_steps = max(0, int(getattr(args, "episode_timeout_steps", 0) or 0))
-    milestone_state = {"next": milestone_interval if milestone_interval > 0 else None, "count": 0}
+    milestone_state = {
+        "next": milestone_interval if milestone_interval > 0 else None,
+        "count": 0,
+    }
     # 追踪每个 env 当前 episode step 数
     per_env_episode_steps = np.zeros((cfg.env.num_envs,), dtype=np.int64)
 
@@ -939,19 +1338,35 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         f"rollout_steps={cfg.rollout.num_steps} grad_accum={cfg.gradient_accumulation}"
     )
     # 简单显存压力预估：obs (num_steps+1)*num_envs*frame_stack*84*84*4 bytes ~ baseline
-    est_obs_mem = (cfg.rollout.num_steps + 1) * cfg.env.num_envs * cfg.model.input_channels * 84 * 84 * 4 / (1024**3)
+    est_obs_mem = (
+        (cfg.rollout.num_steps + 1)
+        * cfg.env.num_envs
+        * cfg.model.input_channels
+        * 84
+        * 84
+        * 4
+        / (1024**3)
+    )
     if device.type == "cuda" and est_obs_mem > 1.5:  # 粗略阈值
-        print(f"[train][info] Estimated CPU rollout buffer size ~{est_obs_mem:.2f} GiB (pinned). Consider reducing rollout-steps or num-envs if OOM occurs.")
+        print(
+            f"[train][info] Estimated CPU rollout buffer size ~{est_obs_mem:.2f} GiB (pinned). Consider reducing rollout-steps or num-envs if OOM occurs."
+        )
     alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
     if device.type == "cuda" and not alloc_conf:
-        print("[train][hint] Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to mitigate fragmentation (export before running).")
+        print(
+            "[train][hint] Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to mitigate fragmentation (export before running)."
+        )
     env_summary = cfg.env.env
     stage_desc = f"{env_summary.world}-{env_summary.stage}"
     print(
         f"[train] stage={stage_desc} action={env_summary.action_type} async={cfg.env.asynchronous} "
         f"total_updates={cfg.total_updates} log_interval={cfg.log_interval}"
     )
-    heartbeat.notify(phase="初始化", message=f"设备 {device.type} 线程{torch_threads}", progress=False)
+    heartbeat.notify(
+        phase="初始化",
+        message=f"设备 {device.type} 线程{torch_threads}",
+        progress=False,
+    )
 
     # Parent-process prewarm: create and close a single env in the parent
     # to perform heavy native initialisation once before spawning workers.
@@ -977,7 +1392,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             print("[train] parent prewarm complete")
         except Exception as exc:
             print(f"[train] parent prewarm failed: {exc}")
-            heartbeat.notify(phase="env", message=f"父进程预热失败: {exc}", progress=False)
+            heartbeat.notify(
+                phase="env", message=f"父进程预热失败: {exc}", progress=False
+            )
 
     # Optionally prewarm each worker configuration sequentially in the parent.
     # This is slower but avoids a thundering herd of first-time imports in the
@@ -989,7 +1406,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             for idx in range(cfg.env.num_envs):
                 try:
                     # Build a single-env cfg for the current stage/seed
-                    single_cfg = dataclasses.replace(cfg.env, num_envs=1, asynchronous=False)
+                    single_cfg = dataclasses.replace(
+                        cfg.env, num_envs=1, asynchronous=False
+                    )
                     # rotate stage schedule to pick per-index stage deterministically
                     # this mirrors create_vector_env stage selection and therefore
                     # warms the same code paths.
@@ -1008,12 +1427,18 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     pre_env.close()
                 except Exception as exc:
                     print(f"[train] parent prewarm for worker {idx} failed: {exc}")
-                    heartbeat.notify(phase="env", message=f"worker {idx} 预热失败: {exc}", progress=False)
+                    heartbeat.notify(
+                        phase="env",
+                        message=f"worker {idx} 预热失败: {exc}",
+                        progress=False,
+                    )
             print("[train] parent prewarm-all complete")
             heartbeat.notify(phase="env", message="全量预热完成", progress=False)
         except Exception as exc:
             print(f"[train] parent prewarm-all failed: {exc}")
-            heartbeat.notify(phase="env", message=f"全量预热失败: {exc}", progress=False)
+            heartbeat.notify(
+                phase="env", message=f"全量预热失败: {exc}", progress=False
+            )
 
     def _initialise_env(env_cfg: MarioVectorEnvConfig):
         timeout = getattr(env_cfg, "reset_timeout", 60.0)
@@ -1025,7 +1450,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             print(f"[train] Environment constructed in {construct_time:.2f}s")
         except TimeoutError:
             construct_time = time.time() - start_construct
-            print(f"[train][error] Environment construction timed out after {construct_time:.2f}s")
+            print(
+                f"[train][error] Environment construction timed out after {construct_time:.2f}s"
+            )
             raise RuntimeError("Vector env construction timed out")
 
         start_reset = time.time()
@@ -1042,7 +1469,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
     env, obs_np, _, effective_env_cfg = _initialise_env(cfg.env)
     cfg.env = effective_env_cfg
-    heartbeat.notify(phase="env", message=f"环境已就绪 async={cfg.env.asynchronous}", progress=False)
+    heartbeat.notify(
+        phase="env", message=f"环境已就绪 async={cfg.env.asynchronous}", progress=False
+    )
     heartbeat.heartbeat_now()
 
     # Honor force-sync CLI flag
@@ -1075,31 +1504,42 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
 
     action_space = env.single_action_space.n
-    cfg.model = dataclasses.replace(cfg.model, action_space=action_space, input_channels=env.single_observation_space.shape[0])
+    cfg.model = dataclasses.replace(
+        cfg.model,
+        action_space=action_space,
+        input_channels=env.single_observation_space.shape[0],
+    )
 
     # 前进动作自动探测（仅在用户指定 probe-forward-actions >0 时执行）
     forward_probe_result = None
     if getattr(args, "probe_forward_actions", 0) > 0:
         try:
             single = None
-            if hasattr(env, 'envs') and isinstance(env.envs, (list, tuple)) and env.envs:
+            if (
+                hasattr(env, "envs")
+                and isinstance(env.envs, (list, tuple))
+                and env.envs
+            ):
                 single = env.envs[0]
             if single is not None:
-                n_actions = int(getattr(single.action_space, 'n', 0))
+                n_actions = int(getattr(single.action_space, "n", 0))
                 per = max(1, int(args.probe_forward_actions))
                 distances = []
-                import numpy as _np
+                # (removed unused numpy import previously triggering F401)
+
                 def _extract_x(inf: dict):
                     if not isinstance(inf, dict):
                         return 0
-                    x = inf.get('x_pos') or inf.get('progress')
-                    metrics = inf.get('metrics') if isinstance(inf, dict) else None
+                    x = inf.get("x_pos") or inf.get("progress")
+                    metrics = inf.get("metrics") if isinstance(inf, dict) else None
                     if x is None and isinstance(metrics, dict):
-                        xv = metrics.get('mario_x') or metrics.get('x_pos')
+                        xv = metrics.get("mario_x") or metrics.get("x_pos")
                         if xv is not None:
                             try:
-                                if hasattr(xv,'item'): xv = xv.item()
-                                elif hasattr(xv,'__len__') and len(xv)>0: xv = xv[0]
+                                if hasattr(xv, "item"):
+                                    xv = xv.item()
+                                elif hasattr(xv, "__len__") and len(xv) > 0:
+                                    xv = xv[0]
                                 x = int(xv)
                             except Exception:
                                 x = None
@@ -1107,6 +1547,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         return int(x) if x is not None else 0
                     except Exception:
                         return 0
+
                 # reset 基准
                 single.reset()
                 for aid in range(n_actions):
@@ -1123,11 +1564,15 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 distances.sort(key=lambda t: t[1], reverse=True)
                 if distances:
                     forward_probe_result = distances
-                    print(f"[train][probe] 动作探测结果 top: {distances[:min(8,len(distances))]}")
+                    print(
+                        f"[train][probe] 动作探测结果 top: {distances[:min(8,len(distances))]}"
+                    )
                     best = distances[0]
-                    if best[1] > 0 and getattr(args, 'forward_action_id', None) is None:
-                        setattr(args, 'forward_action_id', best[0])
-                        print(f"[train][probe] 自动选择 forward_action_id={best[0]} (Δx={best[1]})")
+                    if best[1] > 0 and getattr(args, "forward_action_id", None) is None:
+                        setattr(args, "forward_action_id", best[0])
+                        print(
+                            f"[train][probe] 自动选择 forward_action_id={best[0]} (Δx={best[1]})"
+                        )
         except Exception as _exc:
             print(f"[train][probe][warn] 动作探测失败: {_exc}")
 
@@ -1137,7 +1582,11 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         if hasattr(run_training, "_forward_action_id") and getattr(run_training, "_forward_action_id") is not None:  # type: ignore[attr-defined]
             return int(getattr(run_training, "_forward_action_id"))  # type: ignore[attr-defined]
         candidates = [1, 2, 3, 4, 0]
-        space_n = env.action_space.n if hasattr(env.action_space, 'n') else max(candidates) + 1
+        space_n = (
+            env.action_space.n
+            if hasattr(env.action_space, "n")
+            else max(candidates) + 1
+        )
         fid = next((c for c in candidates if c < space_n), 0)
         setattr(run_training, "_forward_action_id", fid)  # type: ignore[attr-defined]
         return fid
@@ -1155,7 +1604,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 action_id = 0
             auto_bootstrap_state["action_id"] = action_id
         auto_bootstrap_state["remaining"] = max(0, remaining - actions_tensor.numel())
-        if auto_bootstrap_state["remaining"] <= 0 and not auto_bootstrap_state.get("announced_done", False):
+        if auto_bootstrap_state["remaining"] <= 0 and not auto_bootstrap_state.get(
+            "announced_done", False
+        ):
             print("[train][auto-bootstrap] 自动前进阶段结束，恢复策略动作。")
             auto_bootstrap_state["announced_done"] = True
         return torch.full_like(actions_tensor, int(action_id))
@@ -1164,8 +1615,15 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     # Single-GPU / CPU path: model is already moved to device in prepare_model
     model.train()
 
-    optimizer = AdamW(model.parameters(), lr=cfg.optimizer.learning_rate, weight_decay=cfg.optimizer.weight_decay, eps=1e-5)
-    schedule_fn = CosineWithWarmup(cfg.scheduler.warmup_steps, cfg.scheduler.total_steps)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=cfg.optimizer.learning_rate,
+        weight_decay=cfg.optimizer.weight_decay,
+        eps=1e-5,
+    )
+    schedule_fn = CosineWithWarmup(
+        cfg.scheduler.warmup_steps, cfg.scheduler.total_steps
+    )
     scheduler = LambdaLR(optimizer, lr_lambda=schedule_fn)
     # Use new torch.amp API where available
     try:
@@ -1179,7 +1637,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         resume_path = Path(cfg.resume_from)
         resume_metadata = load_checkpoint_metadata(resume_path)
         if not _metadata_matches_config(resume_metadata, cfg):
-            raise ValueError("Resume checkpoint metadata is incompatible with current configuration.")
+            raise ValueError(
+                "Resume checkpoint metadata is incompatible with current configuration."
+            )
     else:
         # 自动探测逻辑：优先编号最高的序号化 checkpoint，其次 latest 快照
         found = find_matching_checkpoint(cfg)
@@ -1189,30 +1649,38 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         else:
             # 尝试 latest 快照
             latest = Path(cfg.save_dir) / f"{_checkpoint_stem(cfg)}_latest.pt"
-            meta = latest.with_suffix('.json')
+            meta = latest.with_suffix(".json")
             if latest.exists() and meta.exists():
                 try:
-                    meta_obj = json.loads(meta.read_text(encoding='utf-8'))
+                    meta_obj = json.loads(meta.read_text(encoding="utf-8"))
                     if _metadata_matches_config(meta_obj, cfg):
                         resume_path = latest
                         resume_metadata = meta_obj
-                        print(f"[train] auto-resume using latest snapshot: {latest.name}")
+                        print(
+                            f"[train] auto-resume using latest snapshot: {latest.name}"
+                        )
                 except Exception:
                     pass
         # 若仍未找到，扩展搜索整个 trained_models 根目录
         if resume_path is None:
-            root_dir = Path('trained_models')
+            root_dir = Path("trained_models")
             if root_dir.exists():
                 recursive = find_matching_checkpoint_recursive(root_dir, cfg)
                 if recursive is not None:
                     resume_path, resume_metadata = recursive
                     try:
                         rel = resume_path.relative_to(root_dir)
-                        print(f"[train] recursive-resume found checkpoint under trained_models/: {rel}")
+                        print(
+                            f"[train] recursive-resume found checkpoint under trained_models/: {rel}"
+                        )
                     except Exception:
-                        print(f"[train] recursive-resume found checkpoint: {resume_path}")
+                        print(
+                            f"[train] recursive-resume found checkpoint: {resume_path}"
+                        )
         if resume_path is None:
-            print("[train] no matching checkpoint found (current save_dir & recursive search) – starting fresh training")
+            print(
+                "[train] no matching checkpoint found (current save_dir & recursive search) – starting fresh training"
+            )
 
     writer, wandb_run, run_dir = create_logger(
         cfg.log_dir,
@@ -1221,7 +1689,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         enable_tb=bool(args.enable_tensorboard),
     )
     try:
-        print(f"[train][log] tensorboard_log_dir={getattr(writer,'log_dir', getattr(writer,'_base',run_dir))}")
+        print(
+            f"[train][log] tensorboard_log_dir={getattr(writer,'log_dir', getattr(writer,'_base',run_dir))}"
+        )
         if args.enable_tensorboard:
             writer.add_text("meta/started", datetime.now(UTC).isoformat(), 0)
             try:
@@ -1234,14 +1704,20 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     maybe_save_config(cfg, args.config_out)
     heartbeat.notify(phase="日志", message="日志与保存目录已就绪", progress=False)
 
-    metrics_file = Path(cfg.metrics_path).expanduser() if cfg.metrics_path else Path(run_dir) / "metrics.jsonl"
+    metrics_file = (
+        Path(cfg.metrics_path).expanduser()
+        if cfg.metrics_path
+        else Path(run_dir) / "metrics.jsonl"
+    )
     metrics_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Start background resource monitor (safe start)
     monitor = None
     if not args.no_monitor:
         try:
-            monitor = Monitor(writer, wandb_run, metrics_file, interval=args.monitor_interval)
+            monitor = Monitor(
+                writer, wandb_run, metrics_file, interval=args.monitor_interval
+            )
             monitor.start()
             heartbeat.notify(phase="监控", message="资源监控已启动", progress=False)
         except Exception as exc:
@@ -1260,7 +1736,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     slow_trace_threshold = getattr(args, "slow_step_trace_threshold", 5)
     slow_trace_window = getattr(args, "slow_step_trace_window", 120.0)
 
-    rollout = RolloutBuffer(cfg.rollout.num_steps, cfg.env.num_envs, env.single_observation_space.shape, device, pin_memory=(device.type == "cuda"))
+    rollout = RolloutBuffer(
+        cfg.rollout.num_steps,
+        cfg.env.num_envs,
+        env.single_observation_space.shape,
+        device,
+        pin_memory=(device.type == "cuda"),
+    )
     per_buffer = None
     if cfg.replay.enable:
         per_buffer = PrioritizedReplay(
@@ -1275,9 +1757,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     optimizer.zero_grad(set_to_none=True)
 
     # 启用 RAM 解析 fallback：遍历底层 envs 尝试设置属性
-    if getattr(args, 'enable_ram_x_parse', False):
+    if getattr(args, "enable_ram_x_parse", False):
         try:
-            if hasattr(env, 'envs'):
+            if hasattr(env, "envs"):
                 for _e in env.envs:
                     # 逐层 unwrap 找到 MarioRewardWrapper
                     cur = _e
@@ -1285,16 +1767,20 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         if cur is None:
                             break
                         name = cur.__class__.__name__.lower()
-                        if name.startswith('mariorewardwrapper'):
+                        if name.startswith("mariorewardwrapper"):
                             try:
                                 cur.enable_ram_x_parse = True
-                                cur.ram_addr_high = int(getattr(args, 'ram_x_high_addr'))
-                                cur.ram_addr_low = int(getattr(args, 'ram_x_low_addr'))
-                                print(f"[train][ram-x] enabled on wrapper (high=0x{cur.ram_addr_high:04X} low=0x{cur.ram_addr_low:04X})")
+                                cur.ram_addr_high = int(
+                                    getattr(args, "ram_x_high_addr")
+                                )
+                                cur.ram_addr_low = int(getattr(args, "ram_x_low_addr"))
+                                print(
+                                    f"[train][ram-x] enabled on wrapper (high=0x{cur.ram_addr_high:04X} low=0x{cur.ram_addr_low:04X})"
+                                )
                             except Exception:
                                 pass
                             break
-                        cur = getattr(cur, 'env', None)
+                        cur = getattr(cur, "env", None)
         except Exception as _exc:
             print(f"[train][ram-x][warn] enable failed: {_exc}")
 
@@ -1323,7 +1809,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     stagnation_update_counter = 0
     stagnation_warn_updates = max(0, int(getattr(args, "stagnation_warn_updates", 0)))
     auto_start_frames = int(getattr(cfg.env.env, "auto_start_frames", 0))
-    auto_start_sequence = [0] * auto_start_frames  # 暂以动作 0 代表 START/NOOP，可后续替换具体 start 动作
+    auto_start_sequence = [
+        0
+    ] * auto_start_frames  # 暂以动作 0 代表 START/NOOP，可后续替换具体 start 动作
 
     last_grad_norm = 0.0
     last_log_time = time.time()
@@ -1338,18 +1826,24 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             issues = _flex_load_state_dict(model, checkpoint["model"])
             if issues:
                 # 控制台只输出前若干，避免噪声
-                print(f"[train][warn] flexible load issues: {issues[:8]}{'...' if len(issues)>8 else ''}")
+                print(
+                    f"[train][warn] flexible load issues: {issues[:8]}{'...' if len(issues)>8 else ''}"
+                )
                 # 写入详细列表到独立日志文件（幂等追加）
                 try:
                     issues_path = Path(run_dir) / "state_dict_load_issues.log"
                     with issues_path.open("a", encoding="utf-8") as fp:
-                        fp.write(f"# {datetime.now(UTC).isoformat()} resume={resume_path}\n")
+                        fp.write(
+                            f"# {datetime.now(UTC).isoformat()} resume={resume_path}\n"
+                        )
                         for it in issues:
                             fp.write(it + "\n")
                 except Exception as _werr:  # noqa: BLE001
                     print(f"[train][warn] failed to write issues log: {_werr}")
         except Exception as e:
-            raise RuntimeError(f"Failed to load model state_dict from {resume_path}: {e}")
+            raise RuntimeError(
+                f"Failed to load model state_dict from {resume_path}: {e}"
+            )
         for key, loader in (
             ("optimizer", optimizer.load_state_dict),
             ("scheduler", scheduler.load_state_dict),
@@ -1366,9 +1860,14 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         global_step = int(checkpoint.get("global_step", 0))
         global_update = int(checkpoint.get("global_update", 0))
         if missing_warn:
-            print("[train][warn] Partial resume: missing/failed -> " + ", ".join(missing_warn))
+            print(
+                "[train][warn] Partial resume: missing/failed -> "
+                + ", ".join(missing_warn)
+            )
         print(f"[train] Resume state: update={global_update} step={global_step}")
-        heartbeat.notify(phase="恢复", message=f"加载检查点 {resume_path.name}", progress=False)
+        heartbeat.notify(
+            phase="恢复", message=f"加载检查点 {resume_path.name}", progress=False
+        )
 
     last_log_step = global_step
     last_log_update = global_update
@@ -1381,7 +1880,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             print("[train][info] model compiled after weight load")
         except Exception as e:  # pragma: no cover
             print(f"[train][warn] post-load compile 失败，将继续使用未编译模型: {e}")
-    overlap_enabled = bool(getattr(args, "overlap_collect", False)) and not cfg.env.asynchronous
+    overlap_enabled = (
+        bool(getattr(args, "overlap_collect", False)) and not cfg.env.asynchronous
+    )
     # 只在同步向量环境下尝试重叠，异步环境不启用（避免复杂性）
     if overlap_enabled:
         print("[train] overlap collection enabled (double-buffer thread model)")
@@ -1396,18 +1897,32 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     orig.train()
                     model = orig
                     cfg.compile_model = False
-                    print("[train][info] unwrap compiled model -> 原始模块用于 overlap 线程前向，避免 FX 追踪冲突。")
+                    print(
+                        "[train][info] unwrap compiled model -> 原始模块用于 overlap 线程前向，避免 FX 追踪冲突。"
+                    )
                 except Exception as e:  # pragma: no cover
-                    print(f"[train][warn] unwrap 编译模型失败: {e}，禁用 overlap 以保证稳定。")
+                    print(
+                        f"[train][warn] unwrap 编译模型失败: {e}，禁用 overlap 以保证稳定。"
+                    )
                     overlap_enabled = False
             else:
-                print("[train][warn] 未发现 _orig_mod，无法安全与 torch.compile 并用；禁用 overlap 模式。")
+                print(
+                    "[train][warn] 未发现 _orig_mod，无法安全与 torch.compile 并用；禁用 overlap 模式。"
+                )
                 overlap_enabled = False
     model_lock = threading.Lock() if overlap_enabled else None
 
     # 用于存放后台线程结果
     class _CollectResult:
-        __slots__ = ("obs_cpu", "obs_gpu", "hidden", "cell", "rollout", "episode_returns", "steps")
+        __slots__ = (
+            "obs_cpu",
+            "obs_gpu",
+            "hidden",
+            "cell",
+            "rollout",
+            "episode_returns",
+            "steps",
+        )
 
         def __init__(self):
             self.obs_cpu = None
@@ -1418,20 +1933,40 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             self.episode_returns = None
             self.steps = 0  # 该批实际采集的环境步数 (= num_envs * rollout_steps)
 
-    def _collect_rollout(buffer: RolloutBuffer, start_obs_cpu: torch.Tensor, start_hidden, start_cell, ep_returns: np.ndarray, update_idx_hint: int, progress_heartbeat: bool = False, step_interval: int = 8):
+    def _collect_rollout(
+        buffer: RolloutBuffer,
+        start_obs_cpu: torch.Tensor,
+        start_hidden,
+        start_cell,
+        ep_returns: np.ndarray,
+        update_idx_hint: int,
+        progress_heartbeat: bool = False,
+        step_interval: int = 8,
+    ):
         local_hidden = start_hidden
         local_cell = start_cell
         obs_local_cpu = start_obs_cpu
         if local_hidden is not None:
-            buffer.set_initial_hidden(local_hidden.detach(), local_cell.detach() if local_cell is not None else None)
+            buffer.set_initial_hidden(
+                local_hidden.detach(),
+                local_cell.detach() if local_cell is not None else None,
+            )
         else:
             buffer.set_initial_hidden(None, None)
         for step in range(cfg.rollout.num_steps):
             with model_lock or contextlib.nullcontext():
                 # 使用 no_grad 而非 inference_mode，避免生成 inference tensor 被后续保存进计算图时报错
                 with torch.no_grad():
-                    with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
-                        out = model(obs_local_cpu.to(device, non_blocking=(device.type == "cuda")), local_hidden, local_cell)
+                    with torch.amp.autocast(
+                        device_type=device.type, enabled=cfg.mixed_precision
+                    ):
+                        out = model(
+                            obs_local_cpu.to(
+                                device, non_blocking=(device.type == "cuda")
+                            ),
+                            local_hidden,
+                            local_cell,
+                        )
             dist = Categorical(logits=out.logits)
             actions = dist.sample()
             if auto_bootstrap_state["remaining"] > 0:
@@ -1441,12 +1976,21 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             actions_cpu = actions.detach().cpu()
             log_probs_cpu = log_probs.detach().cpu()
             values_cpu = values.detach().cpu()
-            step_start = time.time()
-            next_obs_np, reward_np, terminated, truncated, _infos = env.step(actions_cpu.numpy())
+            next_obs_np, reward_np, terminated, truncated, _infos = env.step(
+                actions_cpu.numpy()
+            )
             done = np.logical_or(terminated, truncated)
             reward_cpu = _to_cpu_tensor(reward_np, dtype=torch.float32)
             done_cpu = _to_cpu_tensor(done.astype(np.float32), dtype=torch.float32)
-            buffer.insert(step, obs_local_cpu, actions_cpu, log_probs_cpu, reward_cpu, values_cpu, done_cpu)
+            buffer.insert(
+                step,
+                obs_local_cpu,
+                actions_cpu,
+                log_probs_cpu,
+                reward_cpu,
+                values_cpu,
+                done_cpu,
+            )
             obs_local_cpu = _to_cpu_tensor(next_obs_np)
             ep_returns += reward_np
             if done.any():
@@ -1460,37 +2004,78 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 # detach + clone 产生普通张量，避免 inference tensor backward 限制
                 local_hidden = out.hidden_state.detach().clone()
                 if done.any():
-                    mask = torch.as_tensor(done, dtype=torch.bool, device=local_hidden.device)
+                    mask = torch.as_tensor(
+                        done, dtype=torch.bool, device=local_hidden.device
+                    )
                     local_hidden[:, mask] = 0.0
                 if out.cell_state is not None:
                     local_cell = out.cell_state.detach().clone()
                     if done.any():
-                        mask = torch.as_tensor(done, dtype=torch.bool, device=local_cell.device)
+                        mask = torch.as_tensor(
+                            done, dtype=torch.bool, device=local_cell.device
+                        )
                         local_cell[:, mask] = 0.0
                 else:
                     local_cell = None
             else:
                 local_hidden = None
                 local_cell = None
-            if progress_heartbeat and ((step + 1) % step_interval == 0 or step + 1 == cfg.rollout.num_steps):
-                heartbeat.notify(global_step=-1, phase="rollout", message=f"(bg) 采样 {step+1}/{cfg.rollout.num_steps}")
+            if progress_heartbeat and (
+                (step + 1) % step_interval == 0 or step + 1 == cfg.rollout.num_steps
+            ):
+                heartbeat.notify(
+                    global_step=-1,
+                    phase="rollout",
+                    message=f"(bg) 采样 {step+1}/{cfg.rollout.num_steps}",
+                )
         buffer.set_next_obs(obs_local_cpu)
         steps_collected = cfg.rollout.num_steps * cfg.env.num_envs
         return obs_local_cpu, local_hidden, local_cell, ep_returns, steps_collected
 
     # 双缓冲：当前 buffer / 下一个 buffer
     current_buffer = rollout
-    next_buffer = RolloutBuffer(cfg.rollout.num_steps, cfg.env.num_envs, env.single_observation_space.shape, device, pin_memory=(device.type == "cuda")) if overlap_enabled else None
+    next_buffer = (
+        RolloutBuffer(
+            cfg.rollout.num_steps,
+            cfg.env.num_envs,
+            env.single_observation_space.shape,
+            device,
+            pin_memory=(device.type == "cuda"),
+        )
+        if overlap_enabled
+        else None
+    )
     pending_thread = None
     pending_result = _CollectResult() if overlap_enabled else None
 
-    def _start_background_collection(start_obs_cpu, hidden_state, cell_state, ep_returns, next_update_idx, step_interval: int):
-        assert overlap_enabled and next_buffer is not None and pending_result is not None
+    def _start_background_collection(
+        start_obs_cpu,
+        hidden_state,
+        cell_state,
+        ep_returns,
+        next_update_idx,
+        step_interval: int,
+    ):
+        assert (
+            overlap_enabled and next_buffer is not None and pending_result is not None
+        )
         next_buffer.reset()
         pending_result.obs_cpu = None
+
         def _runner():
             try:
-                obs_cpu_final, h_final, c_final, ep_ret, steps_collected = _collect_rollout(next_buffer, start_obs_cpu, hidden_state, cell_state, ep_returns, next_update_idx, progress_heartbeat=False, step_interval=step_interval)
+                obs_cpu_final, h_final, c_final, ep_ret, steps_collected = (
+                    _collect_rollout(
+                        next_buffer,
+                        start_obs_cpu,
+                        hidden_state,
+                        cell_state,
+                        ep_returns,
+                        next_update_idx,
+                        progress_heartbeat=False,
+                        step_interval=step_interval,
+                    )
+                )
                 pending_result.obs_cpu = obs_cpu_final
                 pending_result.hidden = h_final
                 pending_result.cell = c_final
@@ -1498,6 +2083,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 pending_result.steps = steps_collected
             except Exception as e:  # pragma: no cover - 仅日志
                 print(f"[train][warn] background collection failed: {e}")
+
         t = threading.Thread(target=_runner, daemon=True)
         t.start()
         return t
@@ -1517,28 +2103,45 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 message=f"采集第{update_idx}轮数据",
             )
             # 当前 update 使用的步进进度间隔（前 warmup_updates 个使用 warmup_interval）
-            current_interval = warmup_interval if (update_idx - global_update) < warmup_updates else base_interval
+            current_interval = (
+                warmup_interval
+                if (update_idx - global_update) < warmup_updates
+                else base_interval
+            )
             if not overlap_enabled:
                 # 原始同步采集逻辑保留
                 rollout.reset()
                 if hidden_state is not None:
-                    rollout.set_initial_hidden(hidden_state.detach(), cell_state.detach() if cell_state is not None else None)
+                    rollout.set_initial_hidden(
+                        hidden_state.detach(),
+                        cell_state.detach() if cell_state is not None else None,
+                    )
                 else:
                     rollout.set_initial_hidden(None, None)
                 for step in range(cfg.rollout.num_steps):
                     # 采集阶段不需要梯度：使用 no_grad 避免构建计算图，同时避免 inference_mode 的 backward 限制
                     with torch.no_grad():
-                        with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
+                        with torch.amp.autocast(
+                            device_type=device.type, enabled=cfg.mixed_precision
+                        ):
                             output = model(obs_gpu, hidden_state, cell_state)
                             logits = output.logits
                             values = output.value
                     dist = Categorical(logits=logits)
                     actions = dist.sample()
                     # 若配置 auto-start，在前若干全局 step 强制覆盖动作（仅第一轮）
-                    if auto_start_frames > 0 and update_idx == global_update and global_step < auto_start_frames * cfg.env.num_envs:
+                    if (
+                        auto_start_frames > 0
+                        and update_idx == global_update
+                        and global_step < auto_start_frames * cfg.env.num_envs
+                    ):
                         actions = torch.zeros_like(actions)
                     # Scripted forward warmup：在指定帧数内强制使用前进动作
-                    if getattr(args, "scripted_forward_frames", 0) > 0 and global_step < args.scripted_forward_frames * cfg.env.num_envs:
+                    if (
+                        getattr(args, "scripted_forward_frames", 0) > 0
+                        and global_step
+                        < args.scripted_forward_frames * cfg.env.num_envs
+                    ):
                         try:
                             # 推断 forward 动作 id（缓存）
                             if not hasattr(run_training, "_forward_action_id") or run_training._forward_action_id is None:  # type: ignore[attr-defined]
@@ -1551,34 +2154,48 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                 else:
                                     candidates = [int(faid)]
                                 # 约束到动作空间范围
-                                space_n = env.action_space.n if hasattr(env.action_space, 'n') else max(candidates)+1
+                                space_n = (
+                                    env.action_space.n
+                                    if hasattr(env.action_space, "n")
+                                    else max(candidates) + 1
+                                )
                                 run_training._forward_action_id = next((c for c in candidates if c < space_n), 0)  # type: ignore[attr-defined]
                             fid = int(run_training._forward_action_id)  # type: ignore[attr-defined]
                             actions = torch.full_like(actions, fid)
                         except Exception:
                             pass
                     # Scripted sequence 覆盖（优先级高于 forward_frames）
-                    if getattr(args, 'scripted_sequence', None):
+                    if getattr(args, "scripted_sequence", None):
                         # 预处理脚本为 (action_id, remaining_frames) 队列，缓存到 run_training._scripted_seq
-                        if not hasattr(run_training, '_scripted_seq'):
-                            seq_spec = str(args.scripted_sequence).split(',')
+                        if not hasattr(run_training, "_scripted_seq"):
+                            seq_spec = str(args.scripted_sequence).split(",")
                             parsed = []
                             # 获取动作组合列表（如果 fc wrapper 暴露 _action_combos）
-                            action_combos = getattr(env.envs[0], '_action_combos', None) if hasattr(env, 'envs') and env.envs else None
+                            action_combos = (
+                                getattr(env.envs[0], "_action_combos", None)
+                                if hasattr(env, "envs") and env.envs
+                                else None
+                            )
+
                             def _combo_to_id(name: str):
                                 if action_combos is None:
                                     return None
-                                target = tuple(part.strip().upper() for part in name.split('+') if part.strip())
+                                target = tuple(
+                                    part.strip().upper()
+                                    for part in name.split("+")
+                                    if part.strip()
+                                )
                                 for i, c in enumerate(action_combos):
                                     if tuple(c) == target:
                                         return i
                                 return None
+
                             for token in seq_spec:
                                 token = token.strip()
                                 if not token:
                                     continue
-                                if ':' in token:
-                                    nm, fr = token.split(':', 1)
+                                if ":" in token:
+                                    nm, fr = token.split(":", 1)
                                     try:
                                         frn = max(1, int(fr))
                                     except Exception:
@@ -1593,7 +2210,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                 run_training._scripted_seq = parsed  # type: ignore[attr-defined]
                                 run_training._scripted_seq_idx = 0  # type: ignore[attr-defined]
                         # 应用脚本（每 global_step 减少一帧）
-                        if hasattr(run_training, '_scripted_seq'):
+                        if hasattr(run_training, "_scripted_seq"):
                             seq = run_training._scripted_seq  # type: ignore[attr-defined]
                             if seq:
                                 cur = seq[0]
@@ -1612,9 +2229,15 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                 sid = 0
                         take = min(actions.numel(), secondary_script_state["remaining"])
                         actions.view(-1)[:take] = int(sid)
-                        secondary_script_state["remaining"] = max(0, secondary_script_state["remaining"] - take)
-                        if secondary_script_state["remaining"] == 0 and not secondary_script_state.get("announced_done"):
-                            print("[train][secondary-script] 二次脚本注入结束，恢复策略动作。")
+                        secondary_script_state["remaining"] = max(
+                            0, secondary_script_state["remaining"] - take
+                        )
+                        if secondary_script_state[
+                            "remaining"
+                        ] == 0 and not secondary_script_state.get("announced_done"):
+                            print(
+                                "[train][secondary-script] 二次脚本注入结束，恢复策略动作。"
+                            )
                             secondary_script_state["announced_done"] = True
                     elif auto_bootstrap_state["remaining"] > 0:
                         actions = _apply_auto_bootstrap_actions(actions)
@@ -1622,50 +2245,93 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     actions_cpu = actions.detach().cpu()
                     # 动作频次统计
                     try:
-                        vals, counts = np.unique(actions_cpu.numpy(), return_counts=True)
+                        vals, counts = np.unique(
+                            actions_cpu.numpy(), return_counts=True
+                        )
                         action_hist[vals] += counts
                     except Exception:
                         pass
                     log_probs_cpu = log_probs.detach().cpu()
                     values_cpu = values.detach().cpu()
                     step_start_time = time.time()
-                    next_obs_np, reward_np, terminated, truncated, infos = env.step(actions_cpu.numpy())
+                    next_obs_np, reward_np, terminated, truncated, infos = env.step(
+                        actions_cpu.numpy()
+                    )
                     # 前若干步调试：打印原始 info 结构（仅 env0）
                     if global_step < 20 * cfg.env.num_envs:
                         try:
-                            if isinstance(infos, (list, tuple)) and infos and isinstance(infos[0], dict):
+                            if (
+                                isinstance(infos, (list, tuple))
+                                and infos
+                                and isinstance(infos[0], dict)
+                            ):
                                 keys0 = list(infos[0].keys())
-                                metrics0 = list(infos[0].get('metrics', {}).keys()) if isinstance(infos[0].get('metrics'), dict) else None
-                                print(f"[train][debug-info] gstep={global_step} keys={keys0} metrics_keys={metrics0}")
+                                metrics0 = (
+                                    list(infos[0].get("metrics", {}).keys())
+                                    if isinstance(infos[0].get("metrics"), dict)
+                                    else None
+                                )
+                                print(
+                                    f"[train][debug-info] gstep={global_step} keys={keys0} metrics_keys={metrics0}"
+                                )
                             elif isinstance(infos, dict):
                                 keys0 = list(infos.keys())
-                                mk = list(infos.get('metrics', {}).keys()) if isinstance(infos.get('metrics'), dict) else None
-                                print(f"[train][debug-info] gstep={global_step} dict-keys={keys0} metrics_keys={mk}")
+                                mk = (
+                                    list(infos.get("metrics", {}).keys())
+                                    if isinstance(infos.get("metrics"), dict)
+                                    else None
+                                )
+                                print(
+                                    f"[train][debug-info] gstep={global_step} dict-keys={keys0} metrics_keys={mk}"
+                                )
                         except Exception:
                             pass
                     step_duration = time.time() - step_start_time
                     if step_timeout is not None and step_duration > step_timeout:
                         now_warn = time.time()
-                        if slow_step_cooldown is None or now_warn - last_slow_step_warn >= slow_step_cooldown:
-                            print(f"[train][warn] env.step 耗时 {step_duration:.1f}s (阈值 {step_timeout:.1f}s)，可能存在卡顿。")
-                            heartbeat.notify(phase="rollout", message=f"env.step {step_duration:.1f}s", progress=False)
+                        if (
+                            slow_step_cooldown is None
+                            or now_warn - last_slow_step_warn >= slow_step_cooldown
+                        ):
+                            print(
+                                f"[train][warn] env.step 耗时 {step_duration:.1f}s (阈值 {step_timeout:.1f}s)，可能存在卡顿。"
+                            )
+                            heartbeat.notify(
+                                phase="rollout",
+                                message=f"env.step {step_duration:.1f}s",
+                                progress=False,
+                            )
                             last_slow_step_warn = now_warn
                         slow_step_events.append(now_warn)
                         # 仅保留窗口内事件
-                        slow_step_events = [t for t in slow_step_events if now_warn - t <= slow_trace_window]
+                        slow_step_events = [
+                            t
+                            for t in slow_step_events
+                            if now_warn - t <= slow_trace_window
+                        ]
                         if len(slow_step_events) >= slow_trace_threshold:
-                            trace_path = Path(run_dir) / f"slow_step_trace_{int(now_warn)}.log"
+                            trace_path = (
+                                Path(run_dir) / f"slow_step_trace_{int(now_warn)}.log"
+                            )
                             try:
-                                import faulthandler, traceback as _tb
+                                import faulthandler
+                                import traceback as _tb
+
                                 with trace_path.open("w", encoding="utf-8") as fp:
-                                    fp.write(f"# Slow step trace trigger at {datetime.now(UTC).isoformat()}\n")
+                                    fp.write(
+                                        f"# Slow step trace trigger at {datetime.now(UTC).isoformat()}\n"
+                                    )
                                     faulthandler.dump_traceback(file=fp)
                                     for tid, frame in sys._current_frames().items():  # type: ignore[attr-defined]
                                         fp.write(f"\n# Thread {tid}\n")
                                         fp.write("".join(_tb.format_stack(frame)))
-                                print(f"[train][trace] slow step threshold reached -> {trace_path}")
+                                print(
+                                    f"[train][trace] slow step threshold reached -> {trace_path}"
+                                )
                             except Exception as _exc:  # noqa: BLE001
-                                print(f"[train][trace][error] stack dump failed: {_exc}")
+                                print(
+                                    f"[train][trace][error] stack dump failed: {_exc}"
+                                )
                             slow_step_events.clear()
                     done = np.logical_or(terminated, truncated)
                     # 提取 x_pos 进度（infos 可能是 list 或 tuple）
@@ -1675,16 +2341,29 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                 if not isinstance(inf, dict):
                                     continue
                                 x_val = inf.get("x_pos") or inf.get("progress")
-                                shaping_inf = inf.get("shaping") if isinstance(inf, dict) else None
+                                shaping_inf = (
+                                    inf.get("shaping")
+                                    if isinstance(inf, dict)
+                                    else None
+                                )
                                 if x_val is None:
-                                    metrics = inf.get("metrics") if isinstance(inf, dict) else None
+                                    metrics = (
+                                        inf.get("metrics")
+                                        if isinstance(inf, dict)
+                                        else None
+                                    )
                                     if metrics and isinstance(metrics, dict):
-                                        x_raw = metrics.get("mario_x") or metrics.get("x_pos")
+                                        x_raw = metrics.get("mario_x") or metrics.get(
+                                            "x_pos"
+                                        )
                                         if x_raw is not None:
                                             try:
                                                 if hasattr(x_raw, "item"):
                                                     x_raw = x_raw.item()
-                                                elif hasattr(x_raw, "__len__") and len(x_raw) > 0:
+                                                elif (
+                                                    hasattr(x_raw, "__len__")
+                                                    and len(x_raw) > 0
+                                                ):
                                                     x_raw = x_raw[0]
                                                 x_val = int(x_raw)
                                             except Exception:
@@ -1694,18 +2373,34 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                     if env_last_x[i_env] > env_max_x[i_env]:
                                         env_max_x[i_env] = env_last_x[i_env]
                                         # 里程碑检测（基于全局 max）
-                                        if milestone_interval > 0 and milestone_state["next"] is not None:
+                                        if (
+                                            milestone_interval > 0
+                                            and milestone_state["next"] is not None
+                                        ):
                                             global_candidate = int(env_max_x.max())
-                                            while milestone_state["next"] is not None and global_candidate >= milestone_state["next"]:
+                                            while (
+                                                milestone_state["next"] is not None
+                                                and global_candidate
+                                                >= milestone_state["next"]
+                                            ):
                                                 if milestone_bonus != 0.0:
                                                     shaping_raw_sum += milestone_bonus
-                                                    shaping_scaled_sum += milestone_bonus * max(1.0, shaping_last_scale)
+                                                    shaping_scaled_sum += (
+                                                        milestone_bonus
+                                                        * max(1.0, shaping_last_scale)
+                                                    )
                                                 milestone_state["count"] += 1
-                                                milestone_state["next"] += milestone_interval
+                                                milestone_state[
+                                                    "next"
+                                                ] += milestone_interval
                                     # 正向位移统计
                                     dx = env_last_x[i_env] - env_prev_step_x[i_env]
                                     # 如果之前始终为 0，允许第一次正值直接加入 (dx = current_x)
-                                    if env_prev_step_x[i_env] == 0 and env_last_x[i_env] > 0 and dx == env_last_x[i_env]:
+                                    if (
+                                        env_prev_step_x[i_env] == 0
+                                        and env_last_x[i_env] > 0
+                                        and dx == env_last_x[i_env]
+                                    ):
                                         pass  # dx 已是完整跳跃
                                     if dx > 0:
                                         distance_delta_sum += dx
@@ -1715,7 +2410,11 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                     env_prev_step_x[i_env] = env_last_x[i_env]
                                     # Episode 步数 + 超时截断
                                     per_env_episode_steps[i_env] += 1
-                                    if episode_timeout_steps > 0 and per_env_episode_steps[i_env] >= episode_timeout_steps:
+                                    if (
+                                        episode_timeout_steps > 0
+                                        and per_env_episode_steps[i_env]
+                                        >= episode_timeout_steps
+                                    ):
                                         try:
                                             if isinstance(infos[i_env], dict):
                                                 infos[i_env]["timeout_truncate"] = True
@@ -1726,19 +2425,51 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                     if isinstance(shaping_inf, dict):
                                         try:
                                             # Early shaping：在窗口内动态放大 distance 权重（通过 dx 与 last dx scale 额外加成）
-                                            if early_shaping_window > 0 and update_idx < early_shaping_window and shaping_inf.get("dx"):
+                                            if (
+                                                early_shaping_window > 0
+                                                and update_idx < early_shaping_window
+                                                and shaping_inf.get("dx")
+                                            ):
                                                 # 推断期望覆盖权重
                                                 target_w = early_shaping_distance_weight
                                                 if target_w is None:
                                                     # 默认乘以 2
-                                                    target_w = float(getattr(cfg.env.env.reward_config, 'distance_weight', 1.0)) * 2.0
+                                                    target_w = (
+                                                        float(
+                                                            getattr(
+                                                                cfg.env.env.reward_config,
+                                                                "distance_weight",
+                                                                1.0,
+                                                            )
+                                                        )
+                                                        * 2.0
+                                                    )
                                                 # 原始已加成权重为 cfg.env.env.reward_config.distance_weight (或其退火后的瞬时)；差值补偿
-                                                base_w = float(getattr(cfg.env.env.reward_config, 'distance_weight', 1.0))
-                                                dx_local = float(shaping_inf.get("dx", 0.0) or 0.0)
+                                                base_w = float(
+                                                    getattr(
+                                                        cfg.env.env.reward_config,
+                                                        "distance_weight",
+                                                        1.0,
+                                                    )
+                                                )
+                                                dx_local = float(
+                                                    shaping_inf.get("dx", 0.0) or 0.0
+                                                )
                                                 if dx_local > 0 and target_w > base_w:
-                                                    extra = (target_w - base_w) * dx_local * float(shaping_inf.get("scale", 1.0) or 1.0)
+                                                    extra = (
+                                                        (target_w - base_w)
+                                                        * dx_local
+                                                        * float(
+                                                            shaping_inf.get(
+                                                                "scale", 1.0
+                                                            )
+                                                            or 1.0
+                                                        )
+                                                    )
                                                     shaping_scaled_sum += extra
-                                                    shaping_last_scaled += 0.0  # 不覆盖最后刻度，仅累积
+                                                    shaping_last_scaled += (
+                                                        0.0  # 不覆盖最后刻度，仅累积
+                                                    )
                                             raw_v = shaping_inf.get("raw")
                                             scaled_v = shaping_inf.get("scaled")
                                             scale_v = shaping_inf.get("scale")
@@ -1760,72 +2491,95 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                     if stagnation_steps[i_env] >= stagnation_limit:
                                         try:
                                             if isinstance(infos[i_env], dict):
-                                                infos[i_env]["stagnation_truncate"] = True
+                                                infos[i_env][
+                                                    "stagnation_truncate"
+                                                ] = True
                                             truncated[i_env] = True
                                         except Exception:
                                             pass
                         elif isinstance(infos, dict):  # 向量 env 可能直接给 dict
                             # 单一 dict：尝试提取 batched 形式 (x_pos: array)
-                                        x_array = infos.get("x_pos")
-                                        if x_array is not None:
-                                            try:
-                                                arr = np.asarray(x_array).astype(int)
-                                                if arr.ndim == 0:
-                                                    # 标量 -> 仅更新 env0（其余视为无进展）
-                                                    arr = np.full((cfg.env.num_envs,), int(arr), dtype=int)
-                                                if arr.shape[0] == cfg.env.num_envs:
-                                                    for i_env in range(cfg.env.num_envs):
-                                                        last = int(arr[i_env])
-                                                        env_last_x[i_env] = last
-                                                        if last > env_max_x[i_env]:
-                                                            env_max_x[i_env] = last
-                                                        dx = last - env_prev_step_x[i_env]
-                                                        if env_prev_step_x[i_env] == 0 and last > 0 and dx == last:
-                                                            # 首次整体跳跃
-                                                            pass
-                                                        if dx > 0:
-                                                            distance_delta_sum += dx
-                                                            stagnation_steps[i_env] = 0
-                                                        else:
-                                                            stagnation_steps[i_env] += 1
-                                                        env_prev_step_x[i_env] = last
-                                            except Exception:
+                            x_array = infos.get("x_pos")
+                            if x_array is not None:
+                                try:
+                                    arr = np.asarray(x_array).astype(int)
+                                    if arr.ndim == 0:
+                                        # 标量 -> 仅更新 env0（其余视为无进展）
+                                        arr = np.full(
+                                            (cfg.env.num_envs,), int(arr), dtype=int
+                                        )
+                                    if arr.shape[0] == cfg.env.num_envs:
+                                        for i_env in range(cfg.env.num_envs):
+                                            last = int(arr[i_env])
+                                            env_last_x[i_env] = last
+                                            if last > env_max_x[i_env]:
+                                                env_max_x[i_env] = last
+                                            dx = last - env_prev_step_x[i_env]
+                                            if (
+                                                env_prev_step_x[i_env] == 0
+                                                and last > 0
+                                                and dx == last
+                                            ):
+                                                # 首次整体跳跃
                                                 pass
-                                        # batched shaping: 可能是 list/tuple，每个元素为 dict
-                                        shaping_batch = infos.get("shaping")
-                                        if isinstance(shaping_batch, (list, tuple)) and len(shaping_batch) == cfg.env.num_envs:
-                                            for _i, sh in enumerate(shaping_batch):
-                                                if not isinstance(sh, dict):
-                                                    continue
-                                                try:
-                                                    raw_v = sh.get("raw")
-                                                    scaled_v = sh.get("scaled")
-                                                    scale_v = sh.get("scale")
-                                                    dx_v = sh.get("dx")
-                                                    if isinstance(raw_v, (int, float)):
-                                                        shaping_raw_sum += float(raw_v)
-                                                        shaping_last_raw = float(raw_v)
-                                                    if isinstance(scaled_v, (int, float)):
-                                                        shaping_scaled_sum += float(scaled_v)
-                                                        shaping_last_scaled = float(scaled_v)
-                                                    if isinstance(scale_v, (int, float)):
-                                                        shaping_last_scale = float(scale_v)
-                                                    if isinstance(dx_v, (int, float)):
-                                                        shaping_last_dx = float(dx_v)
-                                                except Exception:
-                                                    shaping_parse_fail += 1
+                                            if dx > 0:
+                                                distance_delta_sum += dx
+                                                stagnation_steps[i_env] = 0
+                                            else:
+                                                stagnation_steps[i_env] += 1
+                                            env_prev_step_x[i_env] = last
+                                except Exception:
+                                    pass
+                            # batched shaping: 可能是 list/tuple，每个元素为 dict
+                            shaping_batch = infos.get("shaping")
+                            if (
+                                isinstance(shaping_batch, (list, tuple))
+                                and len(shaping_batch) == cfg.env.num_envs
+                            ):
+                                for _i, sh in enumerate(shaping_batch):
+                                    if not isinstance(sh, dict):
+                                        continue
+                                    try:
+                                        raw_v = sh.get("raw")
+                                        scaled_v = sh.get("scaled")
+                                        scale_v = sh.get("scale")
+                                        dx_v = sh.get("dx")
+                                        if isinstance(raw_v, (int, float)):
+                                            shaping_raw_sum += float(raw_v)
+                                            shaping_last_raw = float(raw_v)
+                                        if isinstance(scaled_v, (int, float)):
+                                            shaping_scaled_sum += float(scaled_v)
+                                            shaping_last_scaled = float(scaled_v)
+                                        if isinstance(scale_v, (int, float)):
+                                            shaping_last_scale = float(scale_v)
+                                        if isinstance(dx_v, (int, float)):
+                                            shaping_last_dx = float(dx_v)
+                                    except Exception:
+                                        shaping_parse_fail += 1
                     except Exception:
                         pass
                     reward_cpu = _to_cpu_tensor(reward_np, dtype=torch.float32)
-                    done_cpu = _to_cpu_tensor(done.astype(np.float32), dtype=torch.float32)
-                    rollout.insert(step, obs_cpu, actions_cpu, log_probs_cpu, reward_cpu, values_cpu, done_cpu)
+                    done_cpu = _to_cpu_tensor(
+                        done.astype(np.float32), dtype=torch.float32
+                    )
+                    rollout.insert(
+                        step,
+                        obs_cpu,
+                        actions_cpu,
+                        log_probs_cpu,
+                        reward_cpu,
+                        values_cpu,
+                        done_cpu,
+                    )
                     obs_cpu = _to_cpu_tensor(next_obs_np)
                     obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
                     episode_returns += reward_np
                     if done.any():
                         for idx_env, flag in enumerate(done):
                             if flag:
-                                completed_returns.append(float(episode_returns[idx_env]))
+                                completed_returns.append(
+                                    float(episode_returns[idx_env])
+                                )
                                 episode_returns[idx_env] = 0.0
                                 per_env_episode_steps[idx_env] = 0
                         if len(completed_returns) > 1000:
@@ -1833,12 +2587,16 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     if output.hidden_state is not None:
                         hidden_state = output.hidden_state.detach().clone()
                         if done.any():
-                            mask = torch.as_tensor(done, dtype=torch.bool, device=device)
+                            mask = torch.as_tensor(
+                                done, dtype=torch.bool, device=device
+                            )
                             hidden_state[:, mask] = 0.0
                         if output.cell_state is not None:
                             cell_state = output.cell_state.detach().clone()
                             if done.any():
-                                mask = torch.as_tensor(done, dtype=torch.bool, device=device)
+                                mask = torch.as_tensor(
+                                    done, dtype=torch.bool, device=device
+                                )
                                 cell_state[:, mask] = 0.0
                         else:
                             cell_state = None
@@ -1848,15 +2606,36 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     # 主动释放局部变量引用，帮助 Python 更快回收（避免长生存期列表）
                     del output, logits, values, dist, actions, log_probs
                     global_step += cfg.env.num_envs
-                    if (step + 1) % current_interval == 0 or step + 1 == cfg.rollout.num_steps:
-                        heartbeat.notify(global_step=global_step, phase="rollout", message=f"采样进度 {step + 1}/{cfg.rollout.num_steps}")
+                    if (
+                        step + 1
+                    ) % current_interval == 0 or step + 1 == cfg.rollout.num_steps:
+                        heartbeat.notify(
+                            global_step=global_step,
+                            phase="rollout",
+                            message=f"采样进度 {step + 1}/{cfg.rollout.num_steps}",
+                        )
                 rollout.set_next_obs(obs_cpu)
             else:
                 # overlap 模式
                 if update_idx == global_update:
                     # 首次需要前台采集以获得初始缓冲
                     current_buffer.reset()
-                    obs_cpu, hidden_state, cell_state, episode_returns, steps_collected = _collect_rollout(current_buffer, obs_cpu, hidden_state, cell_state, episode_returns, update_idx, progress_heartbeat=True, step_interval=current_interval)
+                    (
+                        obs_cpu,
+                        hidden_state,
+                        cell_state,
+                        episode_returns,
+                        steps_collected,
+                    ) = _collect_rollout(
+                        current_buffer,
+                        obs_cpu,
+                        hidden_state,
+                        cell_state,
+                        episode_returns,
+                        update_idx,
+                        progress_heartbeat=True,
+                        step_interval=current_interval,
+                    )
                     obs_gpu = obs_cpu.to(device, non_blocking=(device.type == "cuda"))
                     global_step += steps_collected  # 首次采集完成后累加步数
                 else:
@@ -1873,10 +2652,21 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     if pending_result.episode_returns is not None:
                         episode_returns = pending_result.episode_returns
                     # 累计后台线程采集的步数
-                    global_step += getattr(pending_result, "steps", cfg.rollout.num_steps * cfg.env.num_envs)
+                    global_step += getattr(
+                        pending_result,
+                        "steps",
+                        cfg.rollout.num_steps * cfg.env.num_envs,
+                    )
                 # 在学习阶段开始前启动下一次后台采集（除非最后一次）
                 if update_idx + 1 < cfg.total_updates:
-                    pending_thread = _start_background_collection(obs_cpu, hidden_state, cell_state, episode_returns, update_idx + 1, step_interval=current_interval)
+                    pending_thread = _start_background_collection(
+                        obs_cpu,
+                        hidden_state,
+                        cell_state,
+                        episode_returns,
+                        update_idx + 1,
+                        step_interval=current_interval,
+                    )
 
             rollout_duration = time.time() - update_wall_start
             heartbeat.notify(
@@ -1892,7 +2682,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
             sequences = rollout.get_sequences(device)
 
-            with torch.amp.autocast(device_type=device.type, enabled=cfg.mixed_precision):
+            with torch.amp.autocast(
+                device_type=device.type, enabled=cfg.mixed_precision
+            ):
                 target_output = model(
                     sequences["obs"],
                     sequences["initial_hidden"].hidden,
@@ -1934,14 +2726,21 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
 
             policy_loss = -(advantages.detach() * target_log_probs).mean()
             value_loss = F.mse_loss(target_values, vs.detach())
-            total_loss = policy_loss + cfg.optimizer.value_loss_coef * value_loss - cfg.optimizer.beta_entropy * entropy + per_loss
+            total_loss = (
+                policy_loss
+                + cfg.optimizer.value_loss_coef * value_loss
+                - cfg.optimizer.beta_entropy * entropy
+                + per_loss
+            )
             total_loss = total_loss / cfg.gradient_accumulation
 
             scaler.scale(total_loss).backward()
 
             if (update_idx + 1) % cfg.gradient_accumulation == 0:
                 scaler.unscale_(optimizer)
-                grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optimizer.max_grad_norm)
+                grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), cfg.optimizer.max_grad_norm
+                )
                 last_grad_norm = float(grad_norm_tensor)
                 # Execute optimizer step via scaler then advance scheduler only if optimizer succeeded
                 try:
@@ -1980,9 +2779,15 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 return_std = float(np.std(recent_returns)) if recent_returns else 0.0
                 return_max = float(np.max(recent_returns)) if recent_returns else 0.0
                 return_min = float(np.min(recent_returns)) if recent_returns else 0.0
-                p50 = float(np.percentile(recent_returns, 50)) if recent_returns else 0.0
-                p90 = float(np.percentile(recent_returns, 90)) if recent_returns else 0.0
-                p99 = float(np.percentile(recent_returns, 99)) if recent_returns else 0.0
+                p50 = (
+                    float(np.percentile(recent_returns, 50)) if recent_returns else 0.0
+                )
+                p90 = (
+                    float(np.percentile(recent_returns, 90)) if recent_returns else 0.0
+                )
+                p99 = (
+                    float(np.percentile(recent_returns, 99)) if recent_returns else 0.0
+                )
                 now = time.time()
                 updates_since_last = max(update_idx - last_log_update, 1)
                 steps_since_last = max(global_step - last_log_step, cfg.env.num_envs)
@@ -2002,9 +2807,15 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     max_x = int(np.max(env_max_x))
                     writer.add_scalar("Env/mean_x_pos", mean_x, global_step)
                     writer.add_scalar("Env/max_x_pos", max_x, global_step)
-                    writer.add_scalar("Env/distance_delta_sum", float(distance_delta_sum), global_step)
-                    writer.add_scalar("Env/shaping_raw_sum", float(shaping_raw_sum), global_step)
-                    writer.add_scalar("Env/shaping_scaled_sum", float(shaping_scaled_sum), global_step)
+                    writer.add_scalar(
+                        "Env/distance_delta_sum", float(distance_delta_sum), global_step
+                    )
+                    writer.add_scalar(
+                        "Env/shaping_raw_sum", float(shaping_raw_sum), global_step
+                    )
+                    writer.add_scalar(
+                        "Env/shaping_scaled_sum", float(shaping_scaled_sum), global_step
+                    )
                 except Exception:
                     pass
                 writer.add_scalar("Reward/avg_return", avg_return, global_step)
@@ -2022,7 +2833,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 )
                 if update_idx == global_update:
                     try:
-                        print(f"[train][debug] first_log distance_delta_sum={distance_delta_sum} env_last_x={env_last_x.tolist()} env_prev_step_x={env_prev_step_x.tolist()}")
+                        print(
+                            f"[train][debug] first_log distance_delta_sum={distance_delta_sum} env_last_x={env_last_x.tolist()} env_prev_step_x={env_prev_step_x.tolist()}"
+                        )
                     except Exception:
                         pass
 
@@ -2051,7 +2864,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     "update_time": total_update_time,
                     "rollout_time": rollout_duration,
                     "learn_time": learn_duration,
-                    "env_mean_x_pos": float(np.mean(env_last_x)) if env_last_x.size else 0.0,
+                    "env_mean_x_pos": (
+                        float(np.mean(env_last_x)) if env_last_x.size else 0.0
+                    ),
                     "env_max_x_pos": int(np.max(env_max_x)) if env_max_x.size else 0,
                     "env_distance_delta_sum": int(distance_delta_sum),
                     "env_shaping_raw_sum": float(shaping_raw_sum),
@@ -2065,53 +2880,47 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 # 估算本 update 内有正向增量的 env 数量（基于 stagnation_steps==0 且 env_last_x>0）
                 try:
                     if env_last_x.size:
-                        pos_envs = int(np.sum((env_last_x > 0) & (stagnation_steps == 0)))
+                        pos_envs = int(
+                            np.sum((env_last_x > 0) & (stagnation_steps == 0))
+                        )
                         metrics_entry["env_positive_dx_envs"] = pos_envs
-                        metrics_entry["env_positive_dx_ratio"] = float(pos_envs) / float(env_last_x.size)
-                        # 自适应调度：基于 env_positive_dx_ratio 调整 distance_weight & entropy_beta
+                        metrics_entry["env_positive_dx_ratio"] = float(
+                            pos_envs
+                        ) / float(env_last_x.size)
+                        # 自适应调度：使用 AdaptiveScheduler（全局单例）
                         try:
-                            adaptive = getattr(cfg, 'adaptive_cfg', None)
-                            if adaptive and 'env_positive_dx_ratio' in metrics_entry:
-                                ratio = float(metrics_entry['env_positive_dx_ratio'])
-                                # 保存窗口历史（放在外部 dict 上）
-                                hist = adaptive.setdefault('_ratio_hist', [])
-                                hist.append(ratio)
-                                if len(hist) > adaptive['dx_window']:
-                                    del hist[0:len(hist)-adaptive['dx_window']]
-                                avg_ratio = sum(hist)/len(hist)
-                                metrics_entry['adaptive_ratio_avg'] = round(avg_ratio,4)
-                                # Distance weight adaptive (仅当 wrapper 支持 & 提供范围)
-                                dw_max = adaptive.get('dw_max'); dw_min = adaptive.get('dw_min')
-                                if dw_max is not None and dw_min is not None and dw_max > dw_min:
-                                    # 当前使用值（以 env_cfg.reward_config.distance_weight 为中心，允许在区间内插值）
-                                    # 为避免直接写 wrapper 内部对象导致线程不安全，采用 early shaping 差值策略：维护一个运行时 delta 系数
-                                    run_adapt = adaptive.setdefault('_dw_runtime', env_cfg.reward_config.distance_weight)
-                                    target = run_adapt
-                                    if avg_ratio < adaptive['dw_low']:
-                                        # 提升 -> 向 dw_max 方向插值
-                                        target = run_adapt + (dw_max - run_adapt) * adaptive['dw_lr']
-                                    elif avg_ratio > adaptive['dw_high']:
-                                        target = run_adapt + (dw_min - run_adapt) * adaptive['dw_lr']
-                                    # 裁剪
-                                    target = min(dw_max, max(dw_min, target))
-                                    adaptive['_dw_runtime'] = target
-                                    metrics_entry['adaptive_distance_weight'] = target
-                                # Entropy beta adaptive
-                                ent_max = adaptive.get('ent_max'); ent_min = adaptive.get('ent_min')
-                                if ent_max is not None and ent_min is not None and ent_max > ent_min:
-                                    run_ent = adaptive.setdefault('_ent_runtime', cfg.optimizer.beta_entropy)
-                                    ent_target = run_ent
-                                    if avg_ratio < adaptive['ent_low']:
-                                        ent_target = run_ent + (ent_max - run_ent) * adaptive['ent_lr']
-                                    elif avg_ratio > adaptive['ent_high']:
-                                        ent_target = run_ent + (ent_min - run_ent) * adaptive['ent_lr']
-                                    ent_target = min(ent_max, max(ent_min, ent_target))
-                                    adaptive['_ent_runtime'] = ent_target
-                                    # 立即更新 cfg.optimizer.beta_entropy 供下个 loss 使用
-                                    cfg.optimizer = dataclasses.replace(cfg.optimizer, beta_entropy=ent_target)
-                                    metrics_entry['adaptive_entropy_beta'] = ent_target
-                        except Exception as _adapt_e:  # 仅记录，不中断训练
-                            metrics_entry['adaptive_error'] = str(_adapt_e)[:120]
+                            if "adaptive_scheduler_obj" not in globals():
+                                adaptive_cfg = getattr(cfg, "adaptive_cfg", None)
+                                if isinstance(adaptive_cfg, AdaptiveConfig):
+                                    base_dw = 0.0
+                                    try:
+                                        base_dw = float(
+                                            getattr(
+                                                getattr(cfg.env, "env"),
+                                                "reward_config",
+                                            ).distance_weight
+                                        )  # type: ignore[attr-defined]
+                                    except Exception:
+                                        pass
+                                    globals()["adaptive_scheduler_obj"] = AdaptiveScheduler(
+                                        adaptive_cfg, base_dw, cfg.optimizer.beta_entropy
+                                    )
+                            sched = globals().get("adaptive_scheduler_obj")
+                            if sched and sched.enabled():
+                                new_dw, new_ent, adapt_metrics = sched.step(
+                                    metrics_entry["env_positive_dx_ratio"]
+                                )
+                                metrics_entry.update(adapt_metrics)
+                                if new_ent is not None:
+                                    cfg.optimizer = dataclasses.replace(
+                                        cfg.optimizer, beta_entropy=float(new_ent)
+                                    )
+                                if new_dw is not None:
+                                    metrics_entry["adaptive_distance_weight_effective"] = float(
+                                        new_dw
+                                    )
+                        except Exception as _adapt_e:
+                            metrics_entry["adaptive_error"] = str(_adapt_e)[:120]
                 except Exception:
                     pass
                 # Plateau 检测：若 secondary_script 尚未触发，满足 threshold 且 max_x 未超过 baseline
@@ -2122,27 +2931,46 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         and not secondary_script_state["triggered"]
                         and update_idx >= secondary_script_threshold
                     ):
-                        current_global_max = int(env_max_x.max()) if env_max_x.size else 0
+                        current_global_max = (
+                            int(env_max_x.max()) if env_max_x.size else 0
+                        )
                         if secondary_script_state["plateau_baseline"] == 0:
-                            secondary_script_state["plateau_baseline"] = current_global_max
+                            secondary_script_state["plateau_baseline"] = (
+                                current_global_max
+                            )
                         # 若当前 max 仍不大于 baseline（允许等于）则触发
-                        if current_global_max <= secondary_script_state["plateau_baseline"]:
-                            secondary_script_state["remaining"] = secondary_script_frames * cfg.env.num_envs
+                        if (
+                            current_global_max
+                            <= secondary_script_state["plateau_baseline"]
+                        ):
+                            secondary_script_state["remaining"] = (
+                                secondary_script_frames * cfg.env.num_envs
+                            )
                             secondary_script_state["triggered"] = True
-                            print(f"[train][secondary-script] 触发二次脚本注入 baseline={secondary_script_state['plateau_baseline']} frames={secondary_script_frames}")
+                            print(
+                                f"[train][secondary-script] 触发二次脚本注入 baseline={secondary_script_state['plateau_baseline']} frames={secondary_script_frames}"
+                            )
                             metrics_entry["secondary_script_triggered"] = 1
                         else:
                             metrics_entry["secondary_script_progress_surpassed"] = 1
                     if secondary_script_state["triggered"]:
-                        metrics_entry["secondary_script_remaining"] = int(secondary_script_state["remaining"])
+                        metrics_entry["secondary_script_remaining"] = int(
+                            secondary_script_state["remaining"]
+                        )
                 except Exception:
                     pass
                 # 追加 auto-bootstrap 状态与诊断字段，便于外部快速判断是否已触发/剩余帧数
                 try:
-                    metrics_entry["auto_bootstrap_triggered"] = 1 if auto_bootstrap_state.get("triggered") else 0
-                    metrics_entry["auto_bootstrap_remaining"] = int(auto_bootstrap_state.get("remaining", 0))
+                    metrics_entry["auto_bootstrap_triggered"] = (
+                        1 if auto_bootstrap_state.get("triggered") else 0
+                    )
+                    metrics_entry["auto_bootstrap_remaining"] = int(
+                        auto_bootstrap_state.get("remaining", 0)
+                    )
                     if auto_bootstrap_state.get("action_id") is not None:
-                        metrics_entry["auto_bootstrap_action_id"] = int(auto_bootstrap_state.get("action_id"))
+                        metrics_entry["auto_bootstrap_action_id"] = int(
+                            auto_bootstrap_state.get("action_id")
+                        )
                 except Exception:
                     pass
                 # 若累计距离仍为 0，输出一次额外诊断（每 50 updates 最多一次，避免刷屏）
@@ -2153,10 +2981,16 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         and update_idx % 50 == 0
                     ):
                         # 采样前若干 env 的最近 x / max / prev_step 差异
-                        sample_n = min(4, env_last_x.shape[0]) if hasattr(env_last_x, 'shape') else 0
+                        sample_n = (
+                            min(4, env_last_x.shape[0])
+                            if hasattr(env_last_x, "shape")
+                            else 0
+                        )
                         if sample_n > 0:
                             last_sample = [int(env_last_x[i]) for i in range(sample_n)]
-                            prev_sample = [int(env_prev_step_x[i]) for i in range(sample_n)]
+                            prev_sample = [
+                                int(env_prev_step_x[i]) for i in range(sample_n)
+                            ]
                             max_sample = [int(env_max_x[i]) for i in range(sample_n)]
                             print(
                                 f"[train][diag] update={update_idx} zero-distance persists last_x={last_sample} prev_x={prev_sample} max_x={max_sample} "
@@ -2169,62 +3003,108 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 try:
                     if milestone_interval > 0:
                         metrics_entry["milestone_count"] = int(milestone_state["count"])
-                        metrics_entry["milestone_next"] = int(milestone_state["next"]) if milestone_state["next"] is not None else -1
+                        metrics_entry["milestone_next"] = (
+                            int(milestone_state["next"])
+                            if milestone_state["next"] is not None
+                            else -1
+                        )
                     if episode_timeout_steps > 0:
-                        metrics_entry["episode_timeout_steps"] = int(episode_timeout_steps)
+                        metrics_entry["episode_timeout_steps"] = int(
+                            episode_timeout_steps
+                        )
                 except Exception:
                     pass
                 # 若存在 forward 探测结果，仅在首个 log 写入一次（前 8 个）
                 if forward_probe_result is not None and update_idx == global_update:
-                    for i, (aid, dx_probe, last_x_probe) in enumerate(forward_probe_result[:8]):
+                    for i, (aid, dx_probe, last_x_probe) in enumerate(
+                        forward_probe_result[:8]
+                    ):
                         metrics_entry[f"probe_action_{i}_id"] = aid
                         metrics_entry[f"probe_action_{i}_dx"] = dx_probe
                         metrics_entry[f"probe_action_{i}_last_x"] = last_x_probe
-                    metrics_entry["probe_forward_action_selected"] = int(getattr(args, 'forward_action_id', -1) if getattr(args, 'forward_action_id', None) is not None else -1)
+                    metrics_entry["probe_forward_action_selected"] = int(
+                        getattr(args, "forward_action_id", -1)
+                        if getattr(args, "forward_action_id", None) is not None
+                        else -1
+                    )
                 # 动作直方图（写入前 16 个 bins）
                 try:
                     total_actions = int(action_hist.sum())
                     if total_actions > 0:
                         for aid in range(min(16, action_hist.shape[0])):
                             if action_hist[aid] > 0:
-                                metrics_entry[f"action_freq_{aid}"] = float(action_hist[aid]) / total_actions
+                                metrics_entry[f"action_freq_{aid}"] = (
+                                    float(action_hist[aid]) / total_actions
+                                )
                 except Exception:
                     pass
                 # 如果当前轮进行了 PER 抽样，添加采样耗时指标
                 if per_buffer is not None:
                     sampled = bool(per_metrics.get("sampled"))
-                    sample_time = float(per_metrics.get("sample_time_ms", 0.0)) if sampled else 0.0
+                    sample_time = (
+                        float(per_metrics.get("sample_time_ms", 0.0))
+                        if sampled
+                        else 0.0
+                    )
                     metrics_entry["replay_sample_time_ms"] = sample_time
                     timings = per_metrics.get("timings", {}) if sampled else {}
                     for k in ("prior", "choice", "weight", "decode", "tensor", "total"):
-                        metrics_entry[f"replay_sample_split_{k}_ms"] = float(timings.get(k, 0.0)) if sampled else 0.0
+                        metrics_entry[f"replay_sample_split_{k}_ms"] = (
+                            float(timings.get(k, 0.0)) if sampled else 0.0
+                        )
                 # 静态配置：per_sample_interval 直接写入，便于外部解析
-                metrics_entry["replay_per_sample_interval"] = int(cfg.replay.per_sample_interval) if per_buffer is not None else 0
+                metrics_entry["replay_per_sample_interval"] = (
+                    int(cfg.replay.per_sample_interval) if per_buffer is not None else 0
+                )
 
                 # PER stats (if enabled)
                 if per_buffer is not None:
                     rstats = per_buffer.stats()
-                    metrics_entry.update({
-                        "replay_size": rstats["size"],
-                        "replay_capacity": rstats["capacity"],
-                        "replay_fill_rate": rstats["fill_rate"],
-                        "replay_last_unique_ratio": rstats["last_sample_unique_ratio"],
-                        "replay_avg_unique_ratio": rstats.get("avg_sample_unique_ratio", 0.0),
-                        "replay_push_total": rstats.get("push_total", 0),
-                        "replay_priority_mean": rstats.get("priority_mean", 0.0),
-                        "replay_priority_p50": rstats.get("priority_p50", 0.0),
-                        "replay_priority_p90": rstats.get("priority_p90", 0.0),
-                        "replay_priority_p99": rstats.get("priority_p99", 0.0),
-                    })
+                    metrics_entry.update(
+                        {
+                            "replay_size": rstats["size"],
+                            "replay_capacity": rstats["capacity"],
+                            "replay_fill_rate": rstats["fill_rate"],
+                            "replay_last_unique_ratio": rstats[
+                                "last_sample_unique_ratio"
+                            ],
+                            "replay_avg_unique_ratio": rstats.get(
+                                "avg_sample_unique_ratio", 0.0
+                            ),
+                            "replay_push_total": rstats.get("push_total", 0),
+                            "replay_priority_mean": rstats.get("priority_mean", 0.0),
+                            "replay_priority_p50": rstats.get("priority_p50", 0.0),
+                            "replay_priority_p90": rstats.get("priority_p90", 0.0),
+                            "replay_priority_p99": rstats.get("priority_p99", 0.0),
+                        }
+                    )
                     try:
-                        writer.add_scalar("Replay/fill_rate", rstats["fill_rate"], global_step)
-                        writer.add_scalar("Replay/last_unique_ratio", rstats["last_sample_unique_ratio"], global_step)
+                        writer.add_scalar(
+                            "Replay/fill_rate", rstats["fill_rate"], global_step
+                        )
+                        writer.add_scalar(
+                            "Replay/last_unique_ratio",
+                            rstats["last_sample_unique_ratio"],
+                            global_step,
+                        )
                         if "avg_sample_unique_ratio" in rstats:
-                            writer.add_scalar("Replay/avg_unique_ratio", rstats["avg_sample_unique_ratio"], global_step)
+                            writer.add_scalar(
+                                "Replay/avg_unique_ratio",
+                                rstats["avg_sample_unique_ratio"],
+                                global_step,
+                            )
                         writer.add_scalar("Replay/size", rstats["size"], global_step)
                         if "priority_mean" in rstats:
-                            writer.add_scalar("Replay/priority_mean", rstats["priority_mean"], global_step)
-                            writer.add_scalar("Replay/priority_p90", rstats["priority_p90"], global_step)
+                            writer.add_scalar(
+                                "Replay/priority_mean",
+                                rstats["priority_mean"],
+                                global_step,
+                            )
+                            writer.add_scalar(
+                                "Replay/priority_p90",
+                                rstats["priority_p90"],
+                                global_step,
+                            )
                     except Exception:
                         pass
 
@@ -2250,8 +3130,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         stagnation_update_counter = 0
                     else:
                         stagnation_update_counter += 1
-                        if stagnation_warn_updates > 0 and stagnation_update_counter >= stagnation_warn_updates:
-                            print(f"[train][warn] Progress stagnation: no global max_x improvement for {stagnation_update_counter} updates (max_x={prev_global_max_x}).")
+                        if (
+                            stagnation_warn_updates > 0
+                            and stagnation_update_counter >= stagnation_warn_updates
+                        ):
+                            print(
+                                f"[train][warn] Progress stagnation: no global max_x improvement for {stagnation_update_counter} updates (max_x={prev_global_max_x})."
+                            )
                             stagnation_update_counter = 0  # 重置避免刷屏
                 except Exception:
                     pass
@@ -2264,8 +3149,12 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         if torch.cuda.is_available():
                             stats["gpu_count"] = torch.cuda.device_count()
                             for gi in range(torch.cuda.device_count()):
-                                stats[f"gpu_{gi}_mem_alloc_bytes"] = float(torch.cuda.memory_allocated(gi))
-                                stats[f"gpu_{gi}_mem_reserved_bytes"] = float(torch.cuda.memory_reserved(gi))
+                                stats[f"gpu_{gi}_mem_alloc_bytes"] = float(
+                                    torch.cuda.memory_allocated(gi)
+                                )
+                                stats[f"gpu_{gi}_mem_reserved_bytes"] = float(
+                                    torch.cuda.memory_reserved(gi)
+                                )
                     except Exception:
                         pass
 
@@ -2276,9 +3165,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                             "--query-gpu=utilization.gpu,memory.used,memory.total",
                             "--format=csv,noheader,nounits",
                         ]
-                        res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+                        res = subprocess.run(
+                            cmd, capture_output=True, text=True, timeout=2
+                        )
                         if res.returncode == 0 and res.stdout.strip():
-                            lines = [l for l in res.stdout.strip().splitlines() if l.strip()]
+                            lines = [
+                                line_var for line_var in res.stdout.strip().splitlines() if line_var.strip()
+                            ]
                             for idx, line in enumerate(lines):
                                 parts = [p.strip() for p in line.split(",")]
                                 if len(parts) >= 3:
@@ -2294,10 +3187,16 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     if psutil is not None:
                         try:
                             p = psutil.Process()
-                            stats["proc_cpu_percent"] = float(p.cpu_percent(interval=None))
+                            stats["proc_cpu_percent"] = float(
+                                p.cpu_percent(interval=None)
+                            )
                             stats["proc_mem_rss_bytes"] = float(p.memory_info().rss)
-                            stats["system_cpu_percent"] = float(psutil.cpu_percent(interval=None))
-                            stats["system_mem_percent"] = float(psutil.virtual_memory().percent)
+                            stats["system_cpu_percent"] = float(
+                                psutil.cpu_percent(interval=None)
+                            )
+                            stats["system_mem_percent"] = float(
+                                psutil.virtual_memory().percent
+                            )
                             collected = True
                         except Exception:
                             pass
@@ -2317,7 +3216,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     last_resource_log = current_time
                     for name, val in stats.items():
                         try:
-                            writer.add_scalar(f"Resource/{name}", float(val), global_step)
+                            writer.add_scalar(
+                                f"Resource/{name}", float(val), global_step
+                            )
                         except Exception:
                             pass
                     if wandb_run is not None and stats:
@@ -2341,8 +3242,16 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         metrics_entry["gpu_util_last"] = util_mean_snapshot
                         metrics_entry["gpu_util_mean_window"] = float(np.mean(gpu_hist))
                         try:
-                            writer.add_scalar("Resource/gpu_util_last", util_mean_snapshot, global_step)
-                            writer.add_scalar("Resource/gpu_util_mean_window", float(np.mean(gpu_hist)), global_step)
+                            writer.add_scalar(
+                                "Resource/gpu_util_last",
+                                util_mean_snapshot,
+                                global_step,
+                            )
+                            writer.add_scalar(
+                                "Resource/gpu_util_mean_window",
+                                float(np.mean(gpu_hist)),
+                                global_step,
+                            )
                         except Exception:
                             pass
 
@@ -2353,7 +3262,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     and update_idx >= auto_bootstrap_threshold
                     and int(metrics_entry.get("env_distance_delta_sum", 0) or 0) <= 0
                 ):
-                    auto_bootstrap_state["remaining"] = auto_bootstrap_frames * cfg.env.num_envs
+                    auto_bootstrap_state["remaining"] = (
+                        auto_bootstrap_frames * cfg.env.num_envs
+                    )
                     auto_bootstrap_state["triggered"] = True
                     auto_bootstrap_state["announced_done"] = False
                     if not auto_bootstrap_state.get("announced_start", False):
@@ -2374,14 +3285,24 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     pass
 
                 # 训练健康度检查：长时间没有完成 episode 可能意味着仍在使用 Dummy env（历史 bug）或奖励逻辑异常
-                if update_idx > 0 and len(completed_returns) == 0 and update_idx % (cfg.log_interval * 10) == 0:
-                    print("[train][warn] No completed episodes yet – verify environments are real (not Dummy) and reward/done signals are propagating.")
+                if (
+                    update_idx > 0
+                    and len(completed_returns) == 0
+                    and update_idx % (cfg.log_interval * 10) == 0
+                ):
+                    print(
+                        "[train][warn] No completed episodes yet – verify environments are real (not Dummy) and reward/done signals are propagating."
+                    )
 
                 last_log_time = now
                 last_log_step = global_step
                 last_log_update = update_idx
 
-            if cfg.checkpoint_interval and update_idx % cfg.checkpoint_interval == 0 and update_idx > 0:
+            if (
+                cfg.checkpoint_interval
+                and update_idx % cfg.checkpoint_interval == 0
+                and update_idx > 0
+            ):
                 checkpoint_path = save_checkpoint(
                     cfg,
                     model,
@@ -2392,31 +3313,49 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     update_idx,
                 )
                 print(f"[train] checkpoint saved -> {checkpoint_path}")
-                heartbeat.notify(phase="checkpoint", message=f"保存 {checkpoint_path.name}", progress=False)
+                heartbeat.notify(
+                    phase="checkpoint",
+                    message=f"保存 {checkpoint_path.name}",
+                    progress=False,
+                )
 
-            if cfg.eval_interval and update_idx % cfg.eval_interval == 0 and update_idx > 0:
+            if (
+                cfg.eval_interval
+                and update_idx % cfg.eval_interval == 0
+                and update_idx > 0
+            ):
                 save_model_snapshot(cfg, model, global_step, update_idx)
                 print("[train] latest snapshot refreshed")
-                heartbeat.notify(phase="checkpoint", message="最新快照已更新", progress=False)
+                heartbeat.notify(
+                    phase="checkpoint", message="最新快照已更新", progress=False
+                )
         # 首次 update 完成后做一次 debug 打印（仅一次）
         if update_idx == global_update:
             try:
                 mean_x_dbg = float(np.mean(env_last_x))
-                print(f"[train][debug] first_update_post_learn global_step={global_step} mean_x={mean_x_dbg:.1f} max_x={int(env_max_x.max())} distance_delta_sum={distance_delta_sum}")
+                print(
+                    f"[train][debug] first_update_post_learn global_step={global_step} mean_x={mean_x_dbg:.1f} max_x={int(env_max_x.max())} distance_delta_sum={distance_delta_sum}"
+                )
             except Exception:
                 pass
     except KeyboardInterrupt:
-        print("[train][warn] interrupted by user, attempting graceful shutdown & latest snapshot save")
-        heartbeat.notify(phase="interrupt", message="收到中断信号，保存最新模型", progress=False)
+        print(
+            "[train][warn] interrupted by user, attempting graceful shutdown & latest snapshot save"
+        )
+        heartbeat.notify(
+            phase="interrupt", message="收到中断信号，保存最新模型", progress=False
+        )
         try:
             snap_path = save_model_snapshot(cfg, model, global_step, update_idx)  # type: ignore[name-defined]
             # 更新 metadata reason=interrupt
             try:
-                meta_file = snap_path.with_suffix('.json')
+                meta_file = snap_path.with_suffix(".json")
                 if meta_file.exists():
-                    meta = json.loads(meta_file.read_text(encoding='utf-8'))
-                    meta['save_state']['reason'] = 'interrupt'
-                    meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                    meta["save_state"]["reason"] = "interrupt"
+                    meta_file.write_text(
+                        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
             except Exception:
                 pass
         except Exception as exc:  # noqa: BLE001
@@ -2427,11 +3366,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         try:
             snap_path = save_model_snapshot(cfg, model, global_step, update_idx)  # type: ignore[name-defined]
             try:
-                meta_file = snap_path.with_suffix('.json')
+                meta_file = snap_path.with_suffix(".json")
                 if meta_file.exists():
-                    meta = json.loads(meta_file.read_text(encoding='utf-8'))
-                    meta['save_state']['reason'] = 'exception'
-                    meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                    meta["save_state"]["reason"] = "exception"
+                    meta_file.write_text(
+                        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
             except Exception:
                 pass
             print("[train][info] latest snapshot saved after exception")
@@ -2456,12 +3397,12 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     except Exception:
         pass
     try:
-        if 'writer' in locals() and writer is not None:
+        if "writer" in locals() and writer is not None:
             writer.close()
     except Exception:
         pass
     try:
-        if 'wandb_run' in locals() and wandb_run is not None:
+        if "wandb_run" in locals() and wandb_run is not None:
             wandb_run.finish()
     except Exception:
         pass

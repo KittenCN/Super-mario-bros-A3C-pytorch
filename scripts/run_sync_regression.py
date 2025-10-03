@@ -2,15 +2,16 @@
 
 Usage: python scripts/run_sync_regression.py --trials 5 --num-envs 4
 """
+
 from __future__ import annotations
 
 import argparse
 import json
+import random
 import time
 from pathlib import Path
-import random
 
-from src.envs import MarioEnvConfig, MarioVectorEnvConfig, create_vector_env
+from src.envs import MarioVectorEnvConfig, create_vector_env
 
 OUT = Path("env_stability_report.jsonl")
 

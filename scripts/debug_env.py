@@ -1,11 +1,12 @@
-from src.envs.mario import MarioEnvConfig, MarioVectorEnvConfig, create_vector_env
 import time
+
+from src.envs.mario import MarioEnvConfig, MarioVectorEnvConfig, create_vector_env
 
 cfg = MarioVectorEnvConfig(
     num_envs=1,
     asynchronous=False,
     stage_schedule=((1, 1),),
-    env=MarioEnvConfig(world=1, stage=1)
+    env=MarioEnvConfig(world=1, stage=1),
 )
 
 print("Creating environment...")

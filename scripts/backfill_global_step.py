@@ -30,14 +30,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, UTC
 from typing import List
 
 
 def iter_metadata_files(root: Path) -> List[Path]:
-    patterns = ["a3c_world", "_latest.json", ".json"]
     results: List[Path] = []
     for p in root.rglob("*.json"):
         name = p.name
@@ -94,7 +92,10 @@ def backfill_file(
     if backup:
         bak = path.with_suffix(path.suffix + ".bak")
         if not bak.exists():
-            bak.write_text(json.dumps(load_json(path), indent=2, ensure_ascii=False), encoding="utf-8")
+            bak.write_text(
+                json.dumps(load_json(path), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
     dump_json(path, meta)
     return True, f"updated:{new_global_step}"
 
@@ -102,7 +103,12 @@ def backfill_file(
 def main():  # noqa: D401
     parser = argparse.ArgumentParser(description="回填历史 checkpoint global_step")
     parser.add_argument("--root", type=str, default="trained_models", help="扫描根目录")
-    parser.add_argument("--assume-rollout-steps", type=int, default=64, help="假设历史训练的 rollout_steps")
+    parser.add_argument(
+        "--assume-rollout-steps",
+        type=int,
+        default=64,
+        help="假设历史训练的 rollout_steps",
+    )
     parser.add_argument("--dry-run", action="store_true", help="仅打印将修改的文件")
     parser.add_argument("--no-backup", action="store_true", help="不生成 .bak 备份文件")
     parser.add_argument(
@@ -135,7 +141,9 @@ def main():  # noqa: D401
         else:
             skipped += 1
             print(f"[migrate][skip] {f.name}: {status}")
-    print(f"[migrate] done changed={changed} skipped={skipped} rollout_steps={args.assume_rollout_steps} dry_run={args.dry_run}")
+    print(
+        f"[migrate] done changed={changed} skipped={skipped} rollout_steps={args.assume_rollout_steps} dry_run={args.dry_run}"
+    )
     return 0
 
 

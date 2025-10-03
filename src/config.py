@@ -59,7 +59,9 @@ class ReplayBufferConfig:
     priority_beta_final: float = 1.0
     priority_beta_steps: int = 1_000_000
     enable: bool = True
-    per_sample_interval: int = 1  # 新增：间隔多少次 update 执行一次 PER 采样（1 表示每次）
+    per_sample_interval: int = (
+        1  # 新增：间隔多少次 update 执行一次 PER 采样（1 表示每次）
+    )
 
 
 @dataclasses.dataclass
@@ -96,7 +98,9 @@ class EvaluationConfig:
     env: MarioEnvConfig = dataclasses.field(default_factory=MarioEnvConfig)
 
 
-def create_default_stage_schedule(world: int, stage: int, span: int = 4) -> Sequence[Tuple[int, int]]:
+def create_default_stage_schedule(
+    world: int, stage: int, span: int = 4
+) -> Sequence[Tuple[int, int]]:
     stages = []
     for offset in range(span):
         stage_idx = (stage - 1 + offset) % 4 + 1

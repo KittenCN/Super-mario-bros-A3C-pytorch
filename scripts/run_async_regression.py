@@ -5,19 +5,20 @@ enforces a per-trial timeout. It captures stdout JSON from the worker and append
 into `env_stability_report.jsonl`. If a worker times out, the parent kills it and
 writes a failure entry.
 """
+
 from __future__ import annotations
 
 import argparse
+import glob
 import json
+import os
+import random
+import shutil
 import subprocess
 import sys
 import time
-from pathlib import Path
-import random
-import shutil
-import glob
-import os
 from datetime import datetime
+from pathlib import Path
 
 OUT = Path("env_stability_report.jsonl")
 WORKER = Path(__file__).parent / "async_trial_worker.py"
@@ -39,7 +40,7 @@ def run_trial(num_envs: int, seed: int, timeout: float) -> dict:
                 "seed": seed,
                 "reset_ok": False,
                 "duration": time.time() - start,
-                "error": repr(err or "no-output")
+                "error": repr(err or "no-output"),
             }
             # Save diagnostic files for this failed trial
             try:
@@ -152,8 +153,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trials", type=int, default=20)
     parser.add_argument("--num-envs", type=int, default=8)
-    parser.add_argument("--timeout", type=float, default=30.0, help="Seconds per trial before killing worker")
-    parser.add_argument("--prewarm-count", type=int, default=0, help="Number of times to prewarm in parent process before async trials")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="Seconds per trial before killing worker",
+    )
+    parser.add_argument(
+        "--prewarm-count",
+        type=int,
+        default=0,
+        help="Number of times to prewarm in parent process before async trials",
+    )
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
     seed_base = args.seed if args.seed is not None else random.randrange(1 << 30)
@@ -163,25 +174,36 @@ def main():
     # Optional parent prewarm: perform a number of synchronous env constructions
     if args.prewarm_count and args.prewarm_count > 0:
         try:
-            print(f"[async-reg] parent prewarm: running {args.prewarm_count} synchronous env constructions")
+            print(
+                f"[async-reg] parent prewarm: running {args.prewarm_count} synchronous env constructions"
+            )
             # local import to avoid importing heavy modules unless needed
             from src.envs import MarioVectorEnvConfig, create_vector_env
 
             for i in range(args.prewarm_count):
                 try:
                     cseed = seed_base + i
-                    pcfg = MarioVectorEnvConfig(num_envs=1, asynchronous=False, stage_schedule=((1, 1),), base_seed=cseed)
+                    pcfg = MarioVectorEnvConfig(
+                        num_envs=1,
+                        asynchronous=False,
+                        stage_schedule=((1, 1),),
+                        base_seed=cseed,
+                    )
                     env = create_vector_env(pcfg)
                     env.reset(seed=cseed)
                     env.close()
-                    print(f"[async-reg] prewarm {i+1}/{args.prewarm_count} ok (seed={cseed})")
+                    print(
+                        f"[async-reg] prewarm {i+1}/{args.prewarm_count} ok (seed={cseed})"
+                    )
                 except Exception as e:
                     print(f"[async-reg] prewarm {i+1} failed: {e}")
         except Exception as e:
             print(f"[async-reg] parent prewarm overall failed: {e}")
     for i in range(args.trials):
         seed = seed_base + i
-        print(f"[async-reg] trial {i+1}/{args.trials} seed={seed} num_envs={args.num_envs}")
+        print(
+            f"[async-reg] trial {i+1}/{args.trials} seed={seed} num_envs={args.num_envs}"
+        )
         entry = run_trial(args.num_envs, seed, timeout=args.timeout)
         try:
             with OUT.open("a", encoding="utf-8") as f:
