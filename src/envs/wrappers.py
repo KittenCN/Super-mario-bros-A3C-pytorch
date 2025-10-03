@@ -17,6 +17,31 @@ finally:
     sys.stderr = _saved_stderr
 
 
+def _coerce_scalar(value: Any) -> Any:
+    """尽可能将 numpy 数组 / 序列压缩为标量，失败则返回原值。"""
+
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return None
+        try:
+            value = value.reshape(-1)[0]
+        except Exception:
+            try:
+                value = value.item()
+            except Exception:
+                return value
+    if hasattr(value, "item") and not isinstance(value, (bytes, bytearray)):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        return _coerce_scalar(value[0])
+    return value
+
+
 @dataclasses.dataclass
 class RewardConfig:
     """Configuration for reward shaping."""
@@ -69,6 +94,7 @@ class MarioRewardWrapper(gym.Wrapper):
         self._ram_debug_prints: int = 0  # 限制调试输出次数
         # 最近一次 step 的诊断快照（避免直接引用 info 被外部修改）
         self._last_diag: Dict[str, Any] = {}
+        self._dx_missed_warn: int = 0
 
     # ---- Runtime adaptive setters ----
     def set_distance_weight(self, new_weight: float) -> None:
@@ -96,73 +122,52 @@ class MarioRewardWrapper(gym.Wrapper):
         metrics = info.get("metrics") if isinstance(info, dict) else None
         if metrics and isinstance(metrics, dict):
             # score 可能以 numpy array 形式存在，如 array([0])
-            raw_score = metrics.get("score")
+            raw_score = _coerce_scalar(metrics.get("score"))
             if raw_score is not None:
-                try:
-                    if hasattr(raw_score, "item"):
-                        raw_score = raw_score.item()
-                    elif hasattr(raw_score, "__len__") and len(raw_score) > 0:
-                        raw_score = raw_score[0]
-                except Exception:
-                    pass
-                info.setdefault("score", raw_score)
-        self._prev_score = info.get("score", 0)
-        # 记录初始 x_pos（如果可得）
-        x_pos = 0
-        if isinstance(info, dict):
-            if "x_pos" in info:
-                try:
-                    x_pos = int(info["x_pos"])
-                except Exception:
-                    pass
-            elif metrics and isinstance(metrics, dict):
-                raw_x = metrics.get("mario_x") or metrics.get("x_pos")
-                if raw_x is not None:
-                    try:
-                        if hasattr(raw_x, "item"):
-                            raw_x = raw_x.item()
-                        elif hasattr(raw_x, "__len__") and len(raw_x) > 0:
-                            raw_x = raw_x[0]
-                        x_pos = int(raw_x)
-                    except Exception:
-                        pass
+                info["score"] = raw_score
+        score_initial = _coerce_scalar(info.get("score", 0))
+        self._prev_score = float(score_initial) if isinstance(score_initial, (int, float)) else 0.0
+        # 记录初始 x_pos（优先 metrics 再回退 info）
+        metrics_x = (
+            _coerce_scalar(metrics.get("mario_x") or metrics.get("x_pos"))
+            if metrics and isinstance(metrics, dict)
+            else None
+        )
+        info_x = _coerce_scalar(info.get("x_pos")) if isinstance(info, dict) else None
+        if isinstance(metrics_x, (int, float)):
+            x_pos = int(metrics_x)
+            if isinstance(info, dict):
+                info["x_pos"] = x_pos
+        elif isinstance(info_x, (int, float)):
+            x_pos = int(info_x)
+        else:
+            x_pos = 0
         # 直接记录初始 x 但不视为已消耗首次增量，待下一步 step 时若有提升将 dx=当前值
         self._prev_x = x_pos
         self._first_progress_pending = True
+        self._dx_missed_warn = 0
         return observation, info
 
     def step(self, action):
         observation, reward, terminated, truncated, info = self.env.step(action)
         metrics = info.get("metrics") if isinstance(info, dict) else None
-        if metrics and isinstance(metrics, dict) and "score" not in info:
-            raw_score = metrics.get("score")
-            if raw_score is not None:
-                try:
-                    if hasattr(raw_score, "item"):
-                        raw_score = raw_score.item()
-                    elif hasattr(raw_score, "__len__") and len(raw_score) > 0:
-                        raw_score = raw_score[0]
-                except Exception:
-                    pass
-                info["score"] = raw_score
-        score = info.get("score", 0)
-        score_delta = score - self._prev_score
+        if metrics and isinstance(metrics, dict):
+            if "score" not in info:
+                raw_score = _coerce_scalar(metrics.get("score"))
+                if raw_score is not None:
+                    info["score"] = raw_score
+            metrics_x = _coerce_scalar(metrics.get("mario_x") or metrics.get("x_pos"))
+        else:
+            metrics_x = None
+        score = _coerce_scalar(info.get("score", 0)) or 0
+        score_delta = float(score) - float(self._prev_score)
         shaped_reward = reward + self.config.score_weight * score_delta
-        self._prev_score = score
+        self._prev_score = float(score)
 
         # 前向位移奖励（仅对正向增量，避免倒退产生负 shaping 干扰）
-        current_x = info.get("x_pos", None)
-        if current_x is None and metrics and isinstance(metrics, dict):
-            raw_x = metrics.get("mario_x") or metrics.get("x_pos")
-            if raw_x is not None:
-                try:
-                    if hasattr(raw_x, "item"):
-                        raw_x = raw_x.item()
-                    elif hasattr(raw_x, "__len__") and len(raw_x) > 0:
-                        raw_x = raw_x[0]
-                    current_x = int(raw_x)
-                except Exception:
-                    current_x = None
+        current_x = _coerce_scalar(info.get("x_pos", None))
+        if isinstance(metrics_x, (int, float)):
+            current_x = float(metrics_x)
         if not isinstance(current_x, (int, float)) and self.enable_ram_x_parse:
             # 尝试基于 RAM fallback
             try:
@@ -199,15 +204,16 @@ class MarioRewardWrapper(gym.Wrapper):
             except Exception:
                 self._ram_failure += 1
         if isinstance(current_x, (int, float)):
-            if self._first_progress_pending and float(current_x) > float(self._prev_x):
+            current_x = float(current_x)
+            if self._first_progress_pending and current_x > float(self._prev_x):
                 # 视为首次整体位移增量
-                dx = float(current_x)
+                dx = current_x
                 self._first_progress_pending = False
             else:
-                dx = float(current_x) - float(self._prev_x)
+                dx = current_x - float(self._prev_x)
             if dx > 0:
                 shaped_reward += self.config.distance_weight * dx
-            self._prev_x = float(current_x)
+            self._prev_x = current_x
             self._ram_last_x = (
                 int(current_x)
                 if isinstance(current_x, (int, float))
@@ -215,6 +221,27 @@ class MarioRewardWrapper(gym.Wrapper):
             )
         else:
             dx = 0.0
+            try:
+                if (
+                    current_x is None
+                    and self.config.distance_weight > 0
+                    and self._dx_missed_warn < 5
+                ):
+                    import os
+
+                    if os.environ.get("MARIO_SHAPING_DEBUG", "0") in {
+                        "1",
+                        "true",
+                        "on",
+                    }:
+                        print(
+                            "[reward][warn] dx_missed: no x_pos data "
+                            f"step={self._step_counter} distance_weight={self.config.distance_weight} "
+                            f"ram_enabled={self.enable_ram_x_parse} ram_fail={self._ram_failure}"
+                        )
+                        self._dx_missed_warn += 1
+            except Exception:  # pragma: no cover
+                pass
         # 诊断：若外部统计出现推进但本地 dx 始终 0，便于定位 (通过环境变量开关避免噪音)
         try:
             if dx == 0.0 and isinstance(current_x, (int, float)) and self.config.distance_weight > 0 and self._step_counter < 5:

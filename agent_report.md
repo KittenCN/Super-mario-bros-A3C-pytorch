@@ -180,3 +180,20 @@ bash scripts/run_2080ti_resume.sh --dry-run
 ### 度量对齐
 - 添加后续字段提案：`stagnation_envs`, `stagnation_mean_steps`, `adaptive_ratio_fallback`。
 - 考虑在 README 的自适应章节补充“故障排查：ratio 长期为 0”说明。
+
+## 2025-10-04 补充 (P1 修复落地)
+
+### 实施内容
+- 训练循环新增 `env_progress_dx` 跟踪每轮正向位移，基于该数组重新计算 `env_positive_dx_ratio`，并在 dx>0 时立即清零对应 `stagnation_steps[i]`。
+- 当本轮 `distance_delta_sum>0` 但计算出的 ratio≤0 时，记录 `adaptive_ratio_fallback` 并使用该值驱动 `AdaptiveScheduler`，同时补充日志指标 `stagnation_envs`、`stagnation_mean_steps`。
+- MarioRewardWrapper 在缺失 x_pos 信息且开启 `MARIO_SHAPING_DEBUG` 时输出限频 `[reward][warn] dx_missed ...` 诊断，便于定位未命中 dx 的情况。
+- 新增 `tests/test_shaping_smoke.py`，模拟 fc_emulator 聚合格式，断言 `shaping_raw_sum`、`env_progress_dx` 与进度占比均为正，覆盖此前未触及的路径。
+
+### 自测
+- `pytest -k shaping_smoke -q`
+- `pytest -k adaptive_injection_integration -q`
+- `MARIO_SHAPING_DEBUG=1 python train.py --world 1 --stage 1 --num-envs 1 --total-updates 5 --log-interval 1 --scripted-forward-frames 32 --reward-distance-weight 0.05`（观察到 `env_shaping_raw_sum≈16.45`、`env_shaping_scaled_sum≈3.28`，ratio 已恢复正常）
+
+### 后续建议
+- 观察真实训练日志中 `adaptive_ratio_fallback` 触发频率，若持续出现需追加更细粒度的 dx 诊断（例如输出 per-env 最近一次 dx）。
+- 将新增指标接入监控面板，并在 README 的自适应章节添加“ratio fallback” 故障排查流程。

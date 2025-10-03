@@ -99,6 +99,28 @@ except ImportError:  # pragma: no cover
     psutil = None  # type: ignore
 
 
+NUMERIC_TYPES = (int, float, np.integer, np.floating)
+
+
+def _scalar(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return None
+        try:
+            value = value.reshape(-1)[0]
+        except Exception:
+            try:
+                value = value.item()
+            except Exception:
+                return value
+    if hasattr(value, "item") and not isinstance(value, (bytes, bytearray)):
+        try:
+            return value.item()
+        except Exception:
+            return value
+    return value
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a Mario agent with modernised A3C"
@@ -1793,6 +1815,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     env_last_x = np.zeros(cfg.env.num_envs, dtype=np.int32)
     env_max_x = np.zeros(cfg.env.num_envs, dtype=np.int32)
     env_prev_step_x = np.zeros(cfg.env.num_envs, dtype=np.int32)
+    env_progress_dx = np.zeros(cfg.env.num_envs, dtype=np.int32)
     distance_delta_sum = 0  # 本 update 内累计正向位移
     shaping_raw_sum = 0.0
     shaping_scaled_sum = 0.0
@@ -2368,7 +2391,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                                 x_val = int(x_raw)
                                             except Exception:
                                                 x_val = None
-                                if isinstance(x_val, (int, float)):
+                                if isinstance(x_val, NUMERIC_TYPES):
                                     env_last_x[i_env] = int(x_val)
                                     if env_last_x[i_env] > env_max_x[i_env]:
                                         env_max_x[i_env] = env_last_x[i_env]
@@ -2404,6 +2427,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                         pass  # dx 已是完整跳跃
                                     if dx > 0:
                                         distance_delta_sum += dx
+                                        env_progress_dx[i_env] += int(dx)
                                         stagnation_steps[i_env] = 0
                                     else:
                                         stagnation_steps[i_env] += 1
@@ -2425,10 +2449,13 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                     if isinstance(shaping_inf, dict):
                                         try:
                                             # Early shaping：在窗口内动态放大 distance 权重（通过 dx 与 last dx scale 额外加成）
+                                            dx_candidate = _scalar(
+                                                shaping_inf.get("dx")
+                                            )
                                             if (
                                                 early_shaping_window > 0
                                                 and update_idx < early_shaping_window
-                                                and shaping_inf.get("dx")
+                                                and dx_candidate
                                             ):
                                                 # 推断期望覆盖权重
                                                 target_w = early_shaping_distance_weight
@@ -2453,15 +2480,17 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                                     )
                                                 )
                                                 dx_local = float(
-                                                    shaping_inf.get("dx", 0.0) or 0.0
+                                                    _scalar(dx_candidate) or 0.0
                                                 )
                                                 if dx_local > 0 and target_w > base_w:
                                                     extra = (
                                                         (target_w - base_w)
                                                         * dx_local
                                                         * float(
-                                                            shaping_inf.get(
-                                                                "scale", 1.0
+                                                            _scalar(
+                                                                shaping_inf.get(
+                                                                    "scale", 1.0
+                                                                )
                                                             )
                                                             or 1.0
                                                         )
@@ -2470,19 +2499,19 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                                     shaping_last_scaled += (
                                                         0.0  # 不覆盖最后刻度，仅累积
                                                     )
-                                            raw_v = shaping_inf.get("raw")
-                                            scaled_v = shaping_inf.get("scaled")
-                                            scale_v = shaping_inf.get("scale")
-                                            dx_v = shaping_inf.get("dx")
-                                            if isinstance(raw_v, (int, float)):
+                                            raw_v = _scalar(shaping_inf.get("raw"))
+                                            scaled_v = _scalar(shaping_inf.get("scaled"))
+                                            scale_v = _scalar(shaping_inf.get("scale"))
+                                            dx_v = _scalar(shaping_inf.get("dx"))
+                                            if isinstance(raw_v, NUMERIC_TYPES):
                                                 shaping_raw_sum += float(raw_v)
                                                 shaping_last_raw = float(raw_v)
-                                            if isinstance(scaled_v, (int, float)):
+                                            if isinstance(scaled_v, NUMERIC_TYPES):
                                                 shaping_scaled_sum += float(scaled_v)
                                                 shaping_last_scaled = float(scaled_v)
-                                            if isinstance(scale_v, (int, float)):
+                                            if isinstance(scale_v, NUMERIC_TYPES):
                                                 shaping_last_scale = float(scale_v)
-                                            if isinstance(dx_v, (int, float)):
+                                            if isinstance(dx_v, NUMERIC_TYPES):
                                                 shaping_last_dx = float(dx_v)
                                         except Exception:
                                             shaping_parse_fail += 1
@@ -2524,6 +2553,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                                 pass
                                             if dx > 0:
                                                 distance_delta_sum += dx
+                                                env_progress_dx[i_env] += int(dx)
                                                 stagnation_steps[i_env] = 0
                                             else:
                                                 stagnation_steps[i_env] += 1
@@ -2540,19 +2570,82 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                     if not isinstance(sh, dict):
                                         continue
                                     try:
-                                        raw_v = sh.get("raw")
-                                        scaled_v = sh.get("scaled")
-                                        scale_v = sh.get("scale")
-                                        dx_v = sh.get("dx")
-                                        if isinstance(raw_v, (int, float)):
+                                        raw_v = _scalar(sh.get("raw"))
+                                        scaled_v = _scalar(sh.get("scaled"))
+                                        scale_v = _scalar(sh.get("scale"))
+                                        dx_v = _scalar(sh.get("dx"))
+                                        if isinstance(raw_v, NUMERIC_TYPES):
                                             shaping_raw_sum += float(raw_v)
                                             shaping_last_raw = float(raw_v)
-                                        if isinstance(scaled_v, (int, float)):
+                                        if isinstance(scaled_v, NUMERIC_TYPES):
                                             shaping_scaled_sum += float(scaled_v)
                                             shaping_last_scaled = float(scaled_v)
-                                        if isinstance(scale_v, (int, float)):
+                                        if isinstance(scale_v, NUMERIC_TYPES):
                                             shaping_last_scale = float(scale_v)
-                                        if isinstance(dx_v, (int, float)):
+                                        if isinstance(dx_v, NUMERIC_TYPES):
+                                            shaping_last_dx = float(dx_v)
+                                    except Exception:
+                                        shaping_parse_fail += 1
+                            elif isinstance(shaping_batch, dict):
+                                try:
+                                    raw_arr = np.asarray(
+                                        shaping_batch.get("raw"), dtype=float
+                                    )
+                                except Exception:
+                                    raw_arr = None
+                                try:
+                                    scaled_arr = np.asarray(
+                                        shaping_batch.get("scaled"), dtype=float
+                                    )
+                                except Exception:
+                                    scaled_arr = None
+                                try:
+                                    scale_arr = np.asarray(
+                                        shaping_batch.get("scale"), dtype=float
+                                    )
+                                except Exception:
+                                    scale_arr = None
+                                try:
+                                    dx_arr = np.asarray(
+                                        shaping_batch.get("dx"), dtype=float
+                                    )
+                                except Exception:
+                                    dx_arr = None
+                                for idx_env in range(cfg.env.num_envs):
+                                    try:
+                                        raw_v = _scalar(
+                                            raw_arr[idx_env]
+                                            if raw_arr is not None
+                                            and raw_arr.size > idx_env
+                                            else None
+                                        )
+                                        scaled_v = _scalar(
+                                            scaled_arr[idx_env]
+                                            if scaled_arr is not None
+                                            and scaled_arr.size > idx_env
+                                            else None
+                                        )
+                                        scale_v = _scalar(
+                                            scale_arr[idx_env]
+                                            if scale_arr is not None
+                                            and scale_arr.size > idx_env
+                                            else None
+                                        )
+                                        dx_v = _scalar(
+                                            dx_arr[idx_env]
+                                            if dx_arr is not None
+                                            and dx_arr.size > idx_env
+                                            else None
+                                        )
+                                        if isinstance(raw_v, NUMERIC_TYPES):
+                                            shaping_raw_sum += float(raw_v)
+                                            shaping_last_raw = float(raw_v)
+                                        if isinstance(scaled_v, NUMERIC_TYPES):
+                                            shaping_scaled_sum += float(scaled_v)
+                                            shaping_last_scaled = float(scaled_v)
+                                        if isinstance(scale_v, NUMERIC_TYPES):
+                                            shaping_last_scale = float(scale_v)
+                                        if isinstance(dx_v, NUMERIC_TYPES):
                                             shaping_last_dx = float(dx_v)
                                     except Exception:
                                         shaping_parse_fail += 1
@@ -2877,81 +2970,108 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     "env_shaping_last_scaled": float(shaping_last_scaled),
                     "env_shaping_parse_fail": int(shaping_parse_fail),
                 }
-                # 估算本 update 内有正向增量的 env 数量（基于 stagnation_steps==0 且 env_last_x>0）
+                # 估算本 update 内有正向增量的 env 数量，并驱动自适应调度
+                progress_ratio = 0.0
+                fallback_ratio = None
+                progress_envs = 0
+                progress_dx_sum = int(np.sum(env_progress_dx))
                 try:
-                    if env_last_x.size:
-                        pos_envs = int(
-                            np.sum((env_last_x > 0) & (stagnation_steps == 0))
+                    env_count = int(getattr(env_last_x, "size", 0))
+                    if env_count:
+                        progress_envs = int(np.count_nonzero(env_progress_dx > 0))
+                    metrics_entry["env_positive_dx_envs"] = progress_envs
+                    if env_count:
+                        progress_ratio = float(progress_envs) / float(env_count)
+                        metrics_entry["stagnation_envs"] = int(
+                            np.count_nonzero(stagnation_steps > 0)
                         )
-                        metrics_entry["env_positive_dx_envs"] = pos_envs
-                        metrics_entry["env_positive_dx_ratio"] = float(
-                            pos_envs
-                        ) / float(env_last_x.size)
-                        # 自适应调度：使用 AdaptiveScheduler（全局单例）
-                        try:
-                            if "adaptive_scheduler_obj" not in globals():
-                                adaptive_cfg = getattr(cfg, "adaptive_cfg", None)
-                                if isinstance(adaptive_cfg, AdaptiveConfig):
-                                    base_dw = 0.0
-                                    try:
-                                        base_dw = float(
-                                            getattr(
-                                                getattr(cfg.env, "env"),
-                                                "reward_config",
-                                            ).distance_weight
-                                        )  # type: ignore[attr-defined]
-                                    except Exception:
-                                        pass
-                                    globals()["adaptive_scheduler_obj"] = AdaptiveScheduler(
-                                        adaptive_cfg, base_dw, cfg.optimizer.beta_entropy
-                                    )
-                            sched = globals().get("adaptive_scheduler_obj")
-                            if sched and sched.enabled():
-                                new_dw, new_ent, adapt_metrics = sched.step(
-                                    metrics_entry["env_positive_dx_ratio"]
+                        metrics_entry["stagnation_mean_steps"] = float(
+                            np.mean(stagnation_steps)
+                        )
+                    else:
+                        metrics_entry["stagnation_envs"] = 0
+                        metrics_entry["stagnation_mean_steps"] = 0.0
+                    if progress_ratio <= 0.0 and distance_delta_sum > 0:
+                        denom = float(env_count) if env_count else max(
+                            1.0, float(cfg.env.num_envs)
+                        )
+                        base_value = float(
+                            progress_dx_sum if progress_dx_sum > 0 else distance_delta_sum
+                        )
+                        fallback_ratio = min(1.0, base_value / denom)
+                        metrics_entry["adaptive_ratio_fallback"] = fallback_ratio
+                        progress_ratio = fallback_ratio
+                    metrics_entry["env_positive_dx_ratio"] = progress_ratio
+                    # 自适应调度：使用 AdaptiveScheduler（全局单例）
+                    try:
+                        if "adaptive_scheduler_obj" not in globals():
+                            adaptive_cfg = getattr(cfg, "adaptive_cfg", None)
+                            if isinstance(adaptive_cfg, AdaptiveConfig):
+                                base_dw = 0.0
+                                try:
+                                    base_dw = float(
+                                        getattr(
+                                            getattr(cfg.env, "env"),
+                                            "reward_config",
+                                        ).distance_weight
+                                    )  # type: ignore[attr-defined]
+                                except Exception:
+                                    pass
+                                globals()["adaptive_scheduler_obj"] = AdaptiveScheduler(
+                                    adaptive_cfg, base_dw, cfg.optimizer.beta_entropy
                                 )
-                                metrics_entry.update(adapt_metrics)
-                                if new_ent is not None:
-                                    cfg.optimizer = dataclasses.replace(
-                                        cfg.optimizer, beta_entropy=float(new_ent)
-                                    )
-                                if new_dw is not None:
-                                    metrics_entry["adaptive_distance_weight_effective"] = float(new_dw)
-                                    # 写回实际 reward wrapper（所有 env）以使 shaping 立即生效
+                        sched = globals().get("adaptive_scheduler_obj")
+                        if sched and sched.enabled():
+                            new_dw, new_ent, adapt_metrics = sched.step(progress_ratio)
+                            metrics_entry.update(adapt_metrics)
+                            if new_ent is not None:
+                                cfg.optimizer = dataclasses.replace(
+                                    cfg.optimizer, beta_entropy=float(new_ent)
+                                )
+                            if new_dw is not None:
+                                metrics_entry["adaptive_distance_weight_effective"] = float(
+                                    new_dw
+                                )
+                                # 写回实际 reward wrapper（所有 env）以使 shaping 立即生效
+                                try:
+                                    if hasattr(env, "envs"):
+                                        for _e in env.envs:  # type: ignore[attr-defined]
+                                            cur = _e
+                                            for _ in range(8):  # unwrap 深度限制
+                                                if cur is None:
+                                                    break
+                                                if cur.__class__.__name__.lower().startswith("mariorewardwrapper"):
+                                                    try:
+                                                        cur.set_distance_weight(float(new_dw))  # type: ignore[attr-defined]
+                                                        metrics_entry.setdefault(
+                                                            "wrapper_distance_weight",
+                                                            float(new_dw),
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                                    break
+                                                cur = getattr(cur, "env", None)
+                                except Exception:
+                                    pass
+                            else:
+                                # 即使本轮没有调度更新，也尝试记录一个 representative wrapper 的当前值（一次即可）
+                                if "wrapper_distance_weight" not in metrics_entry:
                                     try:
-                                        if hasattr(env, "envs"):
-                                            for _e in env.envs:  # type: ignore[attr-defined]
-                                                cur = _e
-                                                for _ in range(8):  # unwrap 深度限制
-                                                    if cur is None:
-                                                        break
-                                                    if cur.__class__.__name__.lower().startswith("mariorewardwrapper"):
-                                                        try:
-                                                            cur.set_distance_weight(float(new_dw))  # type: ignore[attr-defined]
-                                                            metrics_entry.setdefault("wrapper_distance_weight", float(new_dw))
-                                                        except Exception:
-                                                            pass
-                                                        break
-                                                    cur = getattr(cur, "env", None)
+                                        if hasattr(env, "envs") and env.envs:  # type: ignore[attr-defined]
+                                            cur = env.envs[0]
+                                            for _ in range(8):
+                                                if cur is None:
+                                                    break
+                                                if cur.__class__.__name__.lower().startswith("mariorewardwrapper") and hasattr(cur, "get_distance_weight"):
+                                                    metrics_entry["wrapper_distance_weight"] = float(
+                                                        cur.get_distance_weight()
+                                                    )  # type: ignore[attr-defined]
+                                                    break
+                                                cur = getattr(cur, "env", None)
                                     except Exception:
                                         pass
-                                else:
-                                    # 即使本轮没有调度更新，也尝试记录一个 representative wrapper 的当前值（一次即可）
-                                    if "wrapper_distance_weight" not in metrics_entry:
-                                        try:
-                                            if hasattr(env, "envs") and env.envs:  # type: ignore[attr-defined]
-                                                cur = env.envs[0]
-                                                for _ in range(8):
-                                                    if cur is None:
-                                                        break
-                                                    if cur.__class__.__name__.lower().startswith("mariorewardwrapper") and hasattr(cur, "get_distance_weight"):
-                                                        metrics_entry["wrapper_distance_weight"] = float(cur.get_distance_weight())  # type: ignore[attr-defined]
-                                                        break
-                                                    cur = getattr(cur, "env", None)
-                                        except Exception:
-                                            pass
-                        except Exception as _adapt_e:
-                            metrics_entry["adaptive_error"] = str(_adapt_e)[:120]
+                    except Exception as _adapt_e:
+                        metrics_entry["adaptive_error"] = str(_adapt_e)[:120]
                 except Exception:
                     pass
                 # Plateau 检测：若 secondary_script 尚未触发，满足 threshold 且 max_x 未超过 baseline
@@ -3151,6 +3271,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 shaping_last_scaled = 0.0
                 shaping_parse_fail = 0
                 action_hist[:] = 0
+                env_progress_dx[:] = 0
                 stagnation_steps[:] = 0
                 env_prev_step_x[:] = env_last_x
                 # 更新级别停滞检测（基于全局 max）

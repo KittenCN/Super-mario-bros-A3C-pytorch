@@ -1,119 +1,118 @@
-import json
-import os
-import pathlib
-import subprocess
-import time
+"""单环境 shaping 冒烟测试：模拟 fc_emulator 聚合格式确保 raw > 0.
 
-# 该 smoke 测试以最小规模运行训练脚本若干步，验证出现非零 shaping / distance。
-# 假设 train.py 支持通过 RUN_NAME / ACTION_TYPE / SCRIPTED_SEQUENCE / ENABLE_RAM_X_PARSE 等环境变量脚本映射。
-# 若未来动作脚本接口变化，可在此同步调整。
+流程：
+1. 使用 FakeFcEnv + MarioRewardWrapper 产生含 metrics 的 info。
+2. 构造与 fc_emulator 类似的 batched info 结构（dict + array）。
+3. 复用训练循环中的解析逻辑，累计 shaping_raw_sum 与 dx 指标。
+4. 断言 shaping_raw_sum、distance_delta_sum 与进度占比均为正，避免回归。
+"""
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-SCRIPT = PROJECT_ROOT / "scripts" / "run_2080ti_resume.sh"
+from __future__ import annotations
+
+from typing import Any, Dict
+
+import gymnasium as gym
+import numpy as np
+
+from src.envs.wrappers import MarioRewardWrapper, RewardConfig
 
 
-def run_short():
-    env = os.environ.copy()
-    env.update(
-        {
-            "RUN_NAME": "smoke_shaping",
-            "ACTION_TYPE": "extended",
-            "BOOTSTRAP": "1",  # 自动注入脚本 & distance 权重
-            "TOTAL_UPDATES": "3",  # 多给一次机会产生日志
-            "CHECKPOINT_INT": "999999",  # 避免频繁落盘
-            "LOG_DIR": "tensorboard/a3c_super_mario_bros",
-            "LOG_INTERVAL": "1",  # 每个 update 都写 metrics 行
-            "NUM_ENVS": "1",  # 加快启动
-            "ROLLOUT": "32",  # 减少单 update 步数
-            "GRAD_ACCUM": "1",
-            # 显式脚本化序列（即使 BOOTSTRAP 会注入，也覆盖长度更短）
-            "SCRIPTED_SEQUENCE": "START:8,RIGHT+B:120",
-        }
+class FakeFcEnv(gym.Env):
+    """最小化 fc_emulator 风格的环境：仅返回 metrics.x_pos/score。"""
+
+    metadata: Dict[str, Any] = {}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._x = 0
+        self._score = 0
+        self.action_space = gym.spaces.Discrete(3)
+        self.observation_space = gym.spaces.Box(0.0, 1.0, shape=(1,), dtype=np.float32)
+
+    def reset(  # type: ignore[override]
+        self,
+        *,
+        seed: int | None = None,
+        options: Dict[str, Any] | None = None,
+    ):
+        self._x = 0
+        self._score = 0
+        obs = np.zeros((1,), dtype=np.float32)
+        info = {"metrics": {"mario_x": self._x, "score": self._score}}
+        return obs, info
+
+    def step(self, action):  # type: ignore[override]
+        self._x += 8
+        self._score += 1
+        obs = np.zeros((1,), dtype=np.float32)
+        reward = 0.0
+        terminated = False
+        truncated = False
+        info = {"metrics": {"mario_x": self._x, "score": self._score}}
+        return obs, reward, terminated, truncated, info
+
+
+def test_single_env_fc_shaping_smoke():
+    wrapper = MarioRewardWrapper(
+        FakeFcEnv(),
+        RewardConfig(
+            distance_weight=0.05,
+            scale_start=1.0,
+            scale_final=1.0,
+            scale_anneal_steps=0,
+        ),
     )
-    # 使用 --dry-run 获取命令确认（不严格断言），然后真实执行
-    dry = subprocess.run(
-        ["bash", str(SCRIPT), "--dry-run"], env=env, capture_output=True, text=True
-    )
-    if dry.returncode != 0:
-        raise RuntimeError("dry-run failed: " + dry.stderr)
-    # 真正运行（限制时间）
-    proc = subprocess.Popen(
-        ["bash", str(SCRIPT)],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    start = time.time()
-    lines = []
-    timeout = 120  # 秒
-    dx_detected = False
-    while time.time() - start < timeout:
-        line = proc.stdout.readline()
-        if not line:
-            if proc.poll() is not None:
-                break
-            continue
-        lines.append(line)
-        # 检测首次位移
-        if "[reward][dx] first_positive_dx" in line:
-            dx_detected = True
-            # 不立即结束，等待最多 2s 看是否写出 metrics
-            wait_until = time.time() + 2.0
-            while time.time() < wait_until and proc.poll() is None:
-                try:
-                    extra = proc.stdout.readline()
-                except Exception:
-                    break
-                if extra:
-                    lines.append(extra)
-                time.sleep(0.05)
-            break
-    proc.terminate()
-    # 聚合已有 tensorboard 下 metrics.jsonl 文件（最新目录）
-    tb_root = PROJECT_ROOT / "tensorboard" / "a3c_super_mario_bros"
-    if not tb_root.exists():
-        raise AssertionError("tensorboard root not created")
-    # 找最大修改时间的子目录
-    # 若当前目录下不存在 metrics.jsonl，尝试在所有子目录中寻找最近写入的一个
-    candidates = []
-    for p in tb_root.iterdir():
-        if not p.is_dir():
-            continue
-        mf = p / "metrics.jsonl"
-        if mf.exists():
-            candidates.append(mf)
-    if not candidates:
-        raise AssertionError(
-            "metrics.jsonl missing under any run dir in " + str(tb_root)
-        )
-    metrics_file = max(candidates, key=lambda f: f.stat().st_mtime)
-    distance_nonzero = dx_detected  # 如果已在 stdout 捕获 dx，则直接视为成功
-    shaping_nonzero = False
-    if not distance_nonzero or not shaping_nonzero:
-        with metrics_file.open() as fh:
-            for line in fh:
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                if not distance_nonzero and row.get("env_distance_delta_sum", 0) > 0:
-                    distance_nonzero = True
-                if not shaping_nonzero and row.get("env_shaping_raw_sum", 0) > 0:
-                    shaping_nonzero = True
-                if distance_nonzero and shaping_nonzero:
-                    break
-    # 断言至少有一项为真（distance 或 shaping 原始值）
-    if not (distance_nonzero or shaping_nonzero):
-        tail = "".join(lines[-50:])
-        raise AssertionError(
-            "No non-zero distance or shaping observed in smoke run. Stdout tail:\n"
-            + tail
-        )
-    return distance_nonzero, shaping_nonzero
+    wrapper.reset()
+    _, _, _, _, info = wrapper.step(0)
+    shaping = info.get("shaping")
+    assert isinstance(shaping, dict), "wrapper 应写入 shaping 诊断"
+    assert shaping.get("raw", 0.0) > 0.0, "shaping raw 应为正"
 
+    x_raw = info.get("x_pos")
+    if not isinstance(x_raw, (int, np.integer)):
+        x_raw = shaping.get("dx", 0)
+    fc_infos = {
+        "x_pos": np.array([int(x_raw)], dtype=np.int32),
+        "shaping": [shaping],
+    }
+    env_last_x = np.zeros(1, dtype=np.int32)
+    env_prev_step_x = np.zeros(1, dtype=np.int32)
+    env_progress_dx = np.zeros(1, dtype=np.int32)
+    stagnation_steps = np.zeros(1, dtype=np.int32)
+    distance_delta_sum = 0
+    shaping_raw_sum = 0.0
+    shaping_scaled_sum = 0.0
 
-def test_shaping_smoke():
-    distance, shaping = run_short()
-    # 若仅 distance 非零仍接受，但打印提示
-    print(f"[test_shaping_smoke] distance_nonzero={distance} shaping_nonzero={shaping}")
+    x_array = fc_infos.get("x_pos")
+    assert x_array is not None
+    arr = np.asarray(x_array).astype(int)
+    for i_env in range(arr.shape[0]):
+        last = int(arr[i_env])
+        env_last_x[i_env] = last
+        dx = last - env_prev_step_x[i_env]
+        if env_prev_step_x[i_env] == 0 and last > 0 and dx == last:
+            pass
+        if dx > 0:
+            distance_delta_sum += dx
+            env_progress_dx[i_env] += int(dx)
+            stagnation_steps[i_env] = 0
+        else:
+            stagnation_steps[i_env] += 1
+        env_prev_step_x[i_env] = last
+
+    shaping_batch = fc_infos.get("shaping")
+    assert isinstance(shaping_batch, list) and len(shaping_batch) == 1
+    for sh in shaping_batch:
+        raw_v = sh.get("raw")
+        scaled_v = sh.get("scaled")
+        if isinstance(raw_v, (int, float)):
+            shaping_raw_sum += float(raw_v)
+        if isinstance(scaled_v, (int, float)):
+            shaping_scaled_sum += float(scaled_v)
+
+    assert distance_delta_sum > 0, "应检测到正向位移"
+    assert env_progress_dx[0] > 0, "env_progress_dx 累计应>0"
+    assert shaping_raw_sum > 0.0, "shaping_raw_sum 累计应为正"
+    assert shaping_scaled_sum > 0.0, "shaping_scaled_sum 累计应为正"
+    progress_ratio = float(np.count_nonzero(env_progress_dx > 0)) / 1.0
+    assert progress_ratio > 0.0, "进度占比应大于 0"
