@@ -222,20 +222,26 @@ class PrioritizedReplay:
             prio = priorities.detach().cpu().view(B).numpy()
             # 压缩
             if self._compress:
-                obs_comp = (observations.clamp(0, 1) * 255.0).to(torch.uint8).cpu()
+                obs_comp = (
+                    observations.clamp(0, 1).mul(255.0).to(torch.uint8).cpu()
+                )
             else:
                 obs_comp = observations.detach().cpu()
             act_cpu = act.detach().cpu()
             tgt_cpu = tgt.detach().cpu().to(self.target_values.dtype)
             adv_cpu = adv.detach().cpu().to(self.advantages.dtype)
-            for i in range(B):
-                self.obs_storage[self.pos].copy_(obs_comp[i])  # type: ignore[arg-type]
-                self.actions[self.pos].copy_(act_cpu[i])  # type: ignore[arg-type]
-                self.target_values[self.pos].copy_(tgt_cpu[i])  # type: ignore[arg-type]
-                self.advantages[self.pos].copy_(adv_cpu[i])  # type: ignore[arg-type]
-                self.priorities[self.pos] = float(prio[i]) + 1e-5
-                self.pos = (self.pos + 1) % self.capacity
-                self.size = min(self.size + 1, self.capacity)
+            if B == 0:
+                return
+            indices = (torch.arange(B, dtype=torch.long) + self.pos) % self.capacity
+            indices = indices.to(dtype=torch.long)
+            self.obs_storage.index_copy_(0, indices, obs_comp)  # type: ignore[arg-type]
+            self.actions.index_copy_(0, indices, act_cpu)  # type: ignore[arg-type]
+            self.target_values.index_copy_(0, indices, tgt_cpu)  # type: ignore[arg-type]
+            self.advantages.index_copy_(0, indices, adv_cpu)  # type: ignore[arg-type]
+            indices_np = indices.cpu().numpy()
+            self.priorities[indices_np] = prio.astype(np.float32) + 1e-5
+            self.pos = int((int(self.pos) + B) % self.capacity)
+            self.size = min(self.size + B, self.capacity)
             self.push_total += B
 
     def sample(self, batch_size: int) -> Optional[ReplaySample]:

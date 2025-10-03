@@ -16,7 +16,7 @@
 | P0-1 | 历史 checkpoint global_step=0 回填 | 旧 overlap 期间保存的 ckpt 步数缺失，影响统计/调度 | 学习率调度、曲线对齐失真 | P0 | 部分完成（run01、run_balanced 已回填；run_tput/exp_shaping1 待补充元数据） |
 | P0-2 | 训练中断安全退出一致性 | Ctrl+C 或 OOM 后是否完整 flush / 关闭 monitor / 保存 latest | 可能丢失进度 / 文件句柄未关 | P0 | 已完成 |
 | P0-3 | PER 间隔推送缺陷 | `per_sample_interval>1` 时仅在抽样轮 push，导致大量经验未入库 | 优先级样本分布失真、训练收敛失败 | P0 | 已完成（2025-10-02 拆分 push/sample 逻辑并补单测） |
-| P0-4 | GAE 回退 bootstrap 错误 | 非 V-trace 路径下 `compute_returns` 最后一帧使用当前 value 代替 bootstrap value，优势/目标被系统性低估 | 关闭 V-trace 或切换 GAE 时训练结果失真 | P0 | 新发现（需 hotfix 并补 smoke 测试） |
+| P0-4 | GAE 回退 bootstrap 错误 | 非 V-trace 路径下 `compute_returns` 最后一帧使用当前 value 代替 bootstrap value，优势/目标被系统性低估 | 关闭 V-trace 或切换 GAE 时训练结果失真 | P0 | 已完成（2025-10-04 修复并补充单测） |
 | P1-1 | metrics JSONL 结构化输出 | 当前依赖 stdout + (TB 目录为空问题)，缺少稳健数值日志 | 难以离线分析 | P1 | 已完成 |
 | P1-2 | TensorBoard 事件空目录调查 | 事件文件未生成 / writer 初始化逻辑验证 | 可视化受阻 | P1 | 已完成 (init 标记 + log_dir 输出) |
 | P1-3 | Overlap 模式性能基线基准 | 对比 overlap=on/off steps/s、GPU 利用率 | 不知真实收益 | P1 | 已完成 (脚本) |
@@ -25,15 +25,15 @@
 | P1-6 | 奖励分位数 / GPU 利用滑动窗口 | 增强奖励分布 & 资源趋势洞察 | 指标更全面 | P1 | 已完成 |
 | P1-7 | GPU 可用性降级告警 | `cuda` 不可用时训练静默退化为 CPU，SPS < 0.3，需提示或自动降级策略 | 训练耗时无限拉长、监控误判 | P1 | 已完成（`device auto` 提示 + `MARIO_ALLOW_CPU_AUTO` 开关） |
 | P1-8 | 推进统计与塑形验证 | 修复 `env_positive_dx_ratio`、新增 `env_progress_dx/stagnation_*`、塑形烟雾测试、稳态训练脚本 | 自适应调度失真、回归难定位 | P1 | 已完成 |
-| P1-9 | Cosine 调度步数缩放错误 | 余弦调度 `total_steps` 以 env step 计算，但 LR scheduler 每 update 仅前进一步，实际学习率几乎不衰减 | 学习率策略失效、长期保持初始值 | P1 | 新发现（调整 total_steps=total_updates，补回归测试） |
-| P1-10 | 构建超时线程未终止 | `call_with_timeout` 线程超时后仍在后台运行，环境构建失败时可能残留卡死 | 资源泄漏、后续构建不确定性 | P1 | 新发现（改用子进程或显式终止线程） |
+| P1-9 | Cosine 调度步数缩放错误 | 余弦调度 `total_steps` 以 env step 计算，但 LR scheduler 每 update 仅前进一步，实际学习率几乎不衰减 | 学习率策略失效、长期保持初始值 | P1 | 已完成（2025-10-04 对齐 update 计数并限幅 warmup） |
+| P1-10 | 构建超时线程未终止 | `call_with_timeout` 线程超时后仍在后台运行，环境构建失败时可能残留卡死 | 资源泄漏、后续构建不确定性 | P1 | 已完成（2025-10-04 加入 cancel_event 支持与超时清理） |
 | P2-1 | Checkpoint 回填脚本 & 自动迁移 | 单次运行修正所有 metadata JSON | 提升一致性 | P2 | 脚本已落库，待接入批量/CI |
 | P2-2 | Replay FP16 优势/价值存储 | 进一步减内存 (adv/value) 约 2x | 降低内存峰值 | P2 | 1–2 天 |
 | P2-3 | GPU 端 PER / 混合预取 | 减少 host->device 复制 | 提升吞吐 | P2 | 3–5 天 |
 | P2-4 | Structured Heartbeat Export | 心跳输出到单独 JSONL + 进程健康指标 | 稳定性分析 | P2 | 2 天 |
 | P2-5 | 自动学习率/熵调度策略 | 根据最近 return/entropy 自适应 | 更快收敛 | P2 | 3 天 |
-| P2-6 | metrics JSONL 并发写入 | Monitor 线程与训练线程并发写同一 JSONL，无锁保护 | 日志行可能交错或损坏 | P2 | 新发现（加写锁或拆分文件） |
-| P2-7 | PER push 逐元素 copy | `PrioritizedReplay.push` 逐条 `copy_`，大批量 push 时 CPU 压力大 | 大批量采样阻塞训练主循环 | P2 | 评估向量化写入或批量搬运 |
+| P2-6 | metrics JSONL 并发写入 | Monitor 线程与训练线程并发写同一 JSONL，无锁保护 | 日志行可能交错或损坏 | P2 | 已完成（2025-10-04 共享写锁隔离） |
+| P2-7 | PER push 逐元素 copy | `PrioritizedReplay.push` 逐条 `copy_`，大批量 push 时 CPU 压力大 | 大批量采样阻塞训练主循环 | P2 | 已完成（2025-10-04 批量写入向量化） |
 | P3-1 | 真正 Actor-Learner 多进程 | 解除 GIL 限制 + pipeline | 大型改造 | P3 | >1 周 |
 | P3-2 | Transformer 记忆裁剪 / 压缩 | 长序列更高效 | 研究性 | P3 | 待定 |
 | P3-3 | NVML 直接采样替换 nvidia-smi | 减少子进程开销 | 稳定微优化 | P3 | 0.5 天 |
@@ -42,13 +42,13 @@
 
 ## 2. 立即执行 (T0, 本周内)
 1. (进行中) global_step 回填脚本批量执行：已运行 `scripts/backfill_global_step.py --update-if-lower`，`run01/` 与 `run_balanced/` (含 checkpoint) 已写入 `reconstructed_step_source`；`run_tput/`、`exp_shaping1/` 因 `global_update=0` 需后续补充真实步数或人工标注。
-2. (新增) 修复 GAE 回退路径：纠正 `compute_returns` 最后一帧 bootstrap 取值，并补充 `--no-vtrace`/GAE 回归测试。
+2. (已完成) 修复 GAE 回退路径：纠正 `compute_returns` 最后一帧 bootstrap 取值，并补充 `--no-vtrace`/GAE 回归测试。
 3. (已完成) 修复 PER 间隔推送缺陷：`_per_step_update` 独立处理 push 与 sample，并新增单测覆盖 `per_sample_interval>1`。
 4. (已完成) GPU 可用性告警：`--device auto` 无 CUDA 时阻断启动（或设置 `MARIO_ALLOW_CPU_AUTO=1` 后警告继续）。
 5. (已完成) 推进统计修复：`env_progress_dx`、`stagnation_envs`、`adaptive_ratio_fallback` 等指标上线，自适应写回与 JSONL/TensorBoard 数据一致。
 6. (已完成) 自动前进回退：`--auto-bootstrap-threshold/frames` 现默认由脚本注入，可在距离依旧为 0 时启动强制前进。
 7. (已完成) 训练主循环异常安全：异常中断保存 latest + 清理资源。
-8. (新增) 指标结构化校验：配合 `tests/test_shaping_smoke.py` 与 `tests/test_adaptive_injection_integration.py`，确保奖励塑形与 distance_weight 回路可持续自测。
+8. (已完成) 指标结构化校验：配合 `tests/test_shaping_smoke.py` 与 `tests/test_adaptive_injection_integration.py`，确保奖励塑形与 distance_weight 回路可持续自测。
 
 ## 3. 短期 (T1, 下 1–2 周)
 1. (已完成) Overlap 性能基准：脚本 `scripts/benchmark_overlap.py`。
@@ -90,14 +90,9 @@
 - PER 填充率：日志出现 `[replay][stat] fill=XX.X% unique=YY.Y% avg_unique=ZZ.Z%`。
 
 ## 8. 近期执行顺序建议
-1. (P0-4) 修复 GAE bootstrap 取值并补 smoke 测试，解锁非 V-trace 训练路径。
-2. (P0-1) 对剩余 checkpoint (`run_tput/`, `exp_shaping1/`) 补全 global_step 与审计字段。
-3. (P1-9) 校准余弦调度步数，验证学习率真的衰减。
-4. (P1-10) 重写 `call_with_timeout`，避免环境构建残留线程。
-5. (P2-6) 解决 metrics JSONL 并发写冲突（加锁或拆分输出）。
-6. (P2-7) 优化 PER push 批量写入，降低 CPU copy 开销。
-7. (P2-1) backfill 工具纳入 CI / 批处理脚本。
-8. (P2-3) GPU 端 PER 采样原型（含 KL 验证和耗时剖析）。
+1. (P0-1) 对剩余 checkpoint (`run_tput/`, `exp_shaping1/`) 补全 global_step 与审计字段。
+2. (P2-1) backfill 工具纳入 CI / 批处理脚本。
+3. (P2-3) GPU 端 PER 采样原型（含 KL 验证和耗时剖析）。
 
 ## 9. 开发协作提示
 - 日志前缀规范：`[train]`, `[replay]`, `[benchmark]`, `[migrate]` 保持 grep 一致。
@@ -115,6 +110,11 @@
 - env_progress_dx / stagnation 指标与自适应 ratio fallback 上线（2025-10-04）
 - `scripts/train_stable_sync.sh` / `train_stable_async.sh` 提供稳态训练入口（2025-10-04）
 - 奖励塑形/自适应注入烟雾测试 (`tests/test_shaping_smoke.py`, `tests/test_adaptive_injection_integration.py`)
+- GAE fallback 修复与 `tests/test_training_schedule.py` 覆盖（2025-10-04）
+- Cosine 调度按 update 计数 + 饱和处理（2025-10-04）
+- 环境构建超时取消信号 (`call_with_timeout` + `cancel_event`)（2025-10-04）
+- metrics JSONL 加锁避免并发写冲突（2025-10-04）
+- PER push 批量化写入优化（2025-10-04）
 
 ## 11. 新增下一步考量（2025-10-02 更新）
 1. 回放采样 GPU 化：评估使用前缀和 + 二分或 segment tree 在 CUDA 上实现的成本与收益；收集 CPU 采样时间基线。
@@ -123,9 +123,6 @@
 4. 训练恢复兼容性测试矩阵：针对不同 `torch` / `gymnasium` / `nes-py` 版本做最小 smoke（脚本化）。
 5. 异步模式进一步隔离验证：单独最小进程示例定位 `mario_make()` 阻塞调用栈（gdb / faulthandler）。
 6. GPU 可用性守卫：启动时若检测不到 CUDA，提示用户切换设备或直接拒绝长跑，避免 0.1 SPS 的无效训练。
-7. GAE fallback 校验：为 `--no-vtrace` 路径添加单元测试与对照实验，避免重构时回归。
-8. 学习率调度可视化：在 metrics JSONL/TB 中补充 `lr_value` 曲线，验证调度调整是否生效。
-9. 日志多线程写安全：统一 JSONL 写入接口或引入队列，规避 Monitor 与主线程争用。
 
 ---
 如需我直接开始第 1 步“global_step 回填脚本”实现，请提出指令（例如：`实现回填脚本`）。

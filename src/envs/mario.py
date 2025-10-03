@@ -10,6 +10,7 @@ import random
 import sys
 import tempfile
 import time
+import threading
 from collections import deque
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
@@ -579,6 +580,7 @@ def _make_single_env(
     startup_event: Optional[Any] = None,
     next_start_event: Optional[Any] = None,
     allow_dummy_in_main: bool = True,
+    cancel_event: Optional[threading.Event] = None,
 ):
     actions = _select_actions(config.action_type)
 
@@ -601,7 +603,12 @@ def _make_single_env(
             obs = np.zeros(self.observation_space.shape, dtype=np.float32)
             return obs, 0.0, False, False, {}
 
+    def _cancelled(stage: str) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError(f"vector env construction cancelled ({stage})")
+
     def thunk():
+        _cancelled("startup")
         # 仅在异步模式（worker 进程会真正创建 env）时、且允许的情况下在 MainProcess 返回 Dummy
         # 同步模式 (SyncVectorEnv) 下 env_fns 永远在主进程运行，不能返回 Dummy，否则训练得到全 0 奖励/永不 done。
         if (
@@ -629,7 +636,13 @@ def _make_single_env(
             except Exception:
                 pass
             try:
-                startup_event.wait()
+                if cancel_event is not None:
+                    while not cancel_event.is_set():
+                        if startup_event.wait(timeout=0.1):
+                            break
+                    _cancelled("startup_wait")
+                else:
+                    startup_event.wait()
             except Exception:
                 pass
             try:
@@ -648,6 +661,7 @@ def _make_single_env(
                 pass
 
         _diag("start")
+        _cancelled("before_patches")
         # Apply nes_py runtime patches early in the worker so any subsequent
         # imports that rely on nes_py get the patched behaviour (avoid uint8 overflow)
         try:
@@ -666,6 +680,7 @@ def _make_single_env(
         except Exception:
             pass
         env: Optional["gym.Env"] = None
+        _cancelled("after_patches")
         if _fc_emulator_enabled():
             try:
                 env = _make_fc_emulator_env(config)
@@ -680,6 +695,7 @@ def _make_single_env(
                     # 继续走下方 else 分支逻辑创建经典环境
                     env = None
         if env is None:
+            _cancelled("gym_import")
             # Eagerly import modules that may block during first-use and log timings
             try:
                 _diag("import_start_gsm")
@@ -766,6 +782,7 @@ def _make_single_env(
             _diag("fused_preprocess_done")
             env = TransformReward(env, float)
             _diag("transform_reward_done")
+            _cancelled("post_wrappers")
         if config.record_video:
             os.makedirs(config.video_dir, exist_ok=True)
             env = gym.wrappers.RecordVideo(
@@ -775,9 +792,11 @@ def _make_single_env(
                 name_prefix=f"world{config.world}_stage{config.stage}",
             )
             _diag("recordvideo_done")
+            _cancelled("record_video")
         # Worker processes will reset as needed; don't reset here.
         _diag("done")
         try:
+            _cancelled("finalise")
             return env
         finally:
             if next_start_event is not None:
@@ -795,7 +814,10 @@ def _make_single_env(
     return thunk
 
 
-def create_vector_env(config: MarioVectorEnvConfig):
+def create_vector_env(
+    config: MarioVectorEnvConfig,
+    cancel_event: Optional[threading.Event] = None,
+):
     """Create a vectorised Mario environment."""
 
     if not config.stage_schedule:
@@ -807,6 +829,10 @@ def create_vector_env(config: MarioVectorEnvConfig):
 
     stage_cycle: Iterable[Tuple[int, int]] = itertools.cycle(stage_list)
 
+    def _check_cancel(stage: str) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError(f"vector env construction cancelled ({stage})")
+
     env_fns = []
     # Diagnostic directory to capture per-worker init progress
     diag_dir = str(
@@ -816,6 +842,7 @@ def create_vector_env(config: MarioVectorEnvConfig):
 
     ctx_obj = None
     startup_events: List[Optional[Any]] = [None] * config.num_envs
+    _check_cancel("vector_setup")
     if config.asynchronous:
         try:
             current_method = multiprocessing.get_start_method()
@@ -849,6 +876,7 @@ def create_vector_env(config: MarioVectorEnvConfig):
     # Helper: wrap each thunk to打印构建进度，便于定位耗时/卡点
     def _with_progress(fn, i: int):  # type: ignore[override]
         def _inner():
+            _check_cancel(f"env_progress_{i}")
             start = time.time()
             try:
                 print(
@@ -865,6 +893,7 @@ def create_vector_env(config: MarioVectorEnvConfig):
         return _inner
 
     for idx in range(config.num_envs):
+        _check_cancel(f"env_setup_{idx}")
         if config.random_start_stage:
             world, stage = random.choice(stage_list)
         else:
@@ -882,12 +911,14 @@ def create_vector_env(config: MarioVectorEnvConfig):
             next_start_event=next_event,
             # 只有异步模式下允许 main process 返回 Dummy。同步模式必须真实构建 env。
             allow_dummy_in_main=bool(config.asynchronous),
+            cancel_event=cancel_event,
         )
         # Wrap thunk to stagger worker startup when running asynchronously.
         if config.asynchronous and getattr(config, "worker_start_delay", 0.0) > 0.0:
             delay = float(config.worker_start_delay) * float(idx)
 
             def _thunk_with_delay(fn=thunk, d=delay):
+                _check_cancel(f"env_delay_{idx}")
                 try:
                     if d > 0:
                         time.sleep(d)
@@ -903,6 +934,7 @@ def create_vector_env(config: MarioVectorEnvConfig):
         env_fns[-1] = _with_progress(env_fns[-1], idx)
 
     vector_cls = AsyncVectorEnv if config.asynchronous else SyncVectorEnv
+    _check_cancel("vector_class")
     # Create a file to capture vector env construction timing / exceptions
     try:
         _create_diag = Path(diag_dir) / f"create_vector_env_pid{os.getpid()}.log"
@@ -926,6 +958,7 @@ def create_vector_env(config: MarioVectorEnvConfig):
             if method_name:
                 vector_kwargs["context"] = method_name
 
+        _check_cancel("vector_construct")
         try:
             vec_env = vector_cls(env_fns, **vector_kwargs)
         except TypeError:
@@ -934,6 +967,7 @@ def create_vector_env(config: MarioVectorEnvConfig):
             for key in ("context", "shared_memory"):
                 if key in fallback_kwargs:
                     fallback_kwargs.pop(key)
+                    _check_cancel("vector_construct_fallback")
                     try:
                         temp_env = vector_cls(env_fns, **fallback_kwargs)
                         break
@@ -943,6 +977,7 @@ def create_vector_env(config: MarioVectorEnvConfig):
                 vec_env = vector_cls(env_fns)
             else:
                 vec_env = temp_env
+        _check_cancel("vector_construct_done")
         try:
             if _create_diag is not None:
                 with open(_create_diag, "a", encoding="utf-8") as f:

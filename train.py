@@ -51,6 +51,7 @@ import contextlib  # noqa: E402
 # later in the module; the selection above is sufficient.
 import dataclasses  # noqa: E402
 import json  # noqa: E402
+import math  # noqa: E402
 import multiprocessing as _mp  # noqa: E402
 import os  # noqa: E402
 import subprocess  # noqa: E402
@@ -652,9 +653,13 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
         value_loss_coef=args.value_coef,
         max_grad_norm=args.clip_grad,
     )
+    grad_accum = max(1, args.grad_accum)
+    effective_updates = max(1, math.ceil(args.total_updates / grad_accum))
+    warmup_steps = min(train_cfg.scheduler.warmup_steps, effective_updates)
     train_cfg.scheduler = dataclasses.replace(
         train_cfg.scheduler,
-        total_steps=args.total_updates * args.rollout_steps * args.num_envs,
+        warmup_steps=warmup_steps,
+        total_steps=effective_updates,
     )
     train_cfg.env = vec_cfg
     train_cfg.model = dataclasses.replace(
@@ -671,7 +676,7 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     )
     train_cfg.mixed_precision = not args.no_amp
     train_cfg.compile_model = not args.no_compile
-    train_cfg.gradient_accumulation = max(1, args.grad_accum)
+    train_cfg.gradient_accumulation = grad_accum
     train_cfg.log_dir = args.log_dir
     train_cfg.save_dir = args.save_dir
     train_cfg.eval_interval = args.eval_interval
@@ -785,16 +790,18 @@ def compute_returns(
         )
         return vs, advantages
 
-    gae = torch.zeros_like(values[0])
     advantages = torch.zeros_like(values)
     vs = torch.zeros_like(values)
+    gae = torch.zeros_like(bootstrap_value)
     next_value = bootstrap_value
+    lambda_coef = cfg.rollout.tau
     for t in reversed(range(values.shape[0])):
-        next_value = values[t] if t == values.shape[0] - 1 else vs[t + 1]
-        delta = rewards[t] + gamma * (1.0 - dones[t]) * next_value - values[t]
-        gae = delta + gamma * cfg.rollout.tau * (1.0 - dones[t]) * gae
+        non_terminal = 1.0 - dones[t]
+        delta = rewards[t] + gamma * non_terminal * next_value - values[t]
+        gae = delta + gamma * lambda_coef * non_terminal * gae
         advantages[t] = gae
         vs[t] = advantages[t] + values[t]
+        next_value = values[t]
     return vs, advantages
 
 
@@ -1231,23 +1238,39 @@ def maybe_save_config(cfg: TrainingConfig, path: Optional[str]):
     Path(path).write_text(serialisable, encoding="utf-8")
 
 
-def call_with_timeout(fn, timeout: float, *args, **kwargs):
+def call_with_timeout(
+    fn,
+    timeout: float,
+    *args,
+    cancel_event: Optional[threading.Event] = None,
+    **kwargs,
+):
+    if timeout is not None and timeout <= 0:
+        return fn(*args, **kwargs)
+
     result: dict[str, object] = {}
     error: dict[str, BaseException] = {}
+    finished = threading.Event()
+    cancel_event = cancel_event or threading.Event()
 
     def target():
         try:
             result["value"] = fn(*args, **kwargs)
         except BaseException as exc:  # noqa: BLE001 - propagate original exception
             error["error"] = exc
+        finally:
+            finished.set()
 
     thread = threading.Thread(target=target, daemon=True)
     thread.start()
-    thread.join(timeout)
-    if thread.is_alive():
+    completed = finished.wait(timeout)
+    if not completed:
+        cancel_event.set()
+        thread.join(0.1)
         raise TimeoutError(
             f"Call to {getattr(fn, '__name__', repr(fn))} exceeded {timeout:.1f}s"
         )
+    thread.join()
     if error:
         raise error["error"]
     return result.get("value")
@@ -1466,16 +1489,27 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         timeout = getattr(env_cfg, "reset_timeout", 60.0)
         start_construct = time.time()
         print(f"[train] Starting environment construction with timeout={timeout}s...")
+        env_cancel_event = threading.Event()
+
+        def _construct_env():
+            return create_vector_env(env_cfg, cancel_event=env_cancel_event)
+
         try:
-            env_instance = call_with_timeout(create_vector_env, timeout, env_cfg)
+            env_instance = call_with_timeout(
+                _construct_env, timeout, cancel_event=env_cancel_event
+            )
             construct_time = time.time() - start_construct
             print(f"[train] Environment constructed in {construct_time:.2f}s")
-        except TimeoutError:
+        except TimeoutError as err:
             construct_time = time.time() - start_construct
             print(
                 f"[train][error] Environment construction timed out after {construct_time:.2f}s"
             )
-            raise RuntimeError("Vector env construction timed out")
+            env_cancel_event.set()
+            raise RuntimeError("Vector env construction timed out") from err
+        except Exception:
+            env_cancel_event.set()
+            raise
 
         start_reset = time.time()
         print("[train] Resetting environment...")
@@ -1732,13 +1766,18 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         else Path(run_dir) / "metrics.jsonl"
     )
     metrics_file.parent.mkdir(parents=True, exist_ok=True)
+    metrics_lock = threading.Lock()
 
     # Start background resource monitor (safe start)
     monitor = None
     if not args.no_monitor:
         try:
             monitor = Monitor(
-                writer, wandb_run, metrics_file, interval=args.monitor_interval
+                writer,
+                wandb_run,
+                metrics_file,
+                interval=args.monitor_interval,
+                metrics_lock=metrics_lock,
             )
             monitor.start()
             heartbeat.notify(phase="监控", message="资源监控已启动", progress=False)
@@ -3431,8 +3470,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     pass
 
                 try:
-                    with metrics_file.open("a", encoding="utf-8") as fp:
-                        fp.write(json.dumps(metrics_entry, ensure_ascii=False) + "\n")
+                    with metrics_lock:
+                        with metrics_file.open("a", encoding="utf-8") as fp:
+                            fp.write(json.dumps(metrics_entry, ensure_ascii=False) + "\n")
                 except Exception:
                     pass
 

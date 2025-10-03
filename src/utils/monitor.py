@@ -71,13 +71,21 @@ def _get_resource_stats_once():
 
 
 class Monitor:
-    def __init__(self, writer, wandb_run, metrics_path: Path, interval: float = 10.0):
+    def __init__(
+        self,
+        writer,
+        wandb_run,
+        metrics_path: Path,
+        interval: float = 10.0,
+        metrics_lock: Optional[threading.Lock] = None,
+    ):
         self.writer = writer
         self.wandb_run = wandb_run
         self.metrics_path = metrics_path
         self.interval = interval
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self.metrics_lock = metrics_lock
 
     def _loop(self):
         while not self._stop_event.is_set():
@@ -99,8 +107,13 @@ class Monitor:
                         pass
                 # append to metrics file
                 try:
-                    with self.metrics_path.open("a", encoding="utf-8") as fp:
-                        fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    if self.metrics_lock is not None:
+                        with self.metrics_lock:
+                            with self.metrics_path.open("a", encoding="utf-8") as fp:
+                                fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    else:
+                        with self.metrics_path.open("a", encoding="utf-8") as fp:
+                            fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 except Exception:
                     pass
             except Exception:
