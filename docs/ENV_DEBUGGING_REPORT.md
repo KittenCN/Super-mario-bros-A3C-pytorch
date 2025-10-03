@@ -5,12 +5,35 @@
 本文汇整在构建 `AsyncVectorEnv` 时遇到的阻塞、溢出等问题，以及针对 `nes_py` 的修复尝试、实验数据与后续建议，确保团队在仓库重置后也能快速上手。<br>This report captures the blocking and overflow issues observed while constructing `AsyncVectorEnv`, the runtime patches applied to `nes_py`, experiments that were run, and suggested next steps so the team can pick up the investigation after repository resets.
 
 ## 最新变更摘要 | Latest Update (2025-10-04)
-- 在 `create_vector_env` 中引入严格的按序启动：每个 worker 需等待前一个 NES 构建完成后再初始化，避免并发 `mario_make` 引发竞争。<br>Serialised worker start-up in `create_vector_env` so each worker waits for the previous NES construction to finish, preventing concurrent `mario_make` contention.
-- 将默认构建/重置超时设为 `max(180s, num_envs × 60s)`，兼顾大规模并发带来的累积等待。<br>Set the default construct/reset timeout to `max(180s, num_envs × 60s)` to accommodate accumulated waits in large asynchronous batches.
-- 保留文件锁与诊断日志机制，便于继续分析潜在的 NES 底层阻塞。<br>Retained the file-lock and diagnostic logging mechanisms to keep visibility into potential NES-level stalls.
-- `MarioRewardWrapper` 在 `MARIO_SHAPING_DEBUG=1` 下新增 `[reward][warn] dx_missed ...` 限频提示，帮助异步模式定位缺失的 `x_pos` 数据；同步修复 `env_progress_dx`/`stagnation_envs` 指标避免推进占比长期为 0。
 
 ## 问题概述 | Problem Summary
+
+### 2025-10-03 Episode 步数计数缺失与超时截断不触发
+问题现象:
+1. 训练早期出现大量位移 (x_pos 增长) 但从未完成 episode (`episodes_completed` 维持 0)。
+2. 配置 `--episode-timeout-steps` 与 `--stagnation-limit` 均不触发截断，`avg_return` 长期 0。
+3. 调试字段显示 `per_env_episode_steps` 在每个 update 后又是 0。
+
+根因:
+向量环境在后续 step 返回 batched dict（包含整批 `x_pos` 数组）而非 list[dict]，原逻辑只在 list 分支中累加 `per_env_episode_steps[i] += 1` 并应用 timeout/stagnation；batched dict 分支缺失该累加与截断标记，导致步数永远不增长、截断条件无法满足。
+
+修复措施:
+1. 在 batched dict 分支为每个 env 累加 `per_env_episode_steps`。
+2. 添加 timeout/stagnation 判断与 batch 级标记 (`timeout_truncate_batch`, `stagnation_truncate_batch`)。
+3. 重新计算 `done = terminated | truncated` 以反映新截断。
+4. 扩展 episode-end 调试：`MARIO_EPISODE_DEBUG=1` 时输出 `[train][episode-end-debug]`，支持 batch 标记原因解析。
+5. 添加 `MARIO_EPISODE_STEPS_DEBUG=1` 每个 update 打印 `[train][episode-steps-debug]`，可观察 episode 步数累积与重置点。
+
+验证结果:
+脚本前进 + 超时参数下，episode 步数在单次 episode 内递增 (0→73) 并在达阈值后触发 `timeout_truncate_batch`，同时出现 episode-end-debug 日志与非零 return（包含塑形价值）。
+
+使用建议:
+- 快速自检：设置 `--episode-timeout-steps 80 --scripted-forward-frames 400` 并导出 `MARIO_EPISODE_STEPS_DEBUG=1`，若 1~2 个 episode 内未见 steps 增长或 episode-end-debug，则再检查 env wrappers。
+- 若只想最小化输出，将 `MARIO_EPISODE_STEPS_DEBUG` 关闭，仅保留在异常时打开。
+
+相关环境变量:
+- `MARIO_EPISODE_DEBUG`: 打印 episode 结束详细原因。
+- `MARIO_EPISODE_STEPS_DEBUG`: 打印当前 episode 累计步数与 max_x。
 - 现象：父进程构建 `AsyncVectorEnv` 时偶发超时并回退到同步环境，同时输出 “Async vector env construction timed out…”。<br>Symptom: the parent process sporadically times out while building `AsyncVectorEnv`, prints “Async vector env construction timed out…”, and falls back to the synchronous env.
 - 额外现象：在 Python 3.12 + NumPy 2.x 下，单进程运行 `gym_super_mario_bros.make(...)` 会触发 `nes_py` 的 `OverflowError: Python integer 1024 out of bounds for uint8`。<br>Additional symptom: on Python 3.12 + NumPy 2.x, a single-process `gym_super_mario_bros.make(...)` call in `nes_py` raises `OverflowError: Python integer 1024 out of bounds for uint8`.
 - 诊断日志显示 worker 停在 `calling_mario_make` 处，有时崩溃（未打补丁），有时静默挂起（已打补丁），推测阻塞发生在 NES 原生初始化阶段。<br>Diagnostics show workers reaching `calling_mario_make` and then either crashing (without patches) or hanging silently (with patches), indicating the stall occurs during NES native initialisation.

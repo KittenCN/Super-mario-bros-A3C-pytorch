@@ -365,6 +365,15 @@ class MarioRewardWrapper(gym.Wrapper):
                 else:
                     dp_eff = dp_base
                 shaped_reward += dp_eff
+            # 可选：终止调试输出
+            try:
+                import os
+                if os.environ.get("MARIO_EPISODE_TERMINATION_DEBUG", "0") in {"1","true","on"}:
+                    print(
+                        f"[reward][episode-end] step={self._step_counter} terminated={terminated} truncated={truncated} flag={bool(info.get('flag_get'))} reward_post={shaped_reward:.3f} dx_last={self._last_diag.get('dx')} raw={self._last_diag.get('raw')} scale={self._last_diag.get('scale')}"
+                    )
+            except Exception:  # pragma: no cover
+                pass
 
         # 注意：末尾不再再次乘 self.config.scale（已通过动态 dyn_scale 应用）
         return observation, shaped_reward, terminated, truncated, info

@@ -8,6 +8,7 @@
 - **V-trace / GAE 结合 PER**：混合 on/off-policy 目标，支持优先经验回放。<br>**V-trace / GAE with PER**: hybrid on/off-policy targets with prioritised experience replay support.
 - **PyTorch 2.1 工程栈**：`torch.compile`、AMP、余弦 warmup、梯度累积、AdamW。<br>**PyTorch 2.1 stack**: `torch.compile`, AMP, cosine warmup, gradient accumulation, and AdamW.
 - **观测与监控**：TensorBoard、可选 Weights & Biases、奖励统计、周期化 checkpoint。<br>**Observability**: TensorBoard, optional Weights & Biases, reward statistics, and periodic checkpoints.
+ - **Episode 事件分离**：支持将 episode_end 事件行分离到独立 `episodes.jsonl`（`--episodes-event-path`），便于离线分析长度/终止原因直方图。<br>**Episode event separation**: optional dedicated `episodes.jsonl` via `--episodes-event-path` for offline episode length/termination analytics.
 - **自动化工具**：评估脚本、Optuna 超参搜索、Docker/conda 环境、视频录制封装。<br>**Automation tooling**: evaluation scripts, Optuna hyper-parameter search, Docker/conda environments, and video capture wrappers.
 
 ## 快速开始 | Quick Start
@@ -19,8 +20,8 @@ python -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# 训练 | Train（同步向量环境稳态配置）
-bash scripts/train_stable_sync.sh
+# 训练 | Train（同步向量环境稳态配置，附独立 episode 事件文件）
+RUN_NAME=demo_sync EPISODE_EVENTS_PATH=trained_models/demo_sync/episodes.jsonl bash scripts/train_stable_sync.sh
 
 # 异步压力测试（可选，高并发+overlap）
 bash scripts/train_stable_async.sh
@@ -99,7 +100,7 @@ If the sidecar metadata JSON is missing, `test.py` will reconstruct it from the 
 	# 启用 RAM 回退解析 (fc_emulator 缺失 x_pos 时)
 	python train.py ... --enable-ram-x-parse --ram-x-high-addr 0x006D --ram-x-low-addr 0x0086
 	```
-	监控指标：`env_distance_delta_sum`、`env_shaping_raw_sum`、`env_shaping_scaled_sum`（见 `docs/metrics_schema.md`）。
+	监控指标：`env_distance_delta_sum`、`env_shaping_raw_sum`、`env_shaping_scaled_sum`、`episode_length_mean`、`episode_end_reason_*`（见 `docs/metrics_schema.md`）。
 - **脚本化前进 / 探测 (Scripted Progression & Probing)**：降低起步阶段停滞。
 	```bash
 	# 简单脚本序列：按 START 8 帧后持续 RIGHT+B 180 帧
@@ -145,7 +146,7 @@ FORCE_PHASE2=1 PHASE2_EXTRA="NO_COMPILE=1" bash scripts/auto_phase_training.sh
 | Episode Timeout | 促使更快获得 returns | `--episode-timeout-steps` | 每局重启 |
 | Adaptive Distance / Entropy | 动态平衡探索与推进 | `--adaptive-*` 系列 | 可持续 |
 
-推荐早期配置示例（Phase1 冷启动 2k updates）：
+推荐早期配置示例（Phase1 冷启动 2k updates；含单独事件文件）：
 ```bash
 python train.py --world 1 --stage 1 --action-type extended --num-envs 8 \
 	--total-updates 2000 --rollout-steps 32 \
@@ -156,7 +157,8 @@ python train.py --world 1 --stage 1 --action-type extended --num-envs 8 \
 	--auto-bootstrap-threshold 40 --auto-bootstrap-frames 200 \
 	--secondary-script-threshold 100 --secondary-script-frames 160 \
 	--milestone-interval 300 --milestone-bonus 0.5 \
-	--episode-timeout-steps 1200 --enable-ram-x-parse --metrics-path run_metrics.jsonl
+	--episode-timeout-steps 1200 --enable-ram-x-parse --metrics-path run_metrics.jsonl \
+	--episodes-event-path episodes_phase1.jsonl
 ```
 迁移至 Phase2（主学习阶段）时可显著降低 distance_weight、禁用脚本与 early window、保留 milestone 与 timeout：
 ```bash

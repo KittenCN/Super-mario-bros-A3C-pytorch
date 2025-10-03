@@ -5,7 +5,10 @@ All notable changes to this project will be documented in this file.
 The format roughly follows Keep a Changelog and SemVer (future releases). Date format: YYYY-MM-DD.
 
 ## [Unreleased]
+- Fix: 处理 batched dict 形式环境返回时 `per_env_episode_steps` 未累加导致 episode timeout / stagnation 截断不生效的问题；新增调试环境变量 `MARIO_EPISODE_STEPS_DEBUG`、`MARIO_EPISODE_DEBUG` 并在日志中输出 `episode-end-debug` 与 `episode-steps-debug` 帮助定位。
 ### Added
+- Episode metrics: `episode_length_mean/p50/p90/p99` + termination reason histogram `episode_end_reason_*` 与占比 (`episode_end_timeout_ratio`, `episode_end_stagnation_ratio`, `episode_end_flag_ratio`, `episode_end_death_ratio`)；用于监控截断/死亡/通关结构性变化。
+- 文档 `docs/metrics_schema.md` 增补 Episode 终止与长度统计章节。
 - 新增 `tests/test_shaping_smoke.py` 覆盖 fc_emulator 聚合路径，确保奖励塑形产生非零 `shaping_raw_sum` 与推进占比；`tests/test_adaptive_injection_integration.py` 继续验证 distance_weight 运行期注入。
 - `MarioRewardWrapper` 增添 `set_distance_weight()`、`get_diagnostics()`、`_coerce_scalar()` 等接口，并在 `MARIO_SHAPING_DEBUG=1` 下限频输出 `[reward][warn] dx_missed ...` 提示。
 - 新稳态训练脚本：`scripts/train_stable_sync.sh`（同步调试配置）与 `scripts/train_stable_async.sh`（异步 + overlap 压力测试），支持 `--dry-run` 与环境变量覆盖。

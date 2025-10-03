@@ -241,6 +241,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Path to JSONL file for periodic metrics dump",
     )
     parser.add_argument(
+        "--episodes-event-path",
+        type=str,
+        default=None,
+        help="可选：单独写入 episode_end 事件 JSONL（默认与 metrics 混写在同一文件）",
+    )
+    parser.add_argument(
         "--metrics-rotate-max-mb",
         type=float,
         default=0.0,
@@ -423,6 +429,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=int,
         default=20,
         help="连续若干 update 无 max_x 提升触发警告，<=0 关闭",
+    )
+    parser.add_argument(
+        "--stagnation-limit",
+        type=int,
+        default=400,
+        help="若某 env 连续无前进达到该步数则触发截断（与内部 stagnation_limit 对应），默认400",
     )
     parser.add_argument(
         "--scripted-forward-frames",
@@ -912,11 +924,37 @@ def _maybe_print_training_hints(update_idx: int, metrics: Dict[str, Any]) -> Non
             "距离增量为 0，考虑提高 reward_distance_weight 或启用 scripted-forward 或设置 BOOTSTRAP=1。"
         )
 
-    if avg_return <= 0.0 and update_idx >= 200:
+    # 允许通过环境变量降低测试阈值（例如小规模快速试验）
+    import os as _os  # 局部导入防止顶层污染
+    test_lower = _os.environ.get("MARIO_HINT_TEST_LOWER_THRESH")
+    try:
+        test_lower_val = int(test_lower) if test_lower is not None else None
+    except Exception:
+        test_lower_val = None
+    threshold_update = 200 if not test_lower_val else max(1, test_lower_val)
+
+    if avg_return <= 0.0 and update_idx >= threshold_update:
         if shaping_scaled > 1.0 and episodes_completed == 0:
             hints.append(
                 "已检测到推进/塑形奖励，但原生奖励仍为 0；建议缩短 episode 超时或增加死亡惩罚以促使环境结束。"
             )
+            # 详细诊断：打印关键指标快照，帮助定位是 done 信号缺失还是超时/死亡惩罚问题
+            try:
+                diag = {
+                    "env_shaping_scaled_sum": shaping_scaled,
+                    "env_shaping_raw_sum": shaping_raw,
+                    "env_distance_delta_sum": distance_delta,
+                    "env_positive_dx_ratio": metrics.get("env_positive_dx_ratio"),
+                    "episodes_completed": episodes_completed,
+                    "global_step": metrics.get("global_step"),
+                    "wrapper_distance_weight": metrics.get("wrapper_distance_weight"),
+                    "env_shaping_last_dx": metrics.get("env_shaping_last_dx"),
+                    "env_shaping_last_scale": metrics.get("env_shaping_last_scale"),
+                }
+                diag_items = " ".join(f"{k}={v}" for k, v in diag.items())
+                print(f"[train][hint-diagn] update={update_idx} {diag_items}")
+            except Exception:
+                pass
         elif shaping_scaled <= 1.0:
             hints.append("avg_return 长期为 0，可检查奖励塑形或动作脚本是否生效。")
 
@@ -1907,6 +1945,16 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     )
     metrics_file.parent.mkdir(parents=True, exist_ok=True)
     metrics_lock = threading.Lock()
+    # episode_end 事件独立文件（若未指定则复用 metrics_file）
+    episodes_event_file: Path | None = None
+    try:
+        if getattr(args, "episodes_event_path", None):
+            episodes_event_file = Path(args.episodes_event_path).expanduser()
+            episodes_event_file.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            episodes_event_file = metrics_file
+    except Exception:
+        episodes_event_file = metrics_file
 
     # Start background resource monitor (safe start)
     monitor = None
@@ -1991,6 +2039,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     last_resource_log = 0.0
     episode_returns = np.zeros(cfg.env.num_envs, dtype=np.float32)
     completed_returns: list[float] = []
+    # 追加：episode 长度与结束原因（仅保留最近 1000 条避免内存膨胀）
+    completed_episode_lengths: list[int] = []
+    completed_episode_reasons: list[str] = []  # e.g. terminated;truncated;timeout_truncate_batch
     # 追踪每个 env 的最新 x_pos 与累计最大值，便于日志/诊断
     env_last_x = np.zeros(cfg.env.num_envs, dtype=np.int32)
     env_max_x = np.zeros(cfg.env.num_envs, dtype=np.int32)
@@ -2007,7 +2058,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     shaping_parse_fail = 0
     action_hist = np.zeros(64, dtype=np.int64)  # 假设动作空间 <64
     stagnation_steps = np.zeros(cfg.env.num_envs, dtype=np.int32)
-    stagnation_limit = 400  # 若某 env 连续无前进达到该步数可考虑截断
+    stagnation_limit = max(1, int(getattr(args, "stagnation_limit", 400) or 400))
     prev_global_max_x = 0
     stagnation_update_counter = 0
     stagnation_warn_updates = max(0, int(getattr(args, "stagnation_warn_updates", 0)))
@@ -2619,8 +2670,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                     per_env_episode_steps[i_env] += 1
                                     if (
                                         episode_timeout_steps > 0
-                                        and per_env_episode_steps[i_env]
-                                        >= episode_timeout_steps
+                                        and per_env_episode_steps[i_env] >= episode_timeout_steps
                                     ):
                                         try:
                                             if isinstance(infos[i_env], dict):
@@ -2703,9 +2753,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                     if stagnation_steps[i_env] >= stagnation_limit:
                                         try:
                                             if isinstance(infos[i_env], dict):
-                                                infos[i_env][
-                                                    "stagnation_truncate"
-                                                ] = True
+                                                infos[i_env]["stagnation_truncate"] = True
                                             truncated[i_env] = True
                                         except Exception:
                                             pass
@@ -2741,6 +2789,42 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                             else:
                                                 stagnation_steps[i_env] += 1
                                             env_prev_step_x[i_env] = last
+                                            # 计数 episode 步数（batched dict 分支原先缺失）
+                                            per_env_episode_steps[i_env] += 1
+                                            # 应用超时截断
+                                            if (
+                                                episode_timeout_steps > 0
+                                                and per_env_episode_steps[i_env] >= episode_timeout_steps
+                                            ):
+                                                # 标记全局 truncated：batched dict 没有逐 env info，使用列表存储标记
+                                                try:
+                                                    if not isinstance(truncated, (list, tuple)):
+                                                        # truncated 可能是 ndarray；直接 in-place 修改
+                                                        truncated[i_env] = True  # type: ignore[index]
+                                                except Exception:
+                                                    pass
+                                                # 记录 batched 超时标记（便于后续 episode-end debug 提示）
+                                                try:
+                                                    tk = "timeout_truncate_batch"
+                                                    if tk not in infos:
+                                                        infos[tk] = [False] * cfg.env.num_envs
+                                                    infos[tk][i_env] = True  # type: ignore[index]
+                                                except Exception:
+                                                    pass
+                                            # 停滞截断
+                                            if stagnation_steps[i_env] >= stagnation_limit:
+                                                try:
+                                                    if not isinstance(truncated, (list, tuple)):
+                                                        truncated[i_env] = True  # type: ignore[index]
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    sk = "stagnation_truncate_batch"
+                                                    if sk not in infos:
+                                                        infos[sk] = [False] * cfg.env.num_envs
+                                                    infos[sk][i_env] = True  # type: ignore[index]
+                                                except Exception:
+                                                    pass
                                 except Exception:
                                     pass
                             # batched shaping: 可能是 list/tuple，每个元素为 dict
@@ -2834,10 +2918,55 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                         shaping_parse_fail += 1
                     except Exception:
                         pass
+                    # 重新计算 done 以包含可能刚刚标记的 timeout/stagnation 截断
+                    done = np.logical_or(terminated, truncated)
                     reward_cpu = _to_cpu_tensor(reward_np, dtype=torch.float32)
-                    done_cpu = _to_cpu_tensor(
-                        done.astype(np.float32), dtype=torch.float32
-                    )
+                    done_cpu = _to_cpu_tensor(done.astype(np.float32), dtype=torch.float32)
+                    # 额外调试：打印每 update 的 episode steps & 截断原因（受环境变量控制）
+                    try:
+                        import os as _os_es
+                        if _os_es.environ.get("MARIO_EPISODE_STEPS_DEBUG", "0").lower() in {"1", "true", "on"}:
+                            if (global_step // cfg.env.num_envs) % cfg.rollout.num_steps == 0:  # 粗略在每 rollout 末尾打印一次
+                                print(f"[train][episode-steps-debug] update={update_idx} steps={per_env_episode_steps.tolist()} max_x={env_max_x.tolist()}")
+                    except Exception:
+                        pass
+                    # Episode end debug (before resetting returns) when enabled
+                    try:
+                        import os as _os_dbg
+                        if done.any() and _os_dbg.environ.get("MARIO_EPISODE_DEBUG", "0").lower() in {"1", "true", "on"}:
+                            # infos 可能是 list；逐 env 打印终止原因与 return（未清零前）
+                            for i_env, flag in enumerate(done):
+                                if not flag:
+                                    continue
+                                reason_flags: list[str] = []
+                                try:
+                                    if isinstance(infos, (list, tuple)):
+                                        source_info = infos[i_env] if len(infos) > i_env else {}
+                                        if isinstance(source_info, dict):
+                                            for rk in ("flag_get", "timeout_truncate", "stagnation_truncate", "terminated", "truncated"):
+                                                if source_info.get(rk):
+                                                    reason_flags.append(rk)
+                                    elif isinstance(infos, dict):
+                                        # 尝试从 batched 标记中解析
+                                        for rk in ("timeout_truncate_batch", "stagnation_truncate_batch"):
+                                            arr_flags = infos.get(rk)
+                                            try:
+                                                if arr_flags and arr_flags[i_env]:
+                                                    reason_flags.append(rk)
+                                            except Exception:
+                                                pass
+                                except Exception:
+                                    pass
+                                reason_str = ",".join(reason_flags) if reason_flags else "unknown"
+                                try:
+                                    ep_ret_val = float(episode_returns[i_env])
+                                except Exception:
+                                    ep_ret_val = 0.0
+                                print(
+                                    f"[train][episode-end-debug] update={update_idx} gstep={global_step} env={i_env} return={ep_ret_val:.2f} x_pos={env_last_x[i_env]} terminated={bool(terminated[i_env])} truncated={bool(truncated[i_env])} reasons={reason_str}"
+                                )
+                    except Exception:
+                        pass
                     rollout.insert(
                         step,
                         obs_cpu,
@@ -2853,13 +2982,67 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     if done.any():
                         for idx_env, flag in enumerate(done):
                             if flag:
-                                completed_returns.append(
-                                    float(episode_returns[idx_env])
-                                )
+                                # 汇总结束原因（利用前面 episode-end-debug 已解析的 flags 再次构造）
+                                reason_tags: list[str] = []
+                                try:
+                                    if bool(terminated[idx_env]):
+                                        reason_tags.append("terminated")
+                                    if bool(truncated[idx_env]):
+                                        reason_tags.append("truncated")
+                                    # info 结构中可能包含详细标志
+                                    inf_obj = infos[idx_env] if isinstance(infos, (list, tuple)) and len(infos) > idx_env else None
+                                    if isinstance(inf_obj, dict):
+                                        for rk in (
+                                            "flag_get",
+                                            "timeout_truncate",
+                                            "stagnation_truncate",
+                                            "timeout_truncate_batch",
+                                            "stagnation_truncate_batch",
+                                            "dead",
+                                        ):
+                                            if inf_obj.get(rk):
+                                                # 统一 death 标记
+                                                if rk == "dead":
+                                                    reason_tags.append("death")
+                                                else:
+                                                    reason_tags.append(rk)
+                                except Exception:
+                                    pass
+                                # 写入 episode_end 事件行（结构化单行 JSON）
+                                try:  # 防御性，避免训练中断
+                                    ep_len_val = int(per_env_episode_steps[idx_env])
+                                    ep_ret_val = float(episode_returns[idx_env])
+                                    event_obj = {
+                                        "timestamp": time.time(),
+                                        "event": "episode_end",
+                                        "update": update_idx,
+                                        "global_step": global_step,
+                                        "env": int(idx_env),
+                                        "episode_length": ep_len_val,
+                                        "episode_return": ep_ret_val,
+                                        "reasons": sorted(set(reason_tags)) or ["unknown"],
+                                    }
+                                    line = json.dumps(event_obj, ensure_ascii=False)
+                                    target_file = episodes_event_file if episodes_event_file else metrics_file  # type: ignore[name-defined]
+                                    if target_file is not None:
+                                        if metrics_lock is not None:
+                                            with metrics_lock:
+                                                with target_file.open("a", encoding="utf-8") as fp:  # type: ignore[attr-defined]
+                                                    fp.write(line + "\n")
+                                        else:
+                                            with target_file.open("a", encoding="utf-8") as fp:  # type: ignore[attr-defined]
+                                                fp.write(line + "\n")
+                                except Exception:
+                                    pass
+                                completed_returns.append(float(episode_returns[idx_env]))
+                                completed_episode_lengths.append(int(per_env_episode_steps[idx_env]))
+                                completed_episode_reasons.append(";".join(sorted(set(reason_tags))) or "unknown")
                                 episode_returns[idx_env] = 0.0
                                 per_env_episode_steps[idx_env] = 0
                         if len(completed_returns) > 1000:
                             completed_returns = completed_returns[-1000:]
+                            completed_episode_lengths = completed_episode_lengths[-1000:]
+                            completed_episode_reasons = completed_episode_reasons[-1000:]
                     if output.hidden_state is not None:
                         hidden_state = output.hidden_state.detach().clone()
                         if done.any():
@@ -3060,6 +3243,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 lr_value = base_lr_current * lr_scale
                 globals()["adaptive_effective_lr"] = lr_value
                 recent_returns = completed_returns[-100:] if completed_returns else []
+                recent_episode_lengths = completed_episode_lengths[-100:] if completed_episode_lengths else []
                 avg_return = float(np.mean(recent_returns)) if recent_returns else 0.0
                 return_std = float(np.std(recent_returns)) if recent_returns else 0.0
                 return_max = float(np.max(recent_returns)) if recent_returns else 0.0
@@ -3113,6 +3297,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 print(
                     f"[train] update={update_idx} step={global_step} avg_return={avg_return:.2f} "
                     f"loss={loss_total:.4f} lr={lr_value:.2e} grad={last_grad_norm:.3f} "
+                    f"last_dx={shaping_last_dx:.2f} last_scale={shaping_last_scale:.3f} "
                     f"steps/s={env_steps_per_sec:.1f} upd/s={updates_per_sec:.2f} "
                     f"update={total_update_time:.1f}s rollout={rollout_duration:.1f}s learn={learn_duration:.1f}s"
                 )
@@ -3145,6 +3330,11 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     "recent_return_p90": p90,
                     "recent_return_p99": p99,
                     "episodes_completed": len(completed_returns),
+                    # Episode 长度分布（最近窗口）
+                    "episode_length_mean": float(np.mean(recent_episode_lengths)) if recent_episode_lengths else 0.0,
+                    "episode_length_p50": float(np.percentile(recent_episode_lengths, 50)) if recent_episode_lengths else 0.0,
+                    "episode_length_p90": float(np.percentile(recent_episode_lengths, 90)) if recent_episode_lengths else 0.0,
+                    "episode_length_p99": float(np.percentile(recent_episode_lengths, 99)) if recent_episode_lengths else 0.0,
                     "grad_norm": last_grad_norm,
                     "env_steps_per_sec": env_steps_per_sec,
                     "updates_per_sec": updates_per_sec,
@@ -3169,6 +3359,33 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 fallback_ratio = None
                 progress_envs = 0
                 progress_dx_sum = int(np.sum(env_progress_dx))
+                # 活动（未终止）episode 当前步数统计（全部 env，因为每个 env 都在运行一个 episode）
+                try:
+                    active_steps_arr = per_env_episode_steps
+                    if getattr(active_steps_arr, "size", 0) > 0:
+                        metrics_entry["episode_active_steps_mean"] = float(np.mean(active_steps_arr))
+                        metrics_entry["episode_active_steps_max"] = int(np.max(active_steps_arr))
+                        metrics_entry["episode_active_steps_p50"] = float(np.percentile(active_steps_arr, 50))
+                except Exception:
+                    pass
+                # 结束原因直方图（最近 200 条 episode）
+                try:
+                    if completed_episode_reasons:
+                        recent_reasons = completed_episode_reasons[-200:]
+                        reason_counts: Dict[str, int] = {}
+                        for r in recent_reasons:
+                            for part in r.split(";"):
+                                reason_counts[part] = reason_counts.get(part, 0) + 1
+                        total_r = float(sum(reason_counts.values())) or 1.0
+                        # 限制最多写入 12 个类别（避免字段爆炸）
+                        for rk, rv in list(reason_counts.items())[:12]:
+                            metrics_entry[f"episode_end_reason_{rk}"] = int(rv)
+                        metrics_entry["episode_end_timeout_ratio"] = float(reason_counts.get("timeout_truncate_batch", 0)) / total_r
+                        metrics_entry["episode_end_stagnation_ratio"] = float(reason_counts.get("stagnation_truncate_batch", 0)) / total_r
+                        metrics_entry["episode_end_flag_ratio"] = float(reason_counts.get("flag_get", 0)) / total_r
+                        metrics_entry["episode_end_death_ratio"] = float(reason_counts.get("death", 0)) / total_r
+                except Exception:
+                    pass
                 try:
                     env_count = int(getattr(env_last_x, "size", 0))
                     if env_count:

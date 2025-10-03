@@ -29,6 +29,37 @@ Replay (PER): replay_size, replay_capacity, replay_fill_rate, replay_last_unique
 兼容: 新增字段向后兼容; 消费端使用 dict.get(key, default) 处理缺失。
 未来: TD 误差分布、episode length 分位数、成功率、阶段通关率。
 
+### Episode 终止与长度统计 (2025-10-03 新增)
+- episode_length_mean / p50 / p90 / p99: 最近窗口(默认取最近 100 条已完成 episodes) 的长度统计，长度单位=环境步数；用于监控超时截断频率或策略早死问题。
+- episode_end_reason_<tag>: 最近窗口(最多 200 条) episode 终止原因计数直方图，tag 可能包含：
+	- terminated: 环境自然终止（terminated=True）。
+	- truncated: 环境自身截断（例如 gym 超时）或我们注入的 truncated 标志。
+	- timeout_truncate_batch: 训练循环强制 episode_timeout_steps 触发的批量截断。
+	- stagnation_truncate_batch: 因推进停滞 (stagnation_limit) 触发的截断。
+	- flag_get: 成功获取旗帜（通关）。
+	- death: 角色死亡（基于 info.dead 或 wrapper 内部 flag 映射）。
+	- 其它（上限 12 种；多原因会用分号聚合后拆分计数）。
+- episode_end_timeout_ratio / *_stagnation_ratio / *_flag_ratio / *_death_ratio: 针对最近窗口 episode 的终止原因占比（计数/总数），快速评估：
+	- timeout_ratio 过高：episode_timeout_steps 可能过低或策略卡死。
+	- stagnation_ratio 过高：stagnation_limit 需调大或距离奖励过低导致无推进。
+	- flag_ratio 上升：说明策略阶段性掌握过关；可考虑降低 distance_weight 退火。
+	- death_ratio 过高：检查 death_penalty 退火配置是否过早施加高惩罚，或动作探索过于激进。
+
+使用建议：
+1. 监控 episode_length_p50 与 p99 差距：极大重尾常见于频繁 timeout + 少量快速死亡；可调大 timeout 或改进探索。
+2. 若 episode_end_reason_truncated 高而 timeout_ratio 低，说明环境自身 truncated（非我们强制），需审查底层 env wrappers 阈值。
+3. flag_ratio 连续多轮为 0 且 progress_ratio>0，说明推进但未到通关，考虑添加里程碑奖励或二次脚本注入。
+
+#### 活动 Episode 步数 (Active Episodes)
+- episode_active_steps_mean / max / p50: 当前尚在进行中的各 env episode 步数统计（由于向量 env 中每个 env 同时只存在一个活动 episode，因此等价于 per_env_episode_steps 的统计）。可用于观察是否普遍接近 timeout。
+
+#### 事件行: episode_end
+除常规 metrics 行外，当 episode 结束时会追加结构化事件行：
+```
+{"timestamp": ..., "event": "episode_end", "update": <int>, "global_step": <int>, "env": <int>, "episode_length": <int>, "episode_return": <float>, "reasons": ["truncated", ...]}
+```
+消费端应按 `obj.get("event") == "episode_end"` 分支解析；这些行不含常规 loss/entropy 字段。用于离线聚合更精细的分布（如全量 episode_return 直方图、长度 vs. 原因 2D 统计）。
+
 ### 距离 / Shaping 相关字段 (2025-10-02 新增)
 - env_mean_x_pos: 最近一个 log 周期内各 env 最新 x_pos 的平均值。
 - env_max_x_pos: 运行至当前的全局最大 x_pos（所有 env）。

@@ -95,6 +95,7 @@ LOG_ROOT=${LOG_ROOT:-tensorboard/a3c_super_mario_bros}
 DEVICE=${DEVICE:-auto}
 ENABLE_OVERLAP=${ENABLE_OVERLAP:-1}
 PARENT_PREWARM=${PARENT_PREWARM:-1}
+EPISODE_EVENTS_PATH=${EPISODE_EVENTS_PATH:-}
 
 RUN_SAVE_DIR="${SAVE_ROOT%/}/${RUN_NAME}"
 RUN_LOG_DIR="${LOG_ROOT%/}/${RUN_NAME}"
@@ -121,6 +122,7 @@ CMD=(
   --save-dir "$RUN_SAVE_DIR"
   --log-dir "$RUN_LOG_DIR"
   --metrics-path "$RUN_METRICS_PATH"
+  ${EPISODE_EVENTS_PATH:+--episodes-event-path "$EPISODE_EVENTS_PATH"}
   --project "$PROJECT"
   --device "$DEVICE"
   --reward-distance-weight "$REWARD_DISTANCE_WEIGHT"
