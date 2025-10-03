@@ -4,10 +4,11 @@
 
 本文汇整在构建 `AsyncVectorEnv` 时遇到的阻塞、溢出等问题，以及针对 `nes_py` 的修复尝试、实验数据与后续建议，确保团队在仓库重置后也能快速上手。<br>This report captures the blocking and overflow issues observed while constructing `AsyncVectorEnv`, the runtime patches applied to `nes_py`, experiments that were run, and suggested next steps so the team can pick up the investigation after repository resets.
 
-## 最新变更摘要 | Latest Update (2025-09-30)
+## 最新变更摘要 | Latest Update (2025-10-04)
 - 在 `create_vector_env` 中引入严格的按序启动：每个 worker 需等待前一个 NES 构建完成后再初始化，避免并发 `mario_make` 引发竞争。<br>Serialised worker start-up in `create_vector_env` so each worker waits for the previous NES construction to finish, preventing concurrent `mario_make` contention.
 - 将默认构建/重置超时设为 `max(180s, num_envs × 60s)`，兼顾大规模并发带来的累积等待。<br>Set the default construct/reset timeout to `max(180s, num_envs × 60s)` to accommodate accumulated waits in large asynchronous batches.
 - 保留文件锁与诊断日志机制，便于继续分析潜在的 NES 底层阻塞。<br>Retained the file-lock and diagnostic logging mechanisms to keep visibility into potential NES-level stalls.
+- `MarioRewardWrapper` 在 `MARIO_SHAPING_DEBUG=1` 下新增 `[reward][warn] dx_missed ...` 限频提示，帮助异步模式定位缺失的 `x_pos` 数据；同步修复 `env_progress_dx`/`stagnation_envs` 指标避免推进占比长期为 0。
 
 ## 问题概述 | Problem Summary
 - 现象：父进程构建 `AsyncVectorEnv` 时偶发超时并回退到同步环境，同时输出 “Async vector env construction timed out…”。<br>Symptom: the parent process sporadically times out while building `AsyncVectorEnv`, prints “Async vector env construction timed out…”, and falls back to the synchronous env.

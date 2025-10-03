@@ -2,9 +2,9 @@
 
 > 目的：集中记录 2025-09-30 ~ 2025-10-01 期间针对稳定性、性能与可维护性所做的关键设计决策、备选方案、取舍与验证结果。<br>Purpose: Capture key design decisions, alternatives, trade-offs, and validation results for stability, performance, and maintainability changes between 2025-09-30 and 2025-10-01.
 
-更新时间 | Updated: 2025-10-02
+更新时间 | Updated: 2025-10-04
 
-2025-10-03 增补：自适应 distance_weight 实时注入、类型化阶段计划拆分。
+2025-10-04 增补：推进统计修复、shaping 烟雾测试与稳态训练脚本。
 ---
 
 ## 25. 自适应 distance_weight 实时注入 (2025-10-03)
@@ -18,6 +18,20 @@
 - 问题 | Problem: `train.py` 体积 >3000 行，缺少类型提示导致 mypy 噪声高，测试难以对关键逻辑做细粒度覆盖。
 - 决策 | Decision: 分阶段：P1 提供 env wrappers / adaptive / replay 关键外部接口类型；P2 拆分训练主循环为 `trainer/loop.py`, `trainer/checkpoint.py`, `trainer/logging.py`; P3 在 CI 引入 `mypy --strict` 白名单逐步收紧。
 - 后续 | Next: 创建 `src/trainer/` 目录放置最小骨架并迁移 compute_returns 等纯函数；保证现有接口与 CLI 行为不变，逐段移动确保测试持续通过。
+
+## 27. 正向推进指标与停滞修复 (2025-10-04)
+- 问题 | Problem: fc_emulator backend 中 `env_positive_dx_ratio` 长期为 0，造成自适应调度持续上调距值；`env_shaping_raw_sum` 也保持 0，难以验证奖励塑形链路。
+- 决策 | Decision: 在 rollout 解析阶段新建 `env_progress_dx` 追踪每个 env 的正向位移，一旦 dx>0 即重置 `stagnation_steps[i]`；以该数组重新计算正向占比，若仍为 0 且 `distance_delta_sum>0` 则记录 `adaptive_ratio_fallback` 交由调度使用。同步输出 `stagnation_envs`、`stagnation_mean_steps` 指标。
+- 实施 | Implementation: `train.py` 中插值 `env_progress_dx`/`NUMERIC_TYPES` 辅助函数；`src/envs/wrappers.py` 更新为优先读取 metrics 中的数组并统一拉平成标量。
+- 验证 | Validation: `MARIO_SHAPING_DEBUG=1 python train.py --num-envs {1,2,4}` 在同步/异步模式下 `env_positive_dx_ratio` 保持 1.0，`env_shaping_raw_sum` >0 且与 distance_weight 比例一致；REST 运行日志无 fallback 且新增指标可在 TensorBoard/JSONL 中查看。
+- 影响 | Impact: 自适应调度回到可控区间，metrics 面板新增可观测停滞数据，为后续自动阈值调节提供依据。
+
+## 28. 奖励塑形烟雾测试与稳态训练脚本 (2025-10-04)
+- 问题 | Problem: 缺少覆盖 fc_emulator 数据结构的最小化测试；构建训练命令每次需组合多个 CLI 选项，易误配。
+- 决策 | Decision: 新增 `tests/test_shaping_smoke.py` 重放 fc 风格 metrics，断言 `shaping_raw_sum>0` 与推进占比大于 0；提供 `scripts/train_stable_sync.sh` 与 `scripts/train_stable_async.sh` 一键拉起稳定配置，默认写入独立 `save_dir/log_dir`。
+- 实施 | Implementation: 测试复用 `MarioRewardWrapper` 诊断快照；脚本封装常用环境变量、支持 `--dry-run` 和 `RUN_NAME/TOTAL_UPDATES` 覆盖，内部固定启用 `--enable-ram-x-parse`、`--sync-env` 或 `--async-env --confirm-async --overlap-collect`。
+- 验证 | Validation: `pytest -k shaping_smoke -q`、`pytest -k adaptive_injection_integration -q` 皆通过；脚本 `bash scripts/train_stable_{sync,async}.sh --dry-run` 输出全参命令，实跑 50 updates（异步）及 20 updates（同步）指标符合预期。
+- 影响 | Impact: 快速检测奖励链路回归、简化重训流程，配合新指标提供即开即用的验证路径。
 5. 资源监控开销削减 (Resource monitor throttling)
 6. 双缓冲重叠采集 (Overlap rollout collection)
 7. 未来演进候选 (Future candidates)

@@ -10,8 +10,8 @@
 ## 环境子系统 | Environment Subsystem (`src/envs/`)
 - `MarioEnvConfig` 与 `MarioVectorEnvConfig` 描述单环境/向量环境的参数（关卡、动作集、帧跳、随机舞台等）。<br>`MarioEnvConfig` and `MarioVectorEnvConfig` define per-env and vector-env parameters (stage, action set, frame skip, randomised schedule, etc.).
 - `create_vector_env` 支持同步或异步 `Gymnasium` 向量环境，串联帧跳、灰度化、`Resize(84×84)`、`FrameStack`、奖励塑形与录像封装。<br>`create_vector_env` builds sync or async Gymnasium vector environments chaining frame skip, grayscale, `Resize(84×84)`, `FrameStack`, reward shaping, and optional video recording.
-- 通过 `ProgressInfoWrapper` 输出总进度/终止信息，`MarioRewardWrapper` 注入旗帜奖励及失败惩罚，确保奖励尺度一致。<br>`ProgressInfoWrapper` exposes progress/termination info and `MarioRewardWrapper` injects flag rewards and failure penalties to keep reward scales consistent.
-- 针对 `nes_py` 的溢出问题增加运行时补丁与诊断日志，结合文件锁序列化重型初始化。<br>Runtime patches and diagnostics mitigate `nes_py` overflow issues, while file locks serialise heavy initialisation.
+- 通过 `ProgressInfoWrapper` 输出总进度/终止信息，`MarioRewardWrapper` 注入旗帜奖励及失败惩罚，确保奖励尺度一致；2025-10-04 起其 `get_diagnostics()` 也会缓存 `dx/scale/raw` 并驱动 `env_progress_dx`、`stagnation_envs` 等推进指标。<br>`ProgressInfoWrapper` exposes progress/termination info while `MarioRewardWrapper` now surfaces `dx/scale/raw` diagnostics that feed new training metrics such as `env_progress_dx` and `stagnation_envs`.
+- 针对 `nes_py` 的溢出问题增加运行时补丁与诊断日志，结合文件锁序列化重型初始化，并在 `MARIO_SHAPING_DEBUG=1` 下限频输出 `[reward][warn] dx_missed ...` 指示缺失的 `x_pos` 数据。<br>Runtime patches and diagnostics mitigate `nes_py` overflow issues, serialise heavy initialisation via file locks, and emit throttled `[reward][warn] dx_missed ...` messages (with `MARIO_SHAPING_DEBUG=1`) when `x_pos` telemetry is missing.
 
 ## 模型结构 | Model Architecture (`src/models/`)
 - `MarioActorCritic` 采用 IMPALA 残差卷积骨干，输出特征再接入序列模块。<br>`MarioActorCritic` uses an IMPALA residual convolutional backbone whose features feed into a sequence module.
@@ -21,7 +21,7 @@
 
 ## 算法与数据结构 | Algorithms & Data Structures
 - `src/algorithms/vtrace.py` 实现 IMPALA V-trace 目标，融合行为策略与目标策略 log-prob 校正优势。<br>`src/algorithms/vtrace.py` implements IMPALA V-trace targets, blending behaviour and target policy log-probs for corrected advantages.
-- `src/utils/rollout.py` 的 `RolloutBuffer` 在主机或 GPU 上缓存 `(T, N)` 轨迹，便于批量取样与截断回传。<br>The `RolloutBuffer` in `src/utils/rollout.py` stores `(T, N)` trajectories on host or GPU, enabling batched sampling and truncated BPTT.
+- `src/utils/rollout.py` 的 `RolloutBuffer` 在主机或 GPU 上缓存 `(T, N)` 轨迹，便于批量取样与截断回传，并提供 `_scalar()`/`NUMERIC_TYPES` 辅助将 `numpy`/`array` 数据统一拉平成标量，保障指标与自适应逻辑兼容 fc_emulator 报文。<br>The `RolloutBuffer` stores `(T, N)` trajectories and now exposes `_scalar()` helpers to normalise `numpy` payloads, keeping metrics and adaptive logic compatible with fc-emulator style payloads.
 - `src/utils/replay.py` 提供 `PrioritizedReplay`，按优势绝对值决定权重，实现混合 on/off-policy 更新。<br>`src/utils/replay.py` offers `PrioritizedReplay`, weighting samples by absolute advantage to support hybrid on/off-policy updates.
 - `src/utils/schedule.py` 定义 `CosineWithWarmup` 学习率策略，`src/utils/logger.py` 封装 TensorBoard/W&B 记录。<br>`src/utils/schedule.py` defines the `CosineWithWarmup` scheduler and `src/utils/logger.py` wraps TensorBoard/W&B logging.
 
@@ -31,8 +31,8 @@
 3. **Rollout 收集**：`RolloutBuffer` 以 `num_steps × num_envs` 批量与环境交互，episode 结束时重置隐藏状态并累计奖励。<br>**Rollout collection**: the `RolloutBuffer` gathers `num_steps × num_envs` interactions, resets hidden states when episodes finish, and aggregates returns.
 4. **目标计算**：`compute_returns` 使用 V-trace/GAE 生成价值目标与优势；启用 PER 时将样本推入优先缓存。<br>**Target computation**: `compute_returns` derives value targets and advantages via V-trace/GAE; with PER enabled, samples are pushed into the priority buffer.
 5. **反向传播**：合成策略、价值、熵损失并应用梯度裁剪/累积；AMP 缩放、学习率调度与权重衰减同步执行。<br>**Backpropagation**: combine policy, value, and entropy losses, applying gradient clipping/accumulation alongside AMP scaling, schedulers, and weight decay.
-6. **持久化与日志**：定期写入 TensorBoard/W&B、保存 checkpoint 及运行配置 JSON，供恢复或评估使用。<br>**Persistence & logging**: periodically log to TensorBoard/W&B, save checkpoints, and export run configuration JSON for resumption and evaluation.
-7. **返回指标**：`run_training` 输出 `avg_return` 等统计，供 Optuna 等调用。<br>**Return metrics**: `run_training` returns `avg_return` and related statistics for downstream tools like Optuna.
+6. **持久化与日志**：定期写入 TensorBoard/W&B 与结构化 JSONL，新增字段涵盖 `env_progress_dx`、`stagnation_envs`、`adaptive_ratio_fallback`、`wrapper_distance_weight` 等诊断，再保存 checkpoint 与运行配置 JSON 供恢复使用。<br>**Persistence & logging**: periodically log to TensorBoard/W&B and a structured JSONL feed with metrics like `env_progress_dx`, `stagnation_envs`, `adaptive_ratio_fallback`, and `wrapper_distance_weight`, then save checkpoints and run configs for resumption.
+7. **返回指标**：`run_training` 输出 `avg_return` 等统计，可被 Optuna 及稳态训练脚本复用。<br>**Return metrics**: `run_training` returns `avg_return` and related statistics reused by Optuna sweeps and the stable launcher scripts.
 
 ## 评估流程 | Evaluation Flow (`test.py`)
 - CLI 解析 checkpoint、关卡与渲染选项，构造单环境并启用录像。<br>CLI parameters select checkpoints, stages, and rendering options, constructing a single env with optional video recording.
@@ -41,6 +41,7 @@
 
 ## 自动化与工具 | Automation & Tooling
 - `scripts/optuna_search.py` 通过短程训练评估超参组合，输出最佳 `avg_return`。<br>`scripts/optuna_search.py` evaluates hyper-parameter candidates via short training runs and returns the best `avg_return`.
+- `scripts/train_stable_sync.sh` / `scripts/train_stable_async.sh` 提供稳态训练入口：前者针对同步调试（num_envs=2），后者默认启用 `--async-env --confirm-async --overlap-collect --parent-prewarm` 并输出独立日志/保存路径，均支持 `--dry-run` 与环境变量覆盖。<br>`scripts/train_stable_sync.sh` and `scripts/train_stable_async.sh` deliver stable launchers for sync and async regimes, supporting `--dry-run` and environment overrides while defaulting to isolated log/save directories.
 - `requirements.txt`、`environment.yml`、`Dockerfile` 覆盖 pip、conda、Docker 三种环境搭建方式。<br>`requirements.txt`, `environment.yml`, and the `Dockerfile` cover pip, conda, and Docker workflows.
 - `src/utils/monitor.py`（与 CLI 开关配合）提供 CPU/GPU 监控，日志写入 TensorBoard 或 JSONL。<br>`src/utils/monitor.py`, together with CLI switches, provides CPU/GPU monitoring with outputs to TensorBoard or JSONL.
 

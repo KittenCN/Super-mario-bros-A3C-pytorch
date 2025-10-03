@@ -19,8 +19,11 @@ python -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# 训练 | Train
-python train.py --world 1 --stage 1 --num-envs 8 --total-updates 50000
+# 训练 | Train（同步向量环境稳态配置）
+bash scripts/train_stable_sync.sh
+
+# 异步压力测试（可选，高并发+overlap）
+bash scripts/train_stable_async.sh
 
 # 评估（基于元数据）| Evaluate (metadata-driven)
 python test.py --checkpoint trained_models/a3c_world1_stage1_latest.pt --episodes 5
@@ -39,7 +42,12 @@ DISABLE_OVERLAP=1 NO_COMPILE=1 bash scripts/run_2080ti_resume.sh --dry-run
 
 # 运行奖励塑形烟雾测试 (确保距离/塑形指标可产生非零)
 pytest -k test_shaping_smoke -q
+
+# 自适应写回集成测试 (distance_weight 注入)
+pytest -k adaptive_injection_integration -q
 ```
+
+> **提示 | Tip**：`train_stable_sync.sh` 与 `train_stable_async.sh` 均支持 `--dry-run` 预览命令，以及通过环境变量覆盖参数（例如 `RUN_NAME`、`TOTAL_UPDATES`、`NUM_ENVS`）。同步脚本默认 `num_envs=2` 适合调试，异步脚本默认 `num_envs=4` 并开启 `--overlap-collect` 与 `--parent-prewarm` 用于稳定的并发训练。
 
 > **提示 | Tip**：默认依赖 `torch>=2.1`。如改用 `gymnasium-super-mario-bros`，请同步调整 `requirements.txt`。<br>Default dependency targets `torch>=2.1`. If you switch to `gymnasium-super-mario-bros`, update `requirements.txt` accordingly.
 
@@ -190,14 +198,16 @@ python train.py ... \
 - `src/utils/`：RolloutBuffer、PrioritizedReplay、CosineWithWarmup、日志工具。<br>`src/utils/`: RolloutBuffer, PrioritizedReplay, CosineWithWarmup, logging utilities.
 - `train.py`：端到端训练编排（AMP、compile、PER、checkpoint）。<br>`train.py`: end-to-end training orchestration (AMP, compile, PER, checkpointing).
 - `test.py`：评估脚本，支持视频录制与确定性策略执行。<br>`test.py`: evaluation script with deterministic execution and video capture.
-- `scripts/`：自动化工具（如 Optuna 搜索）。<br>`scripts/`: automation helpers (e.g. Optuna search).
+- `scripts/`：自动化工具（Optuna 搜索、诊断脚本、稳态训练封装）。<br>`scripts/`: automation helpers including Optuna search, diagnostics, and stable training launchers.
 
 ## 调试提示 | Debugging Notes
 - 若异步环境构建出现超时或 `nes_py` 溢出，请参阅 `docs/ENV_DEBUGGING_REPORT.md`。<br>If async env construction times out or `nes_py` overflows occur, see `docs/ENV_DEBUGGING_REPORT.md`.
 - 可通过 `--sync-env` 或 `--force-sync` 暂时回退到同步向量环境以验证训练流程。<br>Temporarily fall back to synchronous vector envs using `--sync-env` or `--force-sync` to validate the training loop.
 - `--parent-prewarm`、`--parent-prewarm-all`、`--worker-start-delay` 有助于减少 NES 初始竞争。<br>`--parent-prewarm`, `--parent-prewarm-all`, and `--worker-start-delay` reduce NES initialisation contention.
- - 异步模式需显式确认：即使传入 `--async-env` 仍需 `--confirm-async` 或设置 `MARIO_ENABLE_ASYNC=1` 才会真正启用，以避免误用不稳定路径。
- - PER 回放：默认启用观测 uint8 压缩；`advantages`/`target_values` 使用 FP16 存储并在采样时转回 float32，若需关闭设 `MARIO_PER_FP16_SCALARS=0`。
+- 新增推进/停滞诊断指标：`env_progress_dx`（每轮累计正向位移）、`stagnation_envs`、`stagnation_mean_steps` 以及 `adaptive_ratio_fallback`（当距离增量>0 但占比为 0 时的回退权重）。日志内的 `env_positive_dx_ratio` 现已与实际推进同步。
+- `MARIO_SHAPING_DEBUG=1` 将在首批步数内输出 `[reward][dx] first_positive_dx ...`，若连续步缺失 `x_pos` 数据会限频打印 `[reward][warn] dx_missed ...`，帮助定位 fc_emulator 报告路径。
+- 异步模式需显式确认：即使传入 `--async-env` 仍需 `--confirm-async` 或设置 `MARIO_ENABLE_ASYNC=1` 才会真正启用，以避免误用不稳定路径。
+- PER 回放：默认启用观测 uint8 压缩；`advantages`/`target_values` 使用 FP16 存储并在采样时转回 float32，若需关闭设 `MARIO_PER_FP16_SCALARS=0`。
  - 2025-10-02 修复：`PrioritizedReplay.sample` 缩进错误导致的启动中止已修正，若你在此日期前拉取代码遇到 `IndentationError` 请更新到最新版本。
  - Checkpoint 元数据现包含 `replay.per_sample_interval`，用于恢复时对齐 PER 抽样策略；所有 `.pt/.json` 采用原子写入减少半写风险。
  - 已添加 `pytest.ini` 屏蔽与项目无关的 `pkg_resources` DeprecationWarning，保持测试输出聚焦功能性失败。
