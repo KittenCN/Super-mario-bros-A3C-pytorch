@@ -1582,7 +1582,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         timeout = getattr(env_cfg, "reset_timeout", 60.0)
         start_construct = time.time()
         print(f"[train] Starting environment construction with timeout={timeout}s...")
-        env_cancel_event = threading.Event()
+        env_cancel_event = threading.Event() if not env_cfg.asynchronous else None
 
         def _construct_env():
             return create_vector_env(env_cfg, cancel_event=env_cancel_event)
