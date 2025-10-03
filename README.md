@@ -120,6 +120,67 @@ FORCE_PHASE2=1 PHASE2_EXTRA="NO_COMPILE=1" bash scripts/auto_phase_training.sh
 ```
 生成的每阶段目录下写入 `.phase_done` 记录本阶段 meta，脚本可重入并跳过已完成阶段。用户可通过 `PHASE*_RUN / PHASE*_UPDATES / PHASE*_DISTANCE_WEIGHT` 等变量覆盖，详见脚本顶部注释。
 
+### 推进自救与奖励调度 | Progress Self-Rescue & Reward Scheduling
+冷启动或早期停滞时可组合以下机制加速出现正向位移并逐步退出辅助：
+
+| 机制 | 目的 | 关键参数 | 退出条件 |
+|------|------|----------|----------|
+| Scripted Forward / Sequence | 立即推进出起点 | `--scripted-forward-frames`, `--scripted-sequence` | 帧数耗尽 |
+| Forward Probe | 自动选择最优前进动作 | `--probe-forward-actions` | 一次性 |
+| Early Shaping Window | 放大距离奖励信号 | `--early-shaping-window`, `--early-shaping-distance-weight` | 达到窗口上限 |
+| Auto Bootstrap | 在阈值前仍 0 距离时介入 | `--auto-bootstrap-threshold`, `--auto-bootstrap-frames` | 剩余帧=0 |
+| Secondary Script Injection | Plateau 后二次突破 | `--secondary-script-threshold`, `--secondary-script-frames` | 剩余帧=0 |
+| Distance / Penalty Anneal | 平滑衔接主策略 | `--reward-distance-weight[-final/-anneal-steps]`, `--death-penalty-*` | 退火完成 |
+| Milestone Bonus | 强化持续推进 | `--milestone-interval`, `--milestone-bonus` | 可持续 (阈值递增) |
+| Episode Timeout | 促使更快获得 returns | `--episode-timeout-steps` | 每局重启 |
+| Adaptive Distance / Entropy | 动态平衡探索与推进 | `--adaptive-*` 系列 | 可持续 |
+
+推荐早期配置示例（Phase1 冷启动 2k updates）：
+```bash
+python train.py --world 1 --stage 1 --action-type extended --num-envs 8 \
+	--total-updates 2000 --rollout-steps 32 \
+	--reward-distance-weight 0.05 --reward-distance-weight-final 0.02 --reward-distance-weight-anneal-steps 40000 \
+	--death-penalty-start 0 --death-penalty-final -5 --death-penalty-anneal-steps 30000 \
+	--scripted-forward-frames 240 --probe-forward-actions 8 \
+	--early-shaping-window 60 --early-shaping-distance-weight 0.08 \
+	--auto-bootstrap-threshold 40 --auto-bootstrap-frames 200 \
+	--secondary-script-threshold 100 --secondary-script-frames 160 \
+	--milestone-interval 300 --milestone-bonus 0.5 \
+	--episode-timeout-steps 1200 --enable-ram-x-parse --metrics-path run_metrics.jsonl
+```
+迁移至 Phase2（主学习阶段）时可显著降低 distance_weight、禁用脚本与 early window、保留 milestone 与 timeout：
+```bash
+python train.py --world 1 --stage 1 --action-type extended --num-envs 8 \
+	--total-updates 30000 --rollout-steps 64 \
+	--reward-distance-weight 0.02 --reward-distance-weight-final 0.01 --reward-distance-weight-anneal-steps 80000 \
+	--death-penalty-start -2 --death-penalty-final -6 --death-penalty-anneal-steps 60000 \
+	--milestone-interval 500 --milestone-bonus 0.25 --episode-timeout-steps 2000 \
+	--metrics-path run_metrics_phase2.jsonl
+```
+关键监控指标：
+- `env_distance_delta_sum`：若连续多个 log 周期为 0，脚本/探测未生效或动作集合无推进。
+- `env_positive_dx_ratio`：衡量分布式探索覆盖；低于 0.25 持续多轮可再触发脚本。
+- `milestone_count`：应阶梯式上升；停滞时结合 secondary_script。
+- `avg_return`：提高 Episode 终结频率（timeout）后通常开始上升。
+
+#### 自适应调度 (Adaptive Scheduling)
+可选激活一组基于推进占比 (env_positive_dx_ratio) 的动态调整：
+```bash
+python train.py ... \
+	--adaptive-positive-dx-window 50 \
+	--adaptive-distance-weight-max 0.05 --adaptive-distance-weight-min 0.005 \
+	--adaptive-distance-ratio-low 0.05 --adaptive-distance-ratio-high 0.30 --adaptive-distance-lr 0.05 \
+	--adaptive-entropy-beta-max 0.02 --adaptive-entropy-beta-min 0.003 \
+	--adaptive-entropy-ratio-low 0.05 --adaptive-entropy-ratio-high 0.30 --adaptive-entropy-lr 0.10
+```
+机制说明：
+- avg_ratio < low: 提高 distance_weight 与 entropy_beta 以鼓励探索 & 推进；
+- avg_ratio > high: 降低两者，减少过度随机与 shaping 影响；
+- 中间区: 缓慢滑动，无剧烈波动。
+日志新增: `adaptive_distance_weight`, `adaptive_entropy_beta`, `adaptive_ratio_avg`。
+建议：在冷启动机制已保证快速产生正向位移后再启用，避免早期震荡。
+
+
 ## 项目结构 | Project Structure
 - `src/envs/`：环境工厂、奖励塑形、帧处理、录像封装。<br>`src/envs/`: environment factories, reward shaping, frame processing, video wrappers.
 - `src/models/`：IMPALA 残差块、序列模块、NoisyLinear 组件。<br>`src/models/`: IMPALA residual blocks, sequence modules, and NoisyLinear components.

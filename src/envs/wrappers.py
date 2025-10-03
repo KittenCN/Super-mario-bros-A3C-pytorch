@@ -24,8 +24,15 @@ class RewardConfig:
     score_weight: float = 1.0 / 40.0
     # 位置推进奖励权重：对 (x_pos_t - x_pos_{t-1}) 的正向增量给予加成
     distance_weight: float = 1.0 / 80.0
+    # 若需要对 distance_weight 做线性退火，可指定最终值与步数（按 wrapper step 计数）
+    distance_weight_final: float | None = None
+    distance_weight_anneal_steps: int = 0
     flag_reward: float = 5.0
     death_penalty: float = -5.0
+    # 同理可对 death_penalty 做从 start -> final 的线性插值（通常从 0 降到负值，减小早期学习噪声）
+    death_penalty_start: float | None = None
+    death_penalty_final: float | None = None
+    death_penalty_anneal_steps: int = 0
     # 原始全局缩放（保持向后兼容，如果未启用动态调度即使用该值）
     scale: float = 0.1
     # 动态缩放：线性插值 (0 -> anneal_steps) 从 scale_start 到 scale_final
@@ -174,6 +181,22 @@ class MarioRewardWrapper(gym.Wrapper):
         # 若用户未修改默认 scale_start/scale_final，则保持与 scale 一致
         if self.config.scale_start == self.config.scale_final:
             dyn_scale = self.config.scale_start
+
+        # 距离权重动态退火（可选）
+        if self.config.distance_weight_final is not None and self.config.distance_weight_anneal_steps > 0:
+            t_dw = min(1.0, self._step_counter / float(self.config.distance_weight_anneal_steps))
+            eff_distance_weight = self.config.distance_weight + (self.config.distance_weight_final - self.config.distance_weight) * t_dw
+        else:
+            eff_distance_weight = self.config.distance_weight
+
+        # 将上面使用的 shaped_reward 中 distance_weight（对 dx>0 时添加）调整：我们之前已用 distance_weight 计算在 shaped_reward 里；
+        # 为避免重算，这里只在 dx>0 且有差异时补差值（差分法），避免复制逻辑。
+        try:
+            if eff_distance_weight != self.config.distance_weight and isinstance(dx, (int, float)) and dx > 0:
+                delta_extra = (eff_distance_weight - self.config.distance_weight) * dx
+                shaped_reward += delta_extra
+        except Exception:
+            pass
         raw_before_scale = shaped_reward
         shaped_reward *= dyn_scale
 
@@ -202,10 +225,22 @@ class MarioRewardWrapper(gym.Wrapper):
             setattr(self, "_printed_first_dx", True)
 
         if terminated or truncated:
+            # 动态 death_penalty 退火（仅 episode 终止/截断时应用）
             if info.get("flag_get"):
                 shaped_reward += self.config.flag_reward
             else:
-                shaped_reward += self.config.death_penalty
+                # 计算当前退火 death
+                dp_base = self.config.death_penalty
+                if (
+                    self.config.death_penalty_start is not None
+                    and self.config.death_penalty_final is not None
+                    and self.config.death_penalty_anneal_steps > 0
+                ):
+                    t_dp = min(1.0, self._step_counter / float(self.config.death_penalty_anneal_steps))
+                    dp_eff = self.config.death_penalty_start + (self.config.death_penalty_final - self.config.death_penalty_start) * t_dp
+                else:
+                    dp_eff = dp_base
+                shaped_reward += dp_eff
 
         # 注意：末尾不再再次乘 self.config.scale（已通过动态 dyn_scale 应用）
         return observation, shaped_reward, terminated, truncated, info

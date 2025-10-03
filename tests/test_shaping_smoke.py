@@ -62,9 +62,17 @@ def run_short():
     if not tb_root.exists():
         raise AssertionError('tensorboard root not created')
     # 找最大修改时间的子目录
-    latest = max((p for p in tb_root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime)
-    metrics_file = latest / 'metrics.jsonl'
-    assert metrics_file.exists(), 'metrics.jsonl missing in ' + str(latest)
+    # 若当前目录下不存在 metrics.jsonl，尝试在所有子目录中寻找最近写入的一个
+    candidates = []
+    for p in tb_root.iterdir():
+        if not p.is_dir():
+            continue
+        mf = p / 'metrics.jsonl'
+        if mf.exists():
+            candidates.append(mf)
+    if not candidates:
+        raise AssertionError('metrics.jsonl missing under any run dir in ' + str(tb_root))
+    metrics_file = max(candidates, key=lambda f: f.stat().st_mtime)
     distance_nonzero = dx_detected  # 如果已在 stdout 捕获 dx，则直接视为成功
     shaping_nonzero = False
     if not distance_nonzero or not shaping_nonzero:

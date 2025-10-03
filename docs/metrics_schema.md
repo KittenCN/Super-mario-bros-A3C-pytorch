@@ -49,3 +49,56 @@ Replay (PER): replay_size, replay_capacity, replay_fill_rate, replay_last_unique
 - 若使用 `--probe-forward-actions`，在训练 stdout 日志中应出现每个动作的 dx 结果；选择的 forward_action_id 之后应使 `env_distance_delta_sum` 与 `env_shaping_raw_sum` 上升。
 - 若启用 `--scripted-sequence` 但 raw_sum 仍为 0，检查：脚本动作是否匹配扩展动作集合；RAM 解析是否启用；是否在脚本阶段之前 episode 已重置。
 - `env_shaping_parse_fail` 持续递增通常意味着 RAM 地址无效或 info 结构被上游 wrapper 覆盖。
+
+### 进阶推进自救 & 退火 (2025-10-03 新增)
+- auto_bootstrap_triggered / auto_bootstrap_remaining / auto_bootstrap_action_id: 冷启动自动注入前进动作的触发与剩余帧状态。
+- secondary_script_triggered / secondary_script_remaining: 二次脚本化注入（突破 plateau）触发标记与剩余帧。
+- env_positive_dx_envs / env_positive_dx_ratio: 当前 log 周期内出现正向位移 (dx>0) 的环境数量 / 占比（基于 stagnation_steps==0 且 last_x>0 的近似估计）。
+- milestone_count / milestone_next: 已达成的里程碑数量与下一里程碑阈值 (x_pos)。当全局 max_x >= milestone_next 时递增并可附加里程碑奖励。
+- episode_timeout_steps: 配置的强制超时截断步数（>0 生效）。
+
+里程碑奖励 (milestone bonus)：在 wrapper 外部统计全局 max_x，超过每个间隔 (milestone_interval) 时向 shaping_raw_sum 追加 bonus，并按当前 last_scale 近似转换到 scaled_sum（保持 reward 规模可监控）。
+
+二次脚本注入触发条件：
+1. 达到 secondary_script_threshold update；
+2. 尚未触发 secondary_script；
+3. 当前 global max_x 未超过触发时的 plateau_baseline（初次记录）。
+触发后 remaining=secondary_script_frames*num_envs，actions 被强制为前进动作 id。
+
+Early Shaping：
+- 参数 early-shaping-window / early-shaping-distance-weight 允许在窗口内对 dx 奖励做差值补偿（不修改 wrapper 内部配置，保持可逆 / 简单）。
+
+策略调参建议：
+1. 冷启动：使用 scripted-forward-frames 与较高 distance_weight (0.05)。
+2. 若 20~30 updates 后 max_x 未>0：提高 distance_weight 或启用 auto-bootstrap。
+3. 若 max_x 停在一个 plateau（例如 40）> secondary_script_threshold：配置 secondary 脚本注入 frames（80~150）突破停滞。
+4. 进展稳定后降低 distance_weight 退火到 0.01~0.02，以便价值学习接管且避免奖励爆炸。
+
+调试顺序建议：
+distance_delta_sum -> env_positive_dx_ratio -> milestone_count -> avg_return。
+当 distance_delta_sum>0 且 avg_return 长期为 0，多数是 episode 未结束（timeout 可强制截断）或死亡惩罚仍为 0（退火未完成）。
+
+### inspect_metrics.py 示例输出
+运行命令：
+```
+python train.py --num-envs 1 --total-updates 40 --log-interval 1 --no-compile --scripted-forward-frames 64 --metrics-path tmp_metrics.jsonl
+python scripts/inspect_metrics.py --path tmp_metrics.jsonl --tail 20
+```
+可能输出：
+```
+{
+	"records_analyzed": 20,
+	"avg_env_positive_dx_ratio_recent": 0.62,
+	"last_milestone_count": 0,
+	"last_milestone_next": -1,
+	"secondary_triggered": 1,
+	"secondary_remaining": 0,
+	"auto_bootstrap_triggered": 0,
+	"first_positive_distance_update": 2,
+	"latest_update": 39
+}
+```
+字段解读：
+- avg_env_positive_dx_ratio_recent：最近窗口推进环境占比均值；<0.1 说明探索受阻，可提高 distance_weight / 启用 scripted。
+- secondary_triggered：已触发 plateau 二次脚本；若仍无增长，调大 frames 或阈值策略。
+- first_positive_distance_update：首个 distance_delta_sum>0 的 update；过晚表示 cold start 困难需加大 early shaping。

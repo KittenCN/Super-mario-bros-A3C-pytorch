@@ -19,3 +19,4 @@ ffmpeg-python>=0.2.0
 
 # Dev / Testing
 pytest>=7.4.0
+pytest-cov>=4.1.0

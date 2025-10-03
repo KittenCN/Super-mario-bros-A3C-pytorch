@@ -184,9 +184,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--slow-step-trace-window", type=float, default=120.0, help="慢 step 统计时间窗口 (秒)")
     # Reward shaping / environment control
     parser.add_argument("--reward-distance-weight", type=float, default=1.0/80.0, help="位移奖励权重")
+    parser.add_argument("--reward-distance-weight-final", type=float, default=None, help="位移奖励权重最终值 (线性退火)，未指定则不退火")
+    parser.add_argument("--reward-distance-weight-anneal-steps", type=int, default=0, help="位移奖励权重退火步数 (wrapper 内 step)，0 不启用")
     parser.add_argument("--reward-scale-start", type=float, default=0.2, help="动态缩放起始值")
     parser.add_argument("--reward-scale-final", type=float, default=0.1, help="动态缩放最终值")
     parser.add_argument("--reward-scale-anneal-steps", type=int, default=50_000, help="缩放线性退火步数 (env steps)")
+    parser.add_argument("--death-penalty-start", type=float, default=None, help="死亡惩罚退火起始值 (通常为 0，未指定则使用固定 death_penalty)")
+    parser.add_argument("--death-penalty-final", type=float, default=None, help="死亡惩罚退火最终值 (通常为负数)")
+    parser.add_argument("--death-penalty-anneal-steps", type=int, default=0, help="死亡惩罚退火步数 (wrapper 内 step 计数)，0 不启用")
     parser.add_argument("--auto-start-frames", type=int, default=0, help="开局自动发送 START(+RIGHT) 的帧数，0 禁用")
     parser.add_argument("--stagnation-warn-updates", type=int, default=20, help="连续若干 update 无 max_x 提升触发警告，<=0 关闭")
     parser.add_argument("--scripted-forward-frames", type=int, default=0, help="训练起始阶段前 N*env_num 帧强制使用前进动作 (RIGHT 或 RIGHT+B)，用于 warmup 推进，0 表示关闭")
@@ -199,6 +204,29 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--auto-bootstrap-threshold", type=int, default=0, help="若 >0 且在该 update 前距离增量始终为 0，则自动触发前进动作注入")
     parser.add_argument("--auto-bootstrap-frames", type=int, default=0, help="自动前进触发后强制执行的总帧数 (按 env step)，需与阈值搭配使用")
     parser.add_argument("--auto-bootstrap-action-id", type=int, default=None, help="自动前进阶段使用的动作 id，如未指定则尽量推断包含 RIGHT 的动作")
+    # Early shaping 强化窗口
+    parser.add_argument("--early-shaping-window", type=int, default=0, help=">0 表示前 N updates 使用更强 distance_weight 覆盖 (early-shaping)，之后恢复退火逻辑")
+    parser.add_argument("--early-shaping-distance-weight", type=float, default=None, help="early 窗口内 distance_weight 覆盖值；未提供则自动取当前 distance_weight * 2")
+    # 二次脚本注入（突破停滞）
+    parser.add_argument("--secondary-script-threshold", type=int, default=0, help=">0 时若 max_x 在该 update 之后仍未超过 plateau 值，执行二次短脚本注入")
+    parser.add_argument("--secondary-script-frames", type=int, default=0, help="二次脚本注入帧数 (按 env step，总帧=frames*num_envs)")
+    parser.add_argument("--secondary-script-forward-action-id", type=int, default=None, help="二次脚本使用的动作 id，未指定自动解析")
+    # 里程碑奖励与强制截断
+    parser.add_argument("--milestone-interval", type=int, default=0, help=">0 时每当全局 max_x 超过上一个里程碑+interval 给予额外 shaping 奖励一次")
+    parser.add_argument("--milestone-bonus", type=float, default=0.0, help="里程碑奖励数值 (添加到 shaping_raw_sum & scaled_sum 前的 raw)")
+    parser.add_argument("--episode-timeout-steps", type=int, default=0, help=">0 时对单 env episode 达到该步数强制截断以产生回报")
+    # 自适应调度：基于最近窗口 env_positive_dx_ratio 调整 entropy 与 distance 权重
+    parser.add_argument("--adaptive-positive-dx-window", type=int, default=50, help="计算正向位移比例的滑动窗口更新数，用于自适应调度 (>=10)")
+    parser.add_argument("--adaptive-distance-weight-max", type=float, default=None, help="自适应 distance_weight 上限，未设则不启用调度")
+    parser.add_argument("--adaptive-distance-weight-min", type=float, default=None, help="自适应 distance_weight 下限 (ratio 达到 high 阈值后趋近)" )
+    parser.add_argument("--adaptive-distance-ratio-low", type=float, default=0.05, help="正向位移比例低阈值 (<低阈值提升 distance_weight)")
+    parser.add_argument("--adaptive-distance-ratio-high", type=float, default=0.30, help="正向位移比例高阈值 (>高阈值衰减 distance_weight)")
+    parser.add_argument("--adaptive-distance-lr", type=float, default=0.05, help="distance_weight 自适应更新步长 (相对插值系数)")
+    parser.add_argument("--adaptive-entropy-beta-max", type=float, default=None, help="自适应 entropy_beta 上限；启用需同时设下限")
+    parser.add_argument("--adaptive-entropy-beta-min", type=float, default=None, help="自适应 entropy_beta 下限")
+    parser.add_argument("--adaptive-entropy-ratio-low", type=float, default=0.05, help="正向位移比例低阈值 (<低阈值=>提高 entropy_beta)")
+    parser.add_argument("--adaptive-entropy-ratio-high", type=float, default=0.30, help="正向位移比例高阈值 => 降低 entropy_beta")
+    parser.add_argument("--adaptive-entropy-lr", type=float, default=0.10, help="entropy_beta 自适应更新步长 (相对插值系数)")
     return parser.parse_args(argv)
 
 
@@ -214,9 +242,16 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     # 注入奖励配置
     try:
         env_cfg.reward_config.distance_weight = float(args.reward_distance_weight)
+        if getattr(args, 'reward_distance_weight_final', None) is not None:
+            env_cfg.reward_config.distance_weight_final = float(args.reward_distance_weight_final)
+            env_cfg.reward_config.distance_weight_anneal_steps = int(getattr(args, 'reward_distance_weight_anneal_steps', 0) or 0)
         env_cfg.reward_config.scale_start = float(args.reward_scale_start)
         env_cfg.reward_config.scale_final = float(args.reward_scale_final)
         env_cfg.reward_config.scale_anneal_steps = int(args.reward_scale_anneal_steps)
+        if getattr(args, 'death_penalty_start', None) is not None and getattr(args, 'death_penalty_final', None) is not None:
+            env_cfg.reward_config.death_penalty_start = float(args.death_penalty_start)
+            env_cfg.reward_config.death_penalty_final = float(args.death_penalty_final)
+            env_cfg.reward_config.death_penalty_anneal_steps = int(getattr(args, 'death_penalty_anneal_steps', 0) or 0)
     except Exception:
         pass
     # 记录 auto-start 配置（扩展字段）
@@ -294,6 +329,20 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     train_cfg.replay = dataclasses.replace(train_cfg.replay, per_sample_interval=max(1, getattr(args, 'per_sample_interval', 1)))
     train_cfg.device = args.device
     train_cfg.metrics_path = args.metrics_path
+    # 记录自适应范围到 cfg 以便后续引用（存入 model/optimizer config 简单方案：附加属性）
+    setattr(train_cfg, "adaptive_cfg", {
+        "dx_window": max(10, int(getattr(args, 'adaptive_positive_dx_window', 50))),
+        "dw_max": getattr(args, 'adaptive_distance_weight_max', None),
+        "dw_min": getattr(args, 'adaptive_distance_weight_min', None),
+        "dw_low": getattr(args, 'adaptive_distance_ratio_low', 0.05),
+        "dw_high": getattr(args, 'adaptive_distance_ratio_high', 0.30),
+        "dw_lr": getattr(args, 'adaptive_distance_lr', 0.05),
+        "ent_max": getattr(args, 'adaptive_entropy_beta_max', None),
+        "ent_min": getattr(args, 'adaptive_entropy_beta_min', None),
+        "ent_low": getattr(args, 'adaptive_entropy_ratio_low', 0.05),
+        "ent_high": getattr(args, 'adaptive_entropy_ratio_high', 0.30),
+        "ent_lr": getattr(args, 'adaptive_entropy_lr', 0.10),
+    })
     return train_cfg
 
 
@@ -842,6 +891,20 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         "announced_done": False,
         "announced_start": False,
     }
+    # Early shaping 窗口状态
+    early_shaping_window = max(0, int(getattr(args, "early_shaping_window", 0) or 0))
+    early_shaping_distance_weight = getattr(args, "early_shaping_distance_weight", None)
+    # Secondary script 注入状态
+    secondary_script_threshold = max(0, int(getattr(args, "secondary_script_threshold", 0) or 0))
+    secondary_script_frames = max(0, int(getattr(args, "secondary_script_frames", 0) or 0))
+    secondary_script_action_id = getattr(args, "secondary_script_forward_action_id", None)
+    secondary_script_state = {"remaining": 0, "triggered": False, "plateau_baseline": 0}
+    milestone_interval = max(0, int(getattr(args, "milestone_interval", 0) or 0))
+    milestone_bonus = float(getattr(args, "milestone_bonus", 0.0) or 0.0)
+    episode_timeout_steps = max(0, int(getattr(args, "episode_timeout_steps", 0) or 0))
+    milestone_state = {"next": milestone_interval if milestone_interval > 0 else None, "count": 0}
+    # 追踪每个 env 当前 episode step 数
+    per_env_episode_steps = np.zeros((cfg.env.num_envs,), dtype=np.int64)
 
     # Repro/threads
     torch.manual_seed(cfg.seed)
@@ -1539,7 +1602,21 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                 cur[1] -= 1
                                 if cur[1] <= 0:
                                     seq.pop(0)
-                    if auto_bootstrap_state["remaining"] > 0:
+                    # Secondary scripted injection 优先级最高（突破 plateau）
+                    if secondary_script_state["remaining"] > 0:
+                        sid = secondary_script_action_id
+                        if sid is None:
+                            try:
+                                sid = _resolve_forward_action_id()
+                            except Exception:
+                                sid = 0
+                        take = min(actions.numel(), secondary_script_state["remaining"])
+                        actions.view(-1)[:take] = int(sid)
+                        secondary_script_state["remaining"] = max(0, secondary_script_state["remaining"] - take)
+                        if secondary_script_state["remaining"] == 0 and not secondary_script_state.get("announced_done"):
+                            print("[train][secondary-script] 二次脚本注入结束，恢复策略动作。")
+                            secondary_script_state["announced_done"] = True
+                    elif auto_bootstrap_state["remaining"] > 0:
                         actions = _apply_auto_bootstrap_actions(actions)
                     log_probs = dist.log_prob(actions)
                     actions_cpu = actions.detach().cpu()
@@ -1616,6 +1693,15 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                     env_last_x[i_env] = int(x_val)
                                     if env_last_x[i_env] > env_max_x[i_env]:
                                         env_max_x[i_env] = env_last_x[i_env]
+                                        # 里程碑检测（基于全局 max）
+                                        if milestone_interval > 0 and milestone_state["next"] is not None:
+                                            global_candidate = int(env_max_x.max())
+                                            while milestone_state["next"] is not None and global_candidate >= milestone_state["next"]:
+                                                if milestone_bonus != 0.0:
+                                                    shaping_raw_sum += milestone_bonus
+                                                    shaping_scaled_sum += milestone_bonus * max(1.0, shaping_last_scale)
+                                                milestone_state["count"] += 1
+                                                milestone_state["next"] += milestone_interval
                                     # 正向位移统计
                                     dx = env_last_x[i_env] - env_prev_step_x[i_env]
                                     # 如果之前始终为 0，允许第一次正值直接加入 (dx = current_x)
@@ -1627,9 +1713,32 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                                     else:
                                         stagnation_steps[i_env] += 1
                                     env_prev_step_x[i_env] = env_last_x[i_env]
+                                    # Episode 步数 + 超时截断
+                                    per_env_episode_steps[i_env] += 1
+                                    if episode_timeout_steps > 0 and per_env_episode_steps[i_env] >= episode_timeout_steps:
+                                        try:
+                                            if isinstance(infos[i_env], dict):
+                                                infos[i_env]["timeout_truncate"] = True
+                                            truncated[i_env] = True
+                                        except Exception:
+                                            pass
                                     # shaping 奖励原始/缩放累积
                                     if isinstance(shaping_inf, dict):
                                         try:
+                                            # Early shaping：在窗口内动态放大 distance 权重（通过 dx 与 last dx scale 额外加成）
+                                            if early_shaping_window > 0 and update_idx < early_shaping_window and shaping_inf.get("dx"):
+                                                # 推断期望覆盖权重
+                                                target_w = early_shaping_distance_weight
+                                                if target_w is None:
+                                                    # 默认乘以 2
+                                                    target_w = float(getattr(cfg.env.env.reward_config, 'distance_weight', 1.0)) * 2.0
+                                                # 原始已加成权重为 cfg.env.env.reward_config.distance_weight (或其退火后的瞬时)；差值补偿
+                                                base_w = float(getattr(cfg.env.env.reward_config, 'distance_weight', 1.0))
+                                                dx_local = float(shaping_inf.get("dx", 0.0) or 0.0)
+                                                if dx_local > 0 and target_w > base_w:
+                                                    extra = (target_w - base_w) * dx_local * float(shaping_inf.get("scale", 1.0) or 1.0)
+                                                    shaping_scaled_sum += extra
+                                                    shaping_last_scaled += 0.0  # 不覆盖最后刻度，仅累积
                                             raw_v = shaping_inf.get("raw")
                                             scaled_v = shaping_inf.get("scaled")
                                             scale_v = shaping_inf.get("scale")
@@ -1718,6 +1827,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                             if flag:
                                 completed_returns.append(float(episode_returns[idx_env]))
                                 episode_returns[idx_env] = 0.0
+                                per_env_episode_steps[idx_env] = 0
                         if len(completed_returns) > 1000:
                             completed_returns = completed_returns[-1000:]
                     if output.hidden_state is not None:
@@ -1952,6 +2062,118 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     "env_shaping_last_scaled": float(shaping_last_scaled),
                     "env_shaping_parse_fail": int(shaping_parse_fail),
                 }
+                # 估算本 update 内有正向增量的 env 数量（基于 stagnation_steps==0 且 env_last_x>0）
+                try:
+                    if env_last_x.size:
+                        pos_envs = int(np.sum((env_last_x > 0) & (stagnation_steps == 0)))
+                        metrics_entry["env_positive_dx_envs"] = pos_envs
+                        metrics_entry["env_positive_dx_ratio"] = float(pos_envs) / float(env_last_x.size)
+                        # 自适应调度：基于 env_positive_dx_ratio 调整 distance_weight & entropy_beta
+                        try:
+                            adaptive = getattr(cfg, 'adaptive_cfg', None)
+                            if adaptive and 'env_positive_dx_ratio' in metrics_entry:
+                                ratio = float(metrics_entry['env_positive_dx_ratio'])
+                                # 保存窗口历史（放在外部 dict 上）
+                                hist = adaptive.setdefault('_ratio_hist', [])
+                                hist.append(ratio)
+                                if len(hist) > adaptive['dx_window']:
+                                    del hist[0:len(hist)-adaptive['dx_window']]
+                                avg_ratio = sum(hist)/len(hist)
+                                metrics_entry['adaptive_ratio_avg'] = round(avg_ratio,4)
+                                # Distance weight adaptive (仅当 wrapper 支持 & 提供范围)
+                                dw_max = adaptive.get('dw_max'); dw_min = adaptive.get('dw_min')
+                                if dw_max is not None and dw_min is not None and dw_max > dw_min:
+                                    # 当前使用值（以 env_cfg.reward_config.distance_weight 为中心，允许在区间内插值）
+                                    # 为避免直接写 wrapper 内部对象导致线程不安全，采用 early shaping 差值策略：维护一个运行时 delta 系数
+                                    run_adapt = adaptive.setdefault('_dw_runtime', env_cfg.reward_config.distance_weight)
+                                    target = run_adapt
+                                    if avg_ratio < adaptive['dw_low']:
+                                        # 提升 -> 向 dw_max 方向插值
+                                        target = run_adapt + (dw_max - run_adapt) * adaptive['dw_lr']
+                                    elif avg_ratio > adaptive['dw_high']:
+                                        target = run_adapt + (dw_min - run_adapt) * adaptive['dw_lr']
+                                    # 裁剪
+                                    target = min(dw_max, max(dw_min, target))
+                                    adaptive['_dw_runtime'] = target
+                                    metrics_entry['adaptive_distance_weight'] = target
+                                # Entropy beta adaptive
+                                ent_max = adaptive.get('ent_max'); ent_min = adaptive.get('ent_min')
+                                if ent_max is not None and ent_min is not None and ent_max > ent_min:
+                                    run_ent = adaptive.setdefault('_ent_runtime', cfg.optimizer.beta_entropy)
+                                    ent_target = run_ent
+                                    if avg_ratio < adaptive['ent_low']:
+                                        ent_target = run_ent + (ent_max - run_ent) * adaptive['ent_lr']
+                                    elif avg_ratio > adaptive['ent_high']:
+                                        ent_target = run_ent + (ent_min - run_ent) * adaptive['ent_lr']
+                                    ent_target = min(ent_max, max(ent_min, ent_target))
+                                    adaptive['_ent_runtime'] = ent_target
+                                    # 立即更新 cfg.optimizer.beta_entropy 供下个 loss 使用
+                                    cfg.optimizer = dataclasses.replace(cfg.optimizer, beta_entropy=ent_target)
+                                    metrics_entry['adaptive_entropy_beta'] = ent_target
+                        except Exception as _adapt_e:  # 仅记录，不中断训练
+                            metrics_entry['adaptive_error'] = str(_adapt_e)[:120]
+                except Exception:
+                    pass
+                # Plateau 检测：若 secondary_script 尚未触发，满足 threshold 且 max_x 未超过 baseline
+                try:
+                    if (
+                        secondary_script_threshold > 0
+                        and secondary_script_frames > 0
+                        and not secondary_script_state["triggered"]
+                        and update_idx >= secondary_script_threshold
+                    ):
+                        current_global_max = int(env_max_x.max()) if env_max_x.size else 0
+                        if secondary_script_state["plateau_baseline"] == 0:
+                            secondary_script_state["plateau_baseline"] = current_global_max
+                        # 若当前 max 仍不大于 baseline（允许等于）则触发
+                        if current_global_max <= secondary_script_state["plateau_baseline"]:
+                            secondary_script_state["remaining"] = secondary_script_frames * cfg.env.num_envs
+                            secondary_script_state["triggered"] = True
+                            print(f"[train][secondary-script] 触发二次脚本注入 baseline={secondary_script_state['plateau_baseline']} frames={secondary_script_frames}")
+                            metrics_entry["secondary_script_triggered"] = 1
+                        else:
+                            metrics_entry["secondary_script_progress_surpassed"] = 1
+                    if secondary_script_state["triggered"]:
+                        metrics_entry["secondary_script_remaining"] = int(secondary_script_state["remaining"])
+                except Exception:
+                    pass
+                # 追加 auto-bootstrap 状态与诊断字段，便于外部快速判断是否已触发/剩余帧数
+                try:
+                    metrics_entry["auto_bootstrap_triggered"] = 1 if auto_bootstrap_state.get("triggered") else 0
+                    metrics_entry["auto_bootstrap_remaining"] = int(auto_bootstrap_state.get("remaining", 0))
+                    if auto_bootstrap_state.get("action_id") is not None:
+                        metrics_entry["auto_bootstrap_action_id"] = int(auto_bootstrap_state.get("action_id"))
+                except Exception:
+                    pass
+                # 若累计距离仍为 0，输出一次额外诊断（每 50 updates 最多一次，避免刷屏）
+                try:
+                    if (
+                        int(metrics_entry.get("env_distance_delta_sum", 0) or 0) == 0
+                        and update_idx > 0
+                        and update_idx % 50 == 0
+                    ):
+                        # 采样前若干 env 的最近 x / max / prev_step 差异
+                        sample_n = min(4, env_last_x.shape[0]) if hasattr(env_last_x, 'shape') else 0
+                        if sample_n > 0:
+                            last_sample = [int(env_last_x[i]) for i in range(sample_n)]
+                            prev_sample = [int(env_prev_step_x[i]) for i in range(sample_n)]
+                            max_sample = [int(env_max_x[i]) for i in range(sample_n)]
+                            print(
+                                f"[train][diag] update={update_idx} zero-distance persists last_x={last_sample} prev_x={prev_sample} max_x={max_sample} "
+                                f"raw_sum={metrics_entry.get('env_shaping_raw_sum')} scaled_sum={metrics_entry.get('env_shaping_scaled_sum')} "
+                                f"last_dx={metrics_entry.get('env_shaping_last_dx')} scale={metrics_entry.get('env_shaping_last_scale')}"
+                            )
+                except Exception:
+                    pass
+                # 里程碑与超时统计写入
+                try:
+                    if milestone_interval > 0:
+                        metrics_entry["milestone_count"] = int(milestone_state["count"])
+                        metrics_entry["milestone_next"] = int(milestone_state["next"]) if milestone_state["next"] is not None else -1
+                    if episode_timeout_steps > 0:
+                        metrics_entry["episode_timeout_steps"] = int(episode_timeout_steps)
+                except Exception:
+                    pass
                 # 若存在 forward 探测结果，仅在首个 log 写入一次（前 8 个）
                 if forward_probe_result is not None and update_idx == global_update:
                     for i, (aid, dx_probe, last_x_probe) in enumerate(forward_probe_result[:8]):
