@@ -64,6 +64,7 @@ If the sidecar metadata JSON is missing, `test.py` will reconstruct it from the 
 - 常用参数：`--num-envs`、`--rollout-steps`、`--recurrent-type {gru,lstm,transformer,none}`、`--entropy-beta`、`--value-coef`、`--clip-grad`、`--random-stage`、`--stage-span`、`--per`。<br>Key flags include `--num-envs`, `--rollout-steps`, `--recurrent-type {gru,lstm,transformer,none}`, `--entropy-beta`, `--value-coef`, `--clip-grad`, `--random-stage`, `--stage-span`, and `--per`.
 - `--no-amp` 与 `--no-compile` 可在调试时关闭 AMP 或 `torch.compile`。<br>`--no-amp` and `--no-compile` disable AMP or `torch.compile` when debugging.
 - `--wandb-project`、`--metrics-path`、`--enable-tensorboard` 控制日志输出目的地。<br>`--wandb-project`, `--metrics-path`, and `--enable-tensorboard` control logging destinations.
+- `--metrics-rotate-max-mb` / `--metrics-rotate-retain` 控制 `metrics.jsonl` 的滚动压缩；`--heartbeat-path` 与 `--stall-dump-dir` 可自定义心跳及卡顿堆栈输出；`--per-gpu-sample` / `--per-gpu-sample-fallback-ms` 管理 PER GPU 采样与回退；`--adaptive-lr-scale-*` 配置学习率缩放自适应。<br>`--metrics-rotate-max-mb` / `--metrics-rotate-retain` manage metrics rotation; `--heartbeat-path` and `--stall-dump-dir` customise heartbeat and stall dumps; `--per-gpu-sample` / `--per-gpu-sample-fallback-ms` control PER GPU sampling; `--adaptive-lr-scale-*` tune adaptive LR scaling.
 - 环境构建超时可用 `--env-reset-timeout` 调整；默认按环境数量线性放大。<br>Adjust `--env-reset-timeout` to tune environment construction timeouts; by default it scales with the number of envs.
 
 ## 评估与监控 | Evaluation & Monitoring
@@ -84,7 +85,7 @@ If the sidecar metadata JSON is missing, `test.py` will reconstruct it from the 
 	python scripts/benchmark_overlap.py --num-envs 4 8 --rollout-steps 32 64 --updates 300 --warmup-fraction 0.3
 	```
 	输出 CSV `benchmarks/bench_overlap_*.csv`，字段含义见首行表头。
-- **PER 优先级分析**：训练日志新增 `replay_priority_mean/p50/p90/p99` 与采样唯一率 `replay_avg_unique_ratio`；用于监控优先级分布是否塌缩；`--per-gpu-sample` 可启用 torch searchsorted 采样，在 GPU/CPU 上统一执行减轻 host→device 开销。
+- **PER 优先级分析**：训练日志新增 `replay_priority_mean/p50/p90/p99` 与采样唯一率 `replay_avg_unique_ratio`；用于监控优先级分布是否塌缩；`--per-gpu-sample` 可启用 torch searchsorted 采样，在 GPU/CPU 上统一执行减轻 host→device 开销，并可通过 `--per-gpu-sample-fallback-ms` 设定自动回退阈值。
 - **FP16 标量存储**：设置环境变量 `MARIO_PER_FP16_SCALARS=0` 可关闭默认的 FP16 advantages/target_values 压缩（若需严格数值一致性对比）。
 - **Docker**：`docker build -t mario-a3c .` 后通过 `docker run --gpus all mario-a3c` 启动训练。<br>**Docker**: build with `docker build -t mario-a3c .` then launch via `docker run --gpus all mario-a3c`.
 - **Conda**：`conda env create -f environment.yml && conda activate mario-a3c`。<br>**Conda**: run `conda env create -f environment.yml && conda activate mario-a3c`.

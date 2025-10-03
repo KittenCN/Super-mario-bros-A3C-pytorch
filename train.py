@@ -50,6 +50,7 @@ import contextlib  # noqa: E402
 # Ensure we don't attempt to override an already-initialised start method
 # later in the module; the selection above is sufficient.
 import dataclasses  # noqa: E402
+import faulthandler  # noqa: E402
 import json  # noqa: E402
 import math  # noqa: E402
 import multiprocessing as _mp  # noqa: E402
@@ -61,6 +62,8 @@ import warnings  # noqa: E402
 from datetime import UTC, datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Any, Dict, List, Optional, Sequence, Tuple  # noqa: E402
+import gzip  # noqa: E402
+import shutil  # noqa: E402
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -93,7 +96,7 @@ from src.utils import (  # noqa: E402
 from src.utils.adaptive import AdaptiveConfig, AdaptiveScheduler  # noqa: E402
 from src.utils.heartbeat import HeartbeatReporter  # noqa: E402
 from src.utils.monitor import Monitor  # noqa: E402
-from src.utils.metrics_export import write_latest_metrics  # noqa: E402
+from src.utils.metrics_export import rotate_metrics_file, write_latest_metrics  # noqa: E402
 
 try:  # optional dependency for resource monitoring
     import psutil  # type: ignore
@@ -217,6 +220,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="在支持时启用 GPU 侧优先级采样以减少 host->device 开销",
     )
+    parser.add_argument(
+        "--per-gpu-sample-fallback-ms",
+        type=float,
+        default=0.0,
+        help="GPU 采样耗时超过该毫秒（连续多次）时自动回退到 CPU，0 表示禁用",
+    )
     parser.add_argument("--project", type=str, default="mario-a3c")
     parser.add_argument(
         "--device",
@@ -230,6 +239,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to JSONL file for periodic metrics dump",
+    )
+    parser.add_argument(
+        "--metrics-rotate-max-mb",
+        type=float,
+        default=0.0,
+        help="超过该大小(MB) 时滚动压缩 metrics JSONL，0 表示关闭",
+    )
+    parser.add_argument(
+        "--metrics-rotate-retain",
+        type=int,
+        default=5,
+        help="保留的 metrics 压缩文件数量",
     )
     parser.add_argument(
         "--env-reset-timeout",
@@ -296,6 +317,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="Heartbeat JSONL 输出路径，未指定则写入 run_dir/heartbeat.jsonl",
+    )
+    parser.add_argument(
+        "--stall-dump-dir",
+        type=str,
+        default=None,
+        help="心跳检测到 stall 时将堆栈写入该目录，默认 run_dir/stall_dumps",
     )
     parser.add_argument(
         "--overlap-collect",
@@ -722,9 +749,20 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     train_cfg.replay = dataclasses.replace(
         train_cfg.replay,
         use_gpu_sampler=bool(getattr(args, "per_gpu_sample", False)),
+        gpu_sampler_fallback_ms=max(0.0, float(getattr(args, "per_gpu_sample_fallback_ms", 0.0))),
     )
     train_cfg.device = args.device
     train_cfg.metrics_path = args.metrics_path
+    setattr(
+        train_cfg,
+        "metrics_rotate_max_mb",
+        max(0.0, float(getattr(args, "metrics_rotate_max_mb", 0.0))),
+    )
+    setattr(
+        train_cfg,
+        "metrics_rotate_retain",
+        max(0, int(getattr(args, "metrics_rotate_retain", 5))),
+    )
     # 记录自适应范围到 cfg 以便后续引用（存入 model/optimizer config 简单方案：附加属性）
     setattr(
         train_cfg,
@@ -747,6 +785,7 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
         ),
     )
     setattr(train_cfg, "heartbeat_path", args.heartbeat_path)
+    setattr(train_cfg, "stall_dump_dir", getattr(args, "stall_dump_dir", None))
     return train_cfg
 
 
@@ -936,6 +975,15 @@ def _per_step_update(
     per_sample, per_timings = per_buffer.sample_detailed(batch_size)
     metrics["sample_time_ms"] = (time.time() - per_sample_start) * 1000.0
     metrics["timings"] = dict(per_timings)
+    fallback_ms = float(getattr(cfg.replay, "gpu_sampler_fallback_ms", 0.0))
+    if fallback_ms > 0 and per_buffer.using_gpu_sampler:
+        total_ms = per_timings.get("total", metrics["sample_time_ms"])
+        if per_buffer.register_sample_time(total_ms, fallback_ms):
+            metrics["gpu_sampler_fallback"] = True
+        else:
+            metrics["gpu_sampler_fallback"] = False
+    else:
+        metrics["gpu_sampler_fallback"] = False
 
     if per_sample is None:
         return per_loss, metrics
@@ -1821,6 +1869,15 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
     if heartbeat_log_path is None and hb_interval > 0:
         try:
             heartbeat.set_log_path(Path(run_dir) / "heartbeat.jsonl")
+        except Exception:
+            pass
+    stall_dump_dir_cfg = getattr(cfg, "stall_dump_dir", None)
+    if hb_interval > 0:
+        try:
+            if stall_dump_dir_cfg:
+                heartbeat.set_stall_dump_dir(Path(stall_dump_dir_cfg).expanduser())
+            else:
+                heartbeat.set_stall_dump_dir(Path(run_dir) / "stall_dumps")
         except Exception:
             pass
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
@@ -3334,9 +3391,17 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 metrics_entry["replay_per_sample_interval"] = (
                     int(cfg.replay.per_sample_interval) if per_buffer is not None else 0
                 )
+                stats_snapshot = per_buffer.stats() if per_buffer is not None else {}
                 metrics_entry["replay_gpu_sampler"] = (
-                    1 if (per_buffer is not None and cfg.replay.use_gpu_sampler) else 0
+                    1 if (per_buffer is not None and per_buffer.using_gpu_sampler) else 0
                 )
+                metrics_entry["replay_gpu_sampler_fallback"] = (
+                    1 if bool(per_metrics.get("gpu_sampler_fallback")) else 0
+                )
+                if stats_snapshot.get("gpu_sampler_reason"):
+                    metrics_entry["replay_gpu_sampler_reason"] = stats_snapshot[
+                        "gpu_sampler_reason"
+                    ]
 
                 # PER stats (if enabled)
                 if per_buffer is not None:
@@ -3569,6 +3634,14 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                 try:
                     write_latest_metrics(
                         metrics_entry, metrics_file.with_name("latest.parquet")
+                    )
+                except Exception:
+                    pass
+                try:
+                    rotate_metrics_file(
+                        metrics_file,
+                        getattr(cfg, "metrics_rotate_max_mb", 0.0),
+                        getattr(cfg, "metrics_rotate_retain", 5),
                     )
                 except Exception:
                     pass

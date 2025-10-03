@@ -64,9 +64,9 @@
 ## 4. 中期 (T2, 1 个月)
 1. (已完成) Heartbeat JSONL + `metrics/latest.parquet` 快照输出，支撑快速健康度排查（2025-10-04）。
 2. (已完成) PER push 批量化 + `use_gpu_sampler` torch 采样原型，降低 host→device 开销（2025-10-04）。
-3. (进行中) Fail-fast 卡顿检测：集成 faulthandler/thread dump，自动采集慢 step 栈信息。
-4. (新增) 指标历史归档：滚动压缩 metrics JSONL / Parquet，避免长期运行文件膨胀。
-5. (新增) GPU 采样性能基准：记录 CPU/GPU 路径耗时，提供自动 fallback 判定。
+3. (已完成) Fail-fast 卡顿检测：心跳超时自动落库 `stall_dumps/` 堆栈（2025-10-04）。
+4. (已完成) 指标历史归档：`--metrics-rotate-max-mb` + gzip 滚动压缩，`metrics/latest.parquet` 持续刷新（2025-10-04）。
+5. (已完成) GPU 采样性能基准/回退：记录耗时，超过 `--per-gpu-sample-fallback-ms` 自动切换 CPU（2025-10-04）。
 
 ## 5. 长期 (T3, 1–3 个月)
 1. 多进程 Actor-Learner：独立进程通过共享内存 ring 或 ZeroMQ / torch.distributed 传输 (obs, action, value)。
@@ -120,12 +120,10 @@
 - 自适应学习率缩放 (`adaptive_lr_scale`) + CLI 配置（2025-10-04）
 
 ## 11. 新增下一步考量（2025-10-02 更新）
-1. 指标与 heartbeat 长期归档：滚动压缩/分片 `metrics.jsonl` 与 Parquet，防止长跑占用过多磁盘。
-2. GPU 采样性能基准：对比 CPU/GPU `use_gpu_sampler` 耗时，并在指标中记录自动 fallback 条件。
-3. Checkpoint 原子写：采用临时文件 + fsync + rename 防止中断产生半文件。
-4. 训练恢复兼容性测试矩阵：针对不同 `torch` / `gymnasium` / `nes-py` 版本做最小 smoke（脚本化）。
-5. 异步模式进一步隔离验证：单独最小进程示例定位 `mario_make()` 阻塞调用栈（gdb / faulthandler）。
-6. GPU 可用性守卫：启动时若检测不到 CUDA，提示用户切换设备或直接拒绝长跑，避免 0.1 SPS 的无效训练。
+1. Checkpoint 原子写：采用临时文件 + fsync + rename 防止中断产生半文件。
+2. 训练恢复兼容性测试矩阵：针对不同 `torch` / `gymnasium` / `nes-py` 版本做最小 smoke（脚本化）。
+3. 异步模式进一步隔离验证：单独最小进程示例定位 `mario_make()` 阻塞调用栈（gdb / faulthandler）。
+4. GPU 可用性守卫：启动时若检测不到 CUDA，提示用户切换设备或直接拒绝长跑，避免 0.1 SPS 的无效训练。
 
 ---
 如需我直接开始第 1 步“global_step 回填脚本”实现，请提出指令（例如：`实现回填脚本`）。

@@ -101,6 +101,10 @@ class PrioritizedReplay:
             self._priority_tensor = torch.zeros(
                 (self.capacity,), device=self._sampler_device, dtype=torch.float32
             )
+        self._gpu_sampler_active = self._use_gpu_sampler
+        self._gpu_disable_reason: Optional[str] = None
+        self._gpu_slow_streak = 0
+        self._gpu_fallback_streak = 3
 
     def stats(self) -> dict:
         """返回环形缓冲统计信息 + 优先级分布指标。
@@ -144,7 +148,8 @@ class PrioritizedReplay:
             "priority_p50": prio_p50,
             "priority_p90": prio_p90,
             "priority_p99": prio_p99,
-            "gpu_sampler": bool(self._use_gpu_sampler),
+            "gpu_sampler": bool(self._gpu_sampler_active),
+            "gpu_sampler_reason": self._gpu_disable_reason,
         }
 
     # ----------------- 内部工具 -----------------
@@ -217,6 +222,10 @@ class PrioritizedReplay:
         if self._priority_tensor is None:
             return None
         return self._priority_tensor[: self.size]
+
+    @property
+    def using_gpu_sampler(self) -> bool:
+        return bool(self._use_gpu_sampler and self._gpu_sampler_active)
 
     def _draw_indices(
         self,
@@ -419,3 +428,34 @@ class PrioritizedReplay:
         # 防止全部衰减为 0
         if np.all(self.priorities[: self.size] <= 0):
             self.priorities[: self.size] += 1e-5
+
+    def disable_gpu_sampler(self, reason: Optional[str] = None) -> None:
+        if not self._use_gpu_sampler:
+            return
+        self._use_gpu_sampler = False
+        self._gpu_sampler_active = False
+        self._priority_tensor = None
+        self._gpu_disable_reason = reason
+        print("[replay][info] gpu sampler disabled" + (f": {reason}" if reason else ""))
+
+    def register_sample_time(
+        self, total_ms: float, fallback_ms: float, streak: int = 3
+    ) -> bool:
+        if not self.using_gpu_sampler:
+            self._gpu_slow_streak = 0
+            return False
+        if fallback_ms <= 0:
+            self._gpu_slow_streak = 0
+            return False
+        if total_ms <= fallback_ms:
+            self._gpu_slow_streak = 0
+            return False
+        self._gpu_slow_streak += 1
+        threshold = max(streak, 1)
+        if self._gpu_slow_streak >= threshold:
+            self.disable_gpu_sampler(
+                f"sample {total_ms:.1f}ms exceeded fallback {fallback_ms:.1f}ms"
+            )
+            self._gpu_slow_streak = 0
+            return True
+        return False

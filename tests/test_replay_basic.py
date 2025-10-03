@@ -61,6 +61,24 @@ def test_prioritized_replay_gpu_sampler_cpu_path():
     assert per.stats()["gpu_sampler"] is True
 
 
+def test_prioritized_replay_gpu_sampler_fallback():
+    per = PrioritizedReplay(
+        capacity=32,
+        alpha=0.6,
+        beta_start=0.4,
+        beta_final=1.0,
+        beta_steps=1000,
+        device=torch.device("cpu"),
+        use_gpu_sampler=True,
+    )
+    triggered = per.register_sample_time(total_ms=5.0, fallback_ms=1.0, streak=1)
+    assert triggered is True
+    assert per.using_gpu_sampler is False
+    stats = per.stats()
+    assert stats["gpu_sampler"] is False
+    assert "fallback" in (stats.get("gpu_sampler_reason") or "")
+
+
 def test_checkpoint_metadata_replay_field(tmp_path):
     cfg = TrainingConfig()
     # 模拟 per_sample_interval 设置

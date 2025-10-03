@@ -63,6 +63,7 @@ class ReplayBufferConfig:
         1  # 新增：间隔多少次 update 执行一次 PER 采样（1 表示每次）
     )
     use_gpu_sampler: bool = False
+    gpu_sampler_fallback_ms: float = 0.0
 
 
 @dataclasses.dataclass

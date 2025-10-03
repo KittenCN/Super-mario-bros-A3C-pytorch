@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import faulthandler
 import json
+import sys
 import threading
 import time
+import traceback
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +46,9 @@ class HeartbeatReporter:
         self._log_path: Optional[Path] = None
         if log_path is not None:
             self.set_log_path(log_path)
+        self._stall_dump_dir: Optional[Path] = None
+        self._stall_dump_cooldown = max(stall_timeout, interval * 4)
+        self._last_stall_dump = 0.0
 
         self._history: Deque[_ProgressSample] = deque(maxlen=8)
         now = time.time()
@@ -117,6 +123,18 @@ class HeartbeatReporter:
             except Exception:
                 pass
 
+    def set_stall_dump_dir(
+        self, path: Path, cooldown: Optional[float] = None
+    ) -> None:
+        with self._log_lock:
+            self._stall_dump_dir = path
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+        if cooldown is not None and cooldown > 0:
+            self._stall_dump_cooldown = max(cooldown, 1.0)
+
     def _run(self) -> None:
         while not self._stop_event.wait(self._interval):
             self._emit(force=False)
@@ -180,6 +198,7 @@ class HeartbeatReporter:
         )
 
         if since_progress >= self._stall_timeout:
+            self._dump_stall_trace(now)
             self._print(
                 f"[{self._component}][warn] 已连续 {since_progress_text} 无训练/评估进度，请检查环境是否卡死或线程阻塞。"
             )
@@ -199,5 +218,32 @@ class HeartbeatReporter:
                 self._log_path.parent.mkdir(parents=True, exist_ok=True)
                 with self._log_path.open("a", encoding="utf-8") as fp:
                     fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _dump_stall_trace(self, timestamp: float) -> None:
+        path = None
+        with self._log_lock:
+            path = self._stall_dump_dir
+        if path is None:
+            return
+        if timestamp - self._last_stall_dump < self._stall_dump_cooldown:
+            return
+        self._last_stall_dump = timestamp
+        dump_path = path / f"stall_dump_{int(timestamp)}.log"
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            with dump_path.open("w", encoding="utf-8") as fp:
+                fp.write(
+                    f"# Stall dump generated at {time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(timestamp))}Z\n"
+                )
+                try:
+                    faulthandler.dump_traceback(file=fp)
+                except Exception:
+                    pass
+                fp.write("\n# Thread stacks\n")
+                for tid, frame in sys._current_frames().items():
+                    fp.write(f"\n# Thread {tid}\n")
+                    fp.write("".join(traceback.format_stack(frame)))
         except Exception:
             pass
