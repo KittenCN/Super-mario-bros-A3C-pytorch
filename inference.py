@@ -17,7 +17,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -88,37 +88,74 @@ def _candidate_checkpoints_in_dir(directory: Path) -> List[Path]:
     return sorted(directory.glob("a3c_world*_stage*.pt"))
 
 
-def _select_best_checkpoint_in_dir(directory: Path) -> Path:
-    candidates = _candidate_checkpoints_in_dir(directory)
-    if not candidates:
-        raise FileNotFoundError(f"目录中未找到 *.pt: {directory}")
-    # 优先 latest，再按 global_update 解析 json 元数据排序
-    latest = [c for c in candidates if c.name.endswith("latest.pt")]
-    if latest:
-        return latest[0]
-    scored: List[Tuple[int, int, Path]] = []  # (global_update, global_step, path)
-    for ckpt in candidates:
-        meta_p = ckpt.with_suffix(".json")
-        if not meta_p.exists():
-            continue
-        try:
+def _candidate_checkpoints_recursive(base_dir: Path) -> List[Path]:
+    """递归搜索 base_dir 下的所有候选 .pt 文件。"""
+    return sorted(base_dir.rglob("a3c_world*_stage*.pt"))
+
+
+def _score_checkpoint(ckpt: Path) -> Tuple[int, int, int, int, Path]:
+    """为 checkpoint 构造排序分值。
+
+    返回 (variant_pri, global_update, global_step, mtime_ns, path)
+    其中 variant_pri: latest=2, checkpoint=1, 其它=0。
+    若缺少元数据，尽力从文件名解析 update 序号 (零填充数字段)，否则为 0。
+    """
+    meta_p = ckpt.with_suffix(".json")
+    variant_pri = 0
+    upd = 0
+    step = 0
+    try:
+        if meta_p.exists():
             meta = json.loads(meta_p.read_text(encoding="utf-8"))
-            save_state = meta.get("save_state", {})
-            upd = int(save_state.get("global_update", 0))
-            step = int(save_state.get("global_step", 0))
-            scored.append((upd, step, ckpt))
-        except Exception:
-            continue
-    if not scored:
-        return candidates[-1]
+            ss = meta.get("save_state", {}) if isinstance(meta, dict) else {}
+            upd = int(ss.get("global_update", 0) or 0)
+            step = int(ss.get("global_step", 0) or 0)
+            variant = str(ss.get("type", "checkpoint"))
+            variant_pri = 2 if variant == "latest" else (1 if variant == "checkpoint" else 0)
+        else:
+            # 没有 json：根据文件名与后缀推测 latest 或提取序号
+            if ckpt.name.endswith("latest.pt"):
+                variant_pri = 2
+            # 提取末尾下划线后的数字段
+            name = ckpt.stem
+            try:
+                # 例如 a3c_world1_stage1_0008000 -> 8000
+                tail = name.rsplit("_", 1)[-1]
+                if tail.isdigit():
+                    upd = int(tail)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        mtime = int(ckpt.stat().st_mtime_ns)
+    except Exception:
+        mtime = 0
+    return (variant_pri, upd, step, mtime, ckpt)
+
+
+def _select_best_checkpoint_in_dir_or_recursive(directory: Path, recursive: bool = True) -> Path:
+    """在目录内（或递归子目录）选择最优 checkpoint。
+
+    策略：latest 优先；同类中按 global_update / global_step / mtime 降序。
+    """
+    candidates = (
+        _candidate_checkpoints_recursive(directory) if recursive else _candidate_checkpoints_in_dir(directory)
+    )
+    if not candidates:
+        scope = f"及子目录 " if recursive else ""
+        raise FileNotFoundError(f"目录中未找到 *.pt: {directory} ({scope}无候选)")
+    # 构造分值并排序
+    scored: List[Tuple[int, int, int, int, Path]] = [_score_checkpoint(c) for c in candidates]
     scored.sort(reverse=True)
-    return scored[0][2]
+    return scored[0][4]
 
 
 def resolve_checkpoint_path(arg_path: str) -> Path:
     p = Path(arg_path)
     if p.is_dir():
-        return _select_best_checkpoint_in_dir(p)
+        # 递归选择最佳
+        return _select_best_checkpoint_in_dir_or_recursive(p, recursive=True)
     return p
 
 
@@ -386,8 +423,14 @@ def main():
     np.random.seed(args.seed)
 
     # 加载检查点和元数据
-    checkpoint_path = resolve_checkpoint_path(args.checkpoint)
+    try:
+        checkpoint_path = resolve_checkpoint_path(args.checkpoint)
+    except FileNotFoundError as e:
+        print(f"[inference][error] 未找到可用模型: {e}")
+        print("[inference][hint] 可传入 trained_models 目录，程序将递归选择最新/最匹配的模型文件。")
+        raise
     if not checkpoint_path.exists():
+        print(f"[inference][error] 指定的检查点不存在: {checkpoint_path}")
         raise FileNotFoundError(f"检查点文件不存在: {checkpoint_path}")
 
     print(f"[inference] 加载检查点: {checkpoint_path}")
@@ -413,6 +456,7 @@ def main():
             max_missing=args.max_missing_keys,
             issues_log_dir=Path(args.issues_log_dir),
         )
+        print(f"[inference] 模型加载成功: {checkpoint_path}")
 
         # 运行推理
         print(f"[inference] 开始推理 {args.episodes} 个 episode...")

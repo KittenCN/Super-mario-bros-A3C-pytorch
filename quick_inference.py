@@ -83,36 +83,56 @@ def _candidate_checkpoints_in_dir(directory: Path) -> List[Path]:
     return sorted(directory.glob("a3c_world*_stage*.pt"))
 
 
-def _select_best_checkpoint_in_dir(directory: Path) -> Path:
-    candidates = _candidate_checkpoints_in_dir(directory)
-    if not candidates:
-        raise FileNotFoundError(f"目录中未找到 checkpoint: {directory}")
-    latest = [c for c in candidates if c.name.endswith("latest.pt")]
-    if latest:
-        return latest[0]
-    scored: List[Tuple[int, int, Path]] = []
-    for ckpt in candidates:
-        meta_p = ckpt.with_suffix(".json")
-        if not meta_p.exists():
-            continue
-        try:
+def _candidate_checkpoints_recursive(base_dir: Path) -> List[Path]:
+    return sorted(base_dir.rglob("a3c_world*_stage*.pt"))
+
+
+def _score_checkpoint(ckpt: Path) -> Tuple[int, int, int, int, Path]:
+    meta_p = ckpt.with_suffix(".json")
+    variant_pri = 0
+    upd = 0
+    step = 0
+    try:
+        if meta_p.exists():
             meta = json.loads(meta_p.read_text(encoding="utf-8"))
-            ss = meta.get("save_state", {})
-            upd = int(ss.get("global_update", 0))
-            step = int(ss.get("global_step", 0))
-            scored.append((upd, step, ckpt))
-        except Exception:
-            continue
-    if not scored:
-        return candidates[-1]
+            ss = meta.get("save_state", {}) if isinstance(meta, dict) else {}
+            upd = int(ss.get("global_update", 0) or 0)
+            step = int(ss.get("global_step", 0) or 0)
+            variant = str(ss.get("type", "checkpoint"))
+            variant_pri = 2 if variant == "latest" else (1 if variant == "checkpoint" else 0)
+        else:
+            if ckpt.name.endswith("latest.pt"):
+                variant_pri = 2
+            name = ckpt.stem
+            try:
+                tail = name.rsplit("_", 1)[-1]
+                if tail.isdigit():
+                    upd = int(tail)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        mtime = int(ckpt.stat().st_mtime_ns)
+    except Exception:
+        mtime = 0
+    return (variant_pri, upd, step, mtime, ckpt)
+
+
+def _select_best_checkpoint_in_dir_or_recursive(directory: Path, recursive: bool = True) -> Path:
+    candidates = _candidate_checkpoints_recursive(directory) if recursive else _candidate_checkpoints_in_dir(directory)
+    if not candidates:
+        scope = "及子目录 " if recursive else ""
+        raise FileNotFoundError(f"目录中未找到 checkpoint: {directory} ({scope}无候选)")
+    scored: List[Tuple[int, int, int, int, Path]] = [_score_checkpoint(c) for c in candidates]
     scored.sort(reverse=True)
-    return scored[0][2]
+    return scored[0][4]
 
 
 def resolve_checkpoint_path(arg_path: str) -> Path:
     p = Path(arg_path)
     if p.is_dir():
-        return _select_best_checkpoint_in_dir(p)
+        return _select_best_checkpoint_in_dir_or_recursive(p, recursive=True)
     return p
 
 
@@ -172,6 +192,7 @@ def main():
 
     ss = payload.get("global_step", 0)
     su = payload.get("global_update", 0)
+    print(f"[quick] 模型加载成功: {ckpt_path}")
     print(f"[quick] global_step={ss} global_update={su}")
 
     # Env

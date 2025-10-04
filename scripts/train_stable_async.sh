@@ -29,6 +29,7 @@ usage() {
   SAVE_ROOT / LOG_ROOT    输出目录（默认 trained_models / tensorboard/a3c_super_mario_bros）
   ENABLE_OVERLAP          是否开启 --overlap-collect（默认 1）
   PARENT_PREWARM          是否传入 --parent-prewarm（默认 1）
+  RESUME_RELAX_MATCH      放宽恢复匹配（默认 1，设为 0 则传 --no-resume-relax-match）
 
 示例：
   RUN_NAME=async_long TOTAL_UPDATES=200 ENABLE_OVERLAP=0 \
@@ -95,6 +96,7 @@ LOG_ROOT=${LOG_ROOT:-tensorboard/a3c_super_mario_bros}
 DEVICE=${DEVICE:-auto}
 ENABLE_OVERLAP=${ENABLE_OVERLAP:-1}
 PARENT_PREWARM=${PARENT_PREWARM:-1}
+RESUME_RELAX_MATCH=${RESUME_RELAX_MATCH:-1}
 EPISODE_EVENTS_PATH=${EPISODE_EVENTS_PATH:-}
 
 RUN_SAVE_DIR="${SAVE_ROOT%/}/${RUN_NAME}"
@@ -137,6 +139,13 @@ fi
 
 if [[ ${PARENT_PREWARM} -eq 1 ]]; then
   CMD+=(--parent-prewarm)
+fi
+
+# 放宽恢复匹配开关（默认开启）
+if [[ ${RESUME_RELAX_MATCH} -eq 0 ]]; then
+  CMD+=(--no-resume-relax-match)
+else
+  CMD+=(--resume-relax-match)
 fi
 
 if [[ -n "$SCRIPTED_SEQUENCE" ]]; then

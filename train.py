@@ -203,6 +203,20 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
+    # 放宽恢复匹配：默认开启；可通过 --no-resume-relax-match 关闭
+    parser.add_argument(
+        "--resume-relax-match",
+        dest="resume_relax_match",
+        action="store_true",
+        help="在严格匹配找不到时，放宽为仅匹配 world/stage/action/frame_* 与 model 配置",
+    )
+    parser.add_argument(
+        "--no-resume-relax-match",
+        dest="resume_relax_match",
+        action="store_false",
+        help="禁用放宽匹配，仅严格匹配 metadata",
+    )
+    parser.set_defaults(resume_relax_match=False)
     parser.add_argument(
         "--config-out", type=str, default=None, help="Persist effective config to JSON"
     )
@@ -1205,6 +1219,33 @@ def _metadata_matches_config(metadata: Dict[str, Any], cfg: TrainingConfig) -> b
     return True
 
 
+def _metadata_relaxed_matches_config(metadata: Dict[str, Any], cfg: TrainingConfig) -> bool:
+    """放宽版本的匹配：
+    仅比较以下关键维度，忽略 vector_env（num_envs/async/base_seed/schedule）。
+      - world, stage, action_type, frame_skip, frame_stack
+      - model 配置完全一致
+    """
+    env_cfg = cfg.env.env
+    if int(metadata.get("world", env_cfg.world)) != env_cfg.world:
+        return False
+    if int(metadata.get("stage", env_cfg.stage)) != env_cfg.stage:
+        return False
+    if str(metadata.get("action_type", env_cfg.action_type)) != env_cfg.action_type:
+        return False
+    if int(metadata.get("frame_skip", env_cfg.frame_skip)) != env_cfg.frame_skip:
+        return False
+    if int(metadata.get("frame_stack", env_cfg.frame_stack)) != env_cfg.frame_stack:
+        return False
+    model_meta = metadata.get("model")
+    if not isinstance(model_meta, dict):
+        return False
+    model_cfg = dataclasses.asdict(cfg.model)
+    for key, value in model_cfg.items():
+        if model_meta.get(key) != value:
+            return False
+    return True
+
+
 def find_matching_checkpoint(
     cfg: TrainingConfig,
 ) -> Optional[Tuple[Path, Dict[str, Any]]]:
@@ -1267,6 +1308,40 @@ def find_matching_checkpoint_recursive(
         except Exception:
             continue
         if not _metadata_matches_config(metadata, cfg):
+            continue
+        ckpt_path = json_path.with_suffix(".pt")
+        if not ckpt_path.exists():
+            continue
+        save_state = metadata.get("save_state", {})
+        update_idx = int(save_state.get("global_update", 0))
+        global_step = int(save_state.get("global_step", 0))
+        variant = str(save_state.get("type", "checkpoint"))
+        priority = 1 if variant == "checkpoint" else 0
+        matches.append((update_idx, priority, global_step, ckpt_path, metadata))
+    if not matches:
+        return None
+    matches.sort(reverse=True)
+    _, _, _, path, metadata = matches[0]
+    return path, metadata
+
+
+def find_matching_checkpoint_recursive_relaxed(
+    base_dir: Path, cfg: TrainingConfig, limit: int = 10000
+) -> Optional[Tuple[Path, Dict[str, Any]]]:
+    """递归搜索（放宽匹配）。选择策略同严格版。"""
+    if not base_dir.exists():
+        return None
+    matches: List[Tuple[int, int, int, Path, Dict[str, Any]]] = []
+    count = 0
+    for json_path in base_dir.rglob("a3c_world*_stage*.json"):
+        count += 1
+        if count > limit:
+            break
+        try:
+            metadata = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not _metadata_relaxed_matches_config(metadata, cfg):
             continue
         ckpt_path = json_path.with_suffix(".pt")
         if not ckpt_path.exists():
@@ -1858,7 +1933,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         resume_metadata = load_checkpoint_metadata(resume_path)
         if not _metadata_matches_config(resume_metadata, cfg):
             raise ValueError(
-                "Resume checkpoint metadata is incompatible with current configuration."
+                f"Resume 失败：{resume_path} 的 metadata 与当前配置不兼容。\n"
+                f"请确认 world/stage/action/frame_* 与训练时一致；或移除 --resume 以启用自动在 {Path('trained_models').resolve()} 下递归匹配。"
             )
     else:
         # 自动探测逻辑：优先编号最高的序号化 checkpoint，其次 latest 快照
@@ -1881,7 +1957,7 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         )
                 except Exception:
                     pass
-        # 若仍未找到，扩展搜索整个 trained_models 根目录
+        # 若仍未找到，扩展搜索整个 trained_models 根目录（严格匹配）
         if resume_path is None:
             root_dir = Path("trained_models")
             if root_dir.exists():
@@ -1897,10 +1973,39 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         print(
                             f"[train] recursive-resume found checkpoint: {resume_path}"
                         )
+        # 若严格匹配仍未找到，且允许放宽匹配，则进行放宽匹配
+        allow_relax = bool(getattr(args, "resume_relax_match", True))
+        if resume_path is None and allow_relax:
+            root_dir = Path("trained_models")
+            if root_dir.exists():
+                relaxed = find_matching_checkpoint_recursive_relaxed(root_dir, cfg)
+                if relaxed is not None:
+                    resume_path, resume_metadata = relaxed
+                    try:
+                        rel = resume_path.relative_to(root_dir)
+                        print(
+                            f"[train][resume] 使用放宽匹配在 trained_models/ 下找到: {rel}"
+                        )
+                    except Exception:
+                        print(
+                            f"[train][resume] 使用放宽匹配找到: {resume_path}"
+                        )
+                    print(
+                        "[train][resume][hint] 已忽略 vector_env 差异（num_envs/async/base_seed/schedule），"
+                        "仅匹配 world/stage/action/frame_* 与 model；若不希望此行为，可添加 --no-resume-relax-match。"
+                    )
         if resume_path is None:
             print(
                 "[train] no matching checkpoint found (current save_dir & recursive search) – starting fresh training"
             )
+            try:
+                env_cfg = cfg.env.env
+                print(
+                    f"[train][hint] 当前配置: world={env_cfg.world} stage={env_cfg.stage} action={env_cfg.action_type} "
+                    f"frame_stack={env_cfg.frame_stack} frame_skip={env_cfg.frame_skip}; 若已存在历史模型但向量环境配置不同，可使用 --resume-relax-match（默认开启）。"
+                )
+            except Exception:
+                pass
 
     writer, wandb_run, run_dir = create_logger(
         cfg.log_dir,
@@ -3943,7 +4048,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
             phase="interrupt", message="收到中断信号，保存最新模型", progress=False
         )
         try:
-            snap_path = save_model_snapshot(cfg, model, global_step, update_idx)  # type: ignore[name-defined]
+            _safe_update = int(locals().get("update_idx", globals().get("global_update", 0)))
+            snap_path = save_model_snapshot(cfg, model, global_step, _safe_update)  # type: ignore[name-defined]
             # 更新 metadata reason=interrupt
             try:
                 meta_file = snap_path.with_suffix(".json")
@@ -3961,7 +4067,8 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
         print(f"[train][error] unexpected exception: {exc}")
         heartbeat.notify(phase="error", message=str(exc), progress=False)
         try:
-            snap_path = save_model_snapshot(cfg, model, global_step, update_idx)  # type: ignore[name-defined]
+            _safe_update = int(locals().get("update_idx", globals().get("global_update", 0)))
+            snap_path = save_model_snapshot(cfg, model, global_step, _safe_update)  # type: ignore[name-defined]
             try:
                 meta_file = snap_path.with_suffix(".json")
                 if meta_file.exists():
