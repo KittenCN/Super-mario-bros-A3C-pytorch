@@ -70,6 +70,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# 检查 EXTRA_ARGS 是否包含某个长参数（形如 --flag 或 --flag=value）
+has_long_flag() {
+  local flag="$1"  # 例如 --per-sample-interval 或 --episodes-event-path
+  for arg in "${EXTRA_ARGS[@]}"; do
+    # 完全匹配 --flag 或 以 --flag= 开头
+    if [[ "$arg" == "$flag" || "$arg" == ${flag}=* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 DEFAULT_RUN_NAME="stable_sync_$(date +%Y%m%d-%H%M%S)"
 RUN_NAME=${RUN_NAME:-$DEFAULT_RUN_NAME}
 WORLD=${WORLD:-1}
@@ -116,17 +128,25 @@ CMD=(
   --lr "$LR"
   --checkpoint-interval "$CHECKPOINT_INTERVAL"
   --log-interval "$LOG_INTERVAL"
-  --per-sample-interval "$PER_SAMPLE_INTERVAL"
   --save-dir "$RUN_SAVE_DIR"
   --log-dir "$RUN_LOG_DIR"
   --metrics-path "$RUN_METRICS_PATH"
-  ${EPISODE_EVENTS_PATH:+--episodes-event-path "$EPISODE_EVENTS_PATH"}
   --project "$PROJECT"
   --device "$DEVICE"
   --reward-distance-weight "$REWARD_DISTANCE_WEIGHT"
   --enable-ram-x-parse
   --sync-env
 )
+
+# 仅当 EXTRA_ARGS 未显式提供对应标志时，才添加脚本内默认的 per-sample-interval
+if ! has_long_flag "--per-sample-interval"; then
+  CMD+=(--per-sample-interval "$PER_SAMPLE_INTERVAL")
+fi
+
+# 仅当 EXTRA_ARGS 未传入 episodes-event-path 且环境变量提供了路径时，才追加该参数
+if [[ -n "$EPISODE_EVENTS_PATH" ]] && ! has_long_flag "--episodes-event-path"; then
+  CMD+=(--episodes-event-path "$EPISODE_EVENTS_PATH")
+fi
 
 if [[ -n "$SCRIPTED_SEQUENCE" ]]; then
   CMD+=(--scripted-sequence "$SCRIPTED_SEQUENCE")

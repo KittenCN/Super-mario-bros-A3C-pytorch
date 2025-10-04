@@ -491,6 +491,31 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=None,
         help="动作脚本: 逗号分隔 'NAME[:frames]'，NAME 为组合别名 (START,RIGHT,RIGHT+B,RIGHT+A,RIGHT+A+B,START+RIGHT,START+RIGHT+B)。未指定 frames 默认1",
     )
+    # 提示与自适应缓解选项
+    parser.add_argument(
+        "--disable-hint-auto-mitigate",
+        action="store_true",
+        default=False,
+        help="关闭基于提示的自适应缓解（如自动短暂前进注入）",
+    )
+    parser.add_argument(
+        "--hint-cooldown-updates",
+        type=int,
+        default=200,
+        help="同类提示的最小冷却间隔（单位：updates）以避免刷屏",
+    )
+    parser.add_argument(
+        "--adaptive-bootstrap-updates",
+        type=int,
+        default=80,
+        help="连续无距离进展达到该 update 数后自动触发一次短暂前进注入（0 关闭）",
+    )
+    parser.add_argument(
+        "--adaptive-bootstrap-frames",
+        type=int,
+        default=0,
+        help="自适应触发时的注入帧数（env steps），0 表示按启发式计算",
+    )
     parser.add_argument(
         "--auto-bootstrap-threshold",
         type=int,
@@ -920,9 +945,24 @@ def _maybe_print_training_hints(update_idx: int, metrics: Dict[str, Any]) -> Non
         hint_history = set()
         setattr(run_training, "_hint_history", hint_history)  # type: ignore[attr-defined]
 
+    # 基于自适应与冷却策略抑制刷屏
+    cooldown_updates = int(getattr(run_training, "_hint_cooldown_updates", 200))  # type: ignore[attr-defined]
+    last_print: Dict[str, int] = getattr(  # type: ignore[attr-defined]
+        run_training, "_hint_last_update", {}
+    )
+    if not isinstance(last_print, dict):
+        last_print = {}
+        setattr(run_training, "_hint_last_update", last_print)  # type: ignore[attr-defined]
+
     hints: list[str] = []
     avg_return = float(metrics.get("avg_return", 0.0) or 0.0)
     distance_delta = float(metrics.get("env_distance_delta_sum", 0) or 0)
+    # 使用正向推进占比作为更稳健的进展信号，避免仅因 distance 统计缺失导致的误报
+    pos_dx_ratio_val = metrics.get("env_positive_dx_ratio")
+    try:
+        pos_dx_ratio = float(pos_dx_ratio_val) if pos_dx_ratio_val is not None else None
+    except Exception:
+        pos_dx_ratio = None
     shaping_raw = float(metrics.get("env_shaping_raw_sum", 0.0) or 0.0)
     shaping_scaled = float(metrics.get("env_shaping_scaled_sum", 0.0) or 0.0)
     replay_fill = float(metrics.get("replay_fill_rate", 0.0) or 0.0)
@@ -933,10 +973,37 @@ def _maybe_print_training_hints(update_idx: int, metrics: Dict[str, Any]) -> Non
     train_device = str(metrics.get("train_device", ""))
     num_envs = int(metrics.get("num_envs", 0) or 0)
 
-    if distance_delta == 0 and shaping_raw == 0 and global_step_value > 0:
-        hints.append(
-            "距离增量为 0，考虑提高 reward_distance_weight 或启用 scripted-forward 或设置 BOOTSTRAP=1。"
-        )
+    # 若已触发/正在进行 auto-bootstrap，则不重复输出零进展提示
+    auto_bootstrap_active = bool(metrics.get("auto_bootstrap_remaining", 0) > 0)
+    auto_bootstrap_trig = int(metrics.get("auto_bootstrap_triggered", 0) or 0) == 1
+    if (
+        distance_delta == 0
+        and shaping_raw == 0
+        and update_idx >= 10  # 避免过早提示
+        and not (auto_bootstrap_active or auto_bootstrap_trig)
+        and not (pos_dx_ratio is not None and pos_dx_ratio > 0.0)
+    ):
+        # 根据是否已启用 scripted 配置动态生成建议
+        _args = getattr(run_training, "_args", None)
+        scripted_configured = False
+        try:
+            if _args is not None:
+                scripted_configured = bool(
+                    getattr(_args, "scripted_sequence", None)
+                    or (getattr(_args, "scripted_forward_frames", 0) or 0) > 0
+                )
+        except Exception:
+            scripted_configured = False
+
+        if scripted_configured:
+            msg = "距离增量为 0，考虑提高 reward_distance_weight 或延长 scripted 帧数/检查 scripted 序列动作是否正确，或设置 BOOTSTRAP=1。"
+        else:
+            msg = "距离增量为 0，考虑提高 reward_distance_weight 或启用 scripted-forward，或设置 BOOTSTRAP=1。"
+
+        last_u = last_print.get(msg, -10**9)
+        if update_idx - last_u >= cooldown_updates:
+            hints.append(msg)
+            last_print[msg] = update_idx
 
     # 允许通过环境变量降低测试阈值（例如小规模快速试验）
     import os as _os  # 局部导入防止顶层污染
@@ -973,9 +1040,16 @@ def _maybe_print_training_hints(update_idx: int, metrics: Dict[str, Any]) -> Non
             hints.append("avg_return 长期为 0，可检查奖励塑形或动作脚本是否生效。")
 
     if replay_fill < 0.05 and update_idx >= 100:
-        hints.append(
-            "经验回放填充率 <5%，建议延长预热或提高 per_sample_interval 以外的 push 频率。"
-        )
+        # 仅在 push_total 达到一定比例或训练足够久时提示，跳过早期预热期
+        rpush = int(metrics.get("replay_push_total", 0) or 0)
+        rcap = int(metrics.get("replay_capacity", 0) or 0)
+        warm_enough = (rcap > 0 and rpush >= max(1, int(0.1 * rcap))) or update_idx >= 300
+        if warm_enough:
+            msg = "经验回放填充率 <5%，建议延长预热或提高 per_sample_interval 以外的 push 频率。"
+            last_u = last_print.get(msg, -10**9)
+            if update_idx - last_u >= cooldown_updates:
+                hints.append(msg)
+                last_print[msg] = update_idx
 
     if (
         train_device == "cuda"
@@ -1000,6 +1074,13 @@ def _maybe_print_training_hints(update_idx: int, metrics: Dict[str, Any]) -> Non
 
     joined = " | ".join(hints)
     print(f"[train][hint] update={update_idx} {joined}")
+    # 将简要提示写回 metrics，便于外部统计（字段名以 _hint_ 前缀，避免冲突）
+    try:
+        metrics["_hint_printed"] = 1
+        # 控制长度，防止 JSON 行过长
+        metrics["_hint_text"] = joined[:512]
+    except Exception:
+        pass
 
 
 def _per_step_update(
@@ -1492,6 +1573,11 @@ def call_with_timeout(
 
 
 def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
+    # 将 args 缓存到运行域，供提示/诊断逻辑使用
+    try:
+        setattr(run_training, "_args", args)  # type: ignore[attr-defined]
+    except Exception:
+        pass
     # Device and performance tuning
     if cfg.device == "auto":
         allow_cpu_auto = os.environ.get("MARIO_ALLOW_CPU_AUTO", "0").lower() in {
@@ -3459,6 +3545,40 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                     "env_shaping_last_scaled": float(shaping_last_scaled),
                     "env_shaping_parse_fail": int(shaping_parse_fail),
                 }
+                # 自适应引导：若长期无进展，按阈值触发一次短暂 auto-bootstrap
+                try:
+                    if not getattr(args, "disable_hint_auto_mitigate", False):
+                        # 用于判定“本 update 是否有进展”
+                        had_progress = int(metrics_entry.get("env_distance_delta_sum", 0) or 0) > 0
+                        if not hasattr(run_training, "_no_progress_updates"):
+                            run_training._no_progress_updates = 0  # type: ignore[attr-defined]
+                        if had_progress:
+                            run_training._no_progress_updates = 0  # type: ignore[attr-defined]
+                        else:
+                            run_training._no_progress_updates = int(getattr(run_training, "_no_progress_updates", 0)) + 1  # type: ignore[attr-defined]
+                        adapt_thr = int(getattr(args, "adaptive_bootstrap_updates", 80) or 0)
+                        if (
+                            adapt_thr > 0
+                            and int(getattr(run_training, "_no_progress_updates", 0)) >= adapt_thr  # type: ignore[attr-defined]
+                            and not auto_bootstrap_state.get("triggered")
+                        ):
+                            # 计算注入帧数：显式值优先，否则按启发式= 2 * rollout.num_steps
+                            inject_frames = int(getattr(args, "adaptive_bootstrap_frames", 0) or 0)
+                            if inject_frames <= 0:
+                                inject_frames = max(1, int(cfg.rollout.num_steps) * 2)
+                            auto_bootstrap_state["remaining"] = inject_frames * cfg.env.num_envs
+                            auto_bootstrap_state["triggered"] = True
+                            auto_bootstrap_state["announced_done"] = False
+                            auto_bootstrap_state.setdefault("announced_start", False)
+                            if not auto_bootstrap_state["announced_start"]:
+                                print(
+                                    f"[train][auto-bootstrap][adaptive] 连续 {getattr(run_training, '_no_progress_updates', 0)} updates 无进展，触发短暂前进注入 frames={inject_frames}"
+                                )
+                                auto_bootstrap_state["announced_start"] = True
+                            metrics_entry["auto_bootstrap_triggered"] = 1
+                            metrics_entry["auto_bootstrap_remaining"] = int(auto_bootstrap_state["remaining"])
+                except Exception:
+                    pass
                 # 估算本 update 内有正向增量的 env 数量，并驱动自适应调度
                 progress_ratio = 0.0
                 fallback_ratio = None
@@ -3961,6 +4081,9 @@ def run_training(cfg: TrainingConfig, args: argparse.Namespace) -> dict:
                         auto_bootstrap_state["announced_start"] = True
 
                 try:
+                    # 将 hint 冷却配置注入，使 _maybe_print_training_hints 可以读取
+                    if not hasattr(run_training, "_hint_cooldown_updates"):
+                        setattr(run_training, "_hint_cooldown_updates", int(getattr(args, "hint_cooldown_updates", 200)))  # type: ignore[attr-defined]
                     _maybe_print_training_hints(update_idx, metrics_entry)
                 except Exception:
                     pass
